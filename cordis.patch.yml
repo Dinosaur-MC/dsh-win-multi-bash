@@ -40,11 +40,14 @@
         backends: [git-bash, wsl-bash, pwsh]
         default: pwsh
         # Optional per-machine executable pins (restate the whole config when
-        # uncommenting — a patch replaces the row's entire config):
+        # uncommenting — a patch replaces the row's entire config). The values
+        # below are placeholders only — omit the pins entirely and let
+        # resolution probe automatically (well-known locations → PATH, the WSL
+        # launcher excluded, git.exe layout inference):
         #   gitBash:
-        #     bashPath: 'D:\Program Files\Git\usr\bin\bash.exe'
+        #     bashPath: '<Git 安装目录>\usr\bin\bash.exe'
         #   wslBash:
-        #     wslDistro: 'Ubuntu-24.04'
+        #     wslDistro: '<发行版名，如 Ubuntu-24.04>'
 
     - id: win-mb-tool-git
       name: 'dsh-win-multi-bash/tool-git-bash'

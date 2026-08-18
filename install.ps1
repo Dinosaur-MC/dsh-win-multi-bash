@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     热插 dsh-win-multi-bash（自包含版）：把插件链接进 profile 的 node_modules，
     并把接线块写入 profile 的 cordis.patch.yml。dsh web 会热重载该文件，无需重启。
@@ -17,10 +17,10 @@
         避免两个 ctx.shell 提供者抢席位；
       - 插入本插件的 win-mb-shell-select / win-mb-tool-git / win-mb-tool-wsl 行。
 
-    可选：检测到本机 Git Bash 位于运行时默认探测路径之外（如 D:\Program Files\Git
-    或 PATH 里只有 C:\WINDOWS\system32\bash.exe 这个 WSL 启动器）时，自动在
-    shell-select 配置里写入 gitBash.bashPath 覆盖，保证 git_bash 工具路由到
-    真正的 MSYS bash。
+    可选：检测到本机 Git Bash 位于运行时默认探测路径之外（如非默认盘符的
+    安装目录，或 PATH 里只有 C:\WINDOWS\system32\bash.exe 这个 WSL 启动器）
+    时，自动在 shell-select 配置里写入 gitBash.bashPath 覆盖（探测所得的真实
+    路径，非硬编码），保证 git_bash 工具路由到真正的 MSYS bash。
 
 .PARAMETER ProfileName
     目标 profile 名，默认 web（即 ~/.dsh/profiles/web）。

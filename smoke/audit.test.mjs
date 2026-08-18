@@ -155,7 +155,13 @@ function bareInstance(cls, props) {
   return inst
 }
 
-const GIT_BASH = process.env.DSH_AUDIT_GIT_BASH ?? 'D:\\Program Files\\Git\\usr\\bin\\bash.exe'
+// Git Bash for the real-spawn unit tests is NEVER hardcoded: it is probed with
+// the plugin's own resolver (well-known locations → PATH, WSL launcher
+// excluded → git.exe layout inference). `DSH_AUDIT_GIT_BASH` overrides for
+// hosts where probing must not run. Tests that need a real bash skip when
+// probing finds none, so the suite stays portable.
+const GIT_BASH = process.env.DSH_AUDIT_GIT_BASH ?? resolveBashPath(undefined, process.env, process.platform) ?? ''
+const HAS_GIT_BASH = GIT_BASH.length > 0
 
 // ═════════════════════════════════════════════════════════════════════════════
 // A) Unit tests
@@ -338,6 +344,9 @@ console.log('\n[A] unit: GitBashExecutor (internals hooks)')
     ex.internals.probeConfined = () => true
     assert.equal(ex.sandboxMode, 'read-only')
   })
+  if (!HAS_GIT_BASH) {
+    console.log('  … skipping real-spawn run() tests: no Git Bash probed on this host')
+  } else {
   testAsync('run(): unconfined path passes plain git argv (no sandbox facts)', async () => {
     const sub = fakeSubprocess()
     const ex = bareInstance(GitBashExecutor, {
@@ -418,6 +427,7 @@ console.log('\n[A] unit: GitBashExecutor (internals hooks)')
     assert.equal(result.exitCode, 0)
     assert.deepEqual(result.sandbox, { mode: 'danger-full-access', denied: false })
   })
+  }
 }
 
 console.log('\n[A] unit: bash resolution (git-path inference, never the WSL launcher)')
@@ -717,14 +727,16 @@ async function runTests(ctx, tests) {
   await Promise.all(jobs)
 }
 
-const PLUGIN_ROWS = `
+// The pinned fixture uses the PROBED bash (never a hardcoded path); when
+// probing finds none the pinned variant is skipped by the caller.
+const PLUGIN_ROWS = (bashPath) => `
 - id: win-mb-shell-select
   name: 'dsh-win-multi-bash/shell-select'
   config:
     backends: [git-bash, wsl-bash, pwsh]
     default: pwsh
     gitBash:
-      bashPath: 'D:\\Program Files\\Git\\usr\\bin\\bash.exe'
+      bashPath: '${bashPath}'
 
 - id: win-mb-tool-git
   name: 'dsh-win-multi-bash/tool-git-bash'
@@ -754,11 +766,14 @@ async function execToolResult(ctx, name, args) {
   return { text, isError: result.isError === true, error: result.error }
 }
 
-console.log('\n[B] boot integration: default fixture')
+console.log('\n[B] boot integration: default fixture (pinned via probed bash)')
 {
-  let ctx
-  try {
-    ctx = await bootFixture(PLUGIN_ROWS, 'default.yml')
+  if (!HAS_GIT_BASH) {
+    console.log('  … skipping pinned fixture: no Git Bash probed on this host')
+  } else {
+    let ctx
+    try {
+      ctx = await bootFixture(PLUGIN_ROWS(GIT_BASH), 'default.yml')
     await runTests(ctx, [
       ['boot: tools registered (git_bash, wsl_bash + job tools)', async () => {
         const names = ctx.tools.schemas().map((t) => t.name)
@@ -903,8 +918,9 @@ console.log('\n[B] boot integration: default fixture')
         assert.ok(/40000|spawn|failed|error/i.test(text), text.slice(0, 200))
       }],
     ])
-  } finally {
-    if (ctx) await ctx.fiber.dispose()
+    } finally {
+      if (ctx) await ctx.fiber.dispose()
+    }
   }
 }
 
@@ -976,17 +992,18 @@ console.log('\n[B] boot integration: REAL cordis.patch.yml applied as overlay pa
 
 console.log('\n[B] boot integration: misconfiguration matrices')
 {
-  let ctx
-  try {
-    ctx = await bootFixture(`
+  const BOGUS_BACKEND_ROWS = (bashPath) => `
 - id: win-mb-shell-select
   name: 'dsh-win-multi-bash/shell-select'
   config:
     backends: [git-bash, bogus]
     default: git-bash
     gitBash:
-      bashPath: 'D:\\Program Files\\Git\\usr\\bin\\bash.exe'
-`, 'bogus-backend.yml')
+      bashPath: '${bashPath}'
+`
+  let ctx
+  try {
+    ctx = await bootFixture(BOGUS_BACKEND_ROWS(GIT_BASH), 'bogus-backend.yml')
     await runTests(ctx, [
       ['unknown backend in config fails loud at first use', async () => {
         const r = await execToolResult(ctx, 'git_bash', { command: 'echo x' })

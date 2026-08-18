@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     运行 dsh-win-multi-bash 综合审计测试：单元测试（helpers/schema/executor
     internals）+ 真实 boot 集成测试（工具矩阵、路由、沙箱、后台任务、patch 语义）。
