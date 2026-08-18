@@ -19,7 +19,7 @@
 
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -33,7 +33,8 @@ const { isRunnerSpawnFailure, classifyDenial, classifyRunnerFailure, matchesSign
   await import(libUrl('vendor', 'helpers.js'))
 const { BWRAP_RUNNER_FAILURE_RULES, bwrapProfileArgs } =
   await import(libUrl('vendor', 'bwrap-profiles.js'))
-const { GitBashExecutor } = await import(libUrl('bash-git', 'index.js'))
+const { GitBashExecutor, candidateBashPaths, gitRootCandidates, resolveBashPath } =
+  await import(libUrl('bash-git', 'index.js'))
 const { WslBashExecutor } = await import(libUrl('bash-wsl', 'index.js'))
 const { ShellSelectExecutor, SHELL_BACKEND_UNAVAILABLE } =
   await import(libUrl('shell-select', 'index.js'))
@@ -416,6 +417,62 @@ console.log('\n[A] unit: GitBashExecutor (internals hooks)')
     const result = await ex.run({ command: 'echo dfa-ok', timeoutMs: 30000, stdoutMaxBytes: 4096, workdir: process.cwd(), sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: 'X' } })
     assert.equal(result.exitCode, 0)
     assert.deepEqual(result.sandbox, { mode: 'danger-full-access', denied: false })
+  })
+}
+
+console.log('\n[A] unit: bash resolution (git-path inference, never the WSL launcher)')
+{
+  const bareEnv = (path) => ({ PATH: path, SystemRoot: 'C:\\Windows', ProgramFiles: 'G:\\no-such-pf', 'ProgramFiles(x86)': 'G:\\no-such-x86' })
+
+  test('gitRootCandidates: infers root from <root>\\cmd on PATH (git.exe present)', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'dsh-wmb-gitroot-'))
+    try {
+      const root = join(tmp, 'Git')
+      mkdirSync(join(root, 'cmd'), { recursive: true })
+      mkdirSync(join(root, 'usr', 'bin'), { recursive: true })
+      writeFileSync(join(root, 'cmd', 'git.exe'), '')
+      writeFileSync(join(root, 'usr', 'bin', 'bash.exe'), '')
+      const env = bareEnv(`${join(root, 'cmd')};${join(tmp, 'Strawberry', 'c', 'bin')}`)
+      assert.deepEqual(gitRootCandidates(env), [root])
+      assert.equal(resolveBashPath(undefined, env, 'win32'), join(root, 'usr', 'bin', 'bash.exe'))
+    } finally { rmSync(tmp, { recursive: true, force: true }) }
+  })
+  test('gitRootCandidates: <root>\\usr\\bin layout resolves to the root bash', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'dsh-wmb-gitroot2-'))
+    try {
+      const root = join(tmp, 'Git2')
+      mkdirSync(join(root, 'usr', 'bin'), { recursive: true })
+      writeFileSync(join(root, 'usr', 'bin', 'git.exe'), '')
+      writeFileSync(join(root, 'usr', 'bin', 'bash.exe'), '')
+      const env = bareEnv(join(root, 'usr', 'bin'))
+      assert.deepEqual(gitRootCandidates(env), [root])
+      assert.equal(resolveBashPath(undefined, env, 'win32'), join(root, 'usr', 'bin', 'bash.exe'))
+    } finally { rmSync(tmp, { recursive: true, force: true }) }
+  })
+  test('gitRootCandidates: bin dir without git.exe is not a Git root', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'dsh-wmb-gitroot3-'))
+    try {
+      const bin = join(tmp, 'Strawberry', 'c', 'bin')
+      mkdirSync(bin, { recursive: true })
+      writeFileSync(join(bin, 'bash.exe'), '')
+      const env = bareEnv(bin)
+      assert.deepEqual(gitRootCandidates(env), [])
+      // a real (non-WSL) bash on PATH still resolves directly
+      assert.equal(resolveBashPath(undefined, env, 'win32'), join(bin, 'bash.exe'))
+    } finally { rmSync(tmp, { recursive: true, force: true }) }
+  })
+  test('candidateBashPaths: WSL launcher (System32\\bash.exe) never a candidate', () => {
+    const env = bareEnv(`C:\\Windows\\System32;${join(tmpdir(), 'plain-bin')}`)
+    const paths = candidateBashPaths(env)
+    assert.ok(!paths.some((p) => p.toLowerCase() === 'c:\\windows\\system32\\bash.exe'))
+  })
+  test('resolveBashPath: only the WSL launcher available → undefined (loud failure, not WSL)', () => {
+    const env = bareEnv('C:\\Windows\\System32')
+    assert.equal(resolveBashPath(undefined, env, 'win32'), undefined)
+  })
+  test('resolveBashPath: configured pin always wins', () => {
+    const env = bareEnv('C:\\Windows\\System32')
+    assert.equal(resolveBashPath('D:\\pinned\\bash.exe', env, 'win32'), 'D:\\pinned\\bash.exe')
   })
 }
 
@@ -844,6 +901,43 @@ console.log('\n[B] boot integration: default fixture')
         const text = await execTool(ctx, 'git_bash', { command: `echo ${'a'.repeat(40000)} | wc -c` })
         // Either it runs (spawn ok) or a loud spawn error — but not a hang or uncaught crash.
         assert.ok(/40000|spawn|failed|error/i.test(text), text.slice(0, 200))
+      }],
+    ])
+  } finally {
+    if (ctx) await ctx.fiber.dispose()
+  }
+}
+
+console.log('\n[B] boot integration: no-pin fixture (auto git-path resolution, never WSL)')
+{
+  // No `gitBash.bashPath`: resolution must find the real MSYS Git Bash by
+  // itself (well-known probes → PATH → git.exe layout inference) and must
+  // NEVER land in WSL via the System32 launcher.
+  const NO_PIN_ROWS = `
+- id: win-mb-shell-select
+  name: 'dsh-win-multi-bash/shell-select'
+  config:
+    backends: [git-bash, wsl-bash, pwsh]
+    default: pwsh
+
+- id: win-mb-tool-git
+  name: 'dsh-win-multi-bash/tool-git-bash'
+
+- id: win-mb-tool-wsl
+  name: 'dsh-win-multi-bash/tool-wsl-bash'
+`
+  let ctx
+  try {
+    ctx = await bootFixture(NO_PIN_ROWS, 'nopin.yml')
+    await runTests(ctx, [
+      ['no-pin git_bash runs a real MSYS bash (uname is NOT Linux)', async () => {
+        const text = await execTool(ctx, 'git_bash', { command: 'uname -s' })
+        assert.ok(!/linux/i.test(text), `resolved into WSL/Linux: ${text}`)
+        assert.match(text, /mingw|msys/i)
+      }],
+      ['no-pin git_bash has the Git toolchain (git --version)', async () => {
+        const text = await execTool(ctx, 'git_bash', { command: 'git --version' })
+        assert.match(text, /git version/i)
       }],
     ])
   } finally {
