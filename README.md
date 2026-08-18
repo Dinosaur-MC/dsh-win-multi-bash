@@ -12,7 +12,7 @@ A Windows multi-bash plugin for DeepSeek Harness: `git_bash` / `wsl_bash` model 
 
 - `shell-select` occupies the single `ctx.shell` seat and routes `request.shell ?? default` to one backend; `default` stays `pwsh`.
 - Executable resolution and sandbox probing are lazy: a host without Git Bash or WSL does not affect pwsh; failures are loud at first use.
-- Git Bash is found automatically, in order: an explicit `gitBash.bashPath`, the well-known Program Files locations, `bash.exe` on PATH (the Windows WSL launcher `System32\bash.exe` is **never** selected — this tool is MSYS, not WSL), and finally Git install roots inferred from `git.exe` layout directories on PATH (so an install reachable through `git` is found without a pin).
+- Git Bash is found automatically, in order: an explicit `gitBash.bashPath`, the well-known Program Files locations, `bash.exe` on PATH (the Windows WSL launcher `System32\bash.exe` is **never** selected — this tool is MSYS, not WSL), Git install roots inferred from `git.exe` layout directories on PATH (so an install reachable through `git` is found without a pin), and finally the `HKLM\SOFTWARE\GitForWindows` install path (which the Git for Windows installer always records, covering custom-drive and portable installs).
 - Sandbox `auto`: Git Bash probes the windows-acl runner, WSL probes `bwrap` inside the distro; a failed probe degrades honestly to an unconfined run with no sandbox facts. An explicit `sandbox: bwrap` with bubblewrap missing fails loudly at the first `wsl_bash` command (never at boot), leaving the other backends untouched.
 - All rows register host-plane: every session sees the tools regardless of its agent preset.
 

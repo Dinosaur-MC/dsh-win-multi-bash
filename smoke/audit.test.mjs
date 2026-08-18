@@ -33,7 +33,7 @@ const { isRunnerSpawnFailure, classifyDenial, classifyRunnerFailure, matchesSign
   await import(libUrl('vendor', 'helpers.js'))
 const { BWRAP_RUNNER_FAILURE_RULES, bwrapProfileArgs } =
   await import(libUrl('vendor', 'bwrap-profiles.js'))
-const { GitBashExecutor, candidateBashPaths, gitRootCandidates, resolveBashPath } =
+const { GitBashExecutor, candidateBashPaths, gitRootCandidates, gitToolPath, resolveBashPath } =
   await import(libUrl('bash-git', 'index.js'))
 const { WslBashExecutor } = await import(libUrl('bash-wsl', 'index.js'))
 const { ShellSelectExecutor, SHELL_BACKEND_UNAVAILABLE } =
@@ -317,6 +317,7 @@ console.log('\n[A] unit: GitBashExecutor (internals hooks)')
     const ex = bareInstance(GitBashExecutor)
     ex.source = () => ({})
     ex.internals.resolveBashPath = () => undefined
+    ex.internals.registryBashPaths = () => undefined // registry may hit on hosts with Git installed
     assert.throws(() => ex.bashPath(), /Git Bash was not found \(probed/)
   })
   test('gitArgv: [bashPath, -c, command]', () => {
@@ -483,6 +484,42 @@ console.log('\n[A] unit: bash resolution (git-path inference, never the WSL laun
   test('resolveBashPath: configured pin always wins', () => {
     const env = bareEnv('C:\\Windows\\System32')
     assert.equal(resolveBashPath('D:\\pinned\\bash.exe', env, 'win32'), 'D:\\pinned\\bash.exe')
+  })
+  test('gitToolPath: <root>\\usr\\bin bash injects cmd/bin/usr\\bin (full toolchain)', () => {
+    const p = gitToolPath('D:\\Program Files\\Git\\usr\\bin\\bash.exe', 'C:\\Windows\\System32')
+    const entries = p.split(';')
+    assert.deepEqual(entries.slice(0, 3), [
+      'D:\\Program Files\\Git\\cmd',
+      'D:\\Program Files\\Git\\bin',
+      'D:\\Program Files\\Git\\usr\\bin',
+    ])
+    assert.ok(entries.includes('C:\\Windows\\System32'))
+  })
+  test('gitToolPath: <root>\\bin bash also injects the full layout', () => {
+    const p = gitToolPath('C:\\Program Files\\Git\\bin\\bash.exe', '')
+    assert.deepEqual(p.split(';').slice(0, 3), [
+      'C:\\Program Files\\Git\\cmd',
+      'C:\\Program Files\\Git\\bin',
+      'C:\\Program Files\\Git\\usr\\bin',
+    ])
+  })
+  test('gitToolPath: foreign (non-Git-layout) bash keeps only its own dir', () => {
+    const p = gitToolPath('D:\\tools\\other-bash\\bash.exe', 'C:\\Windows')
+    assert.deepEqual(p.split(';').slice(0, 1), ['D:\\tools\\other-bash'])
+  })
+  test('tryBashPath: registry fallback used after standard probes miss (internals hook)', () => {
+    const ex = bareInstance(GitBashExecutor)
+    ex.source = () => ({})
+    ex.internals.resolveBashPath = () => undefined
+    ex.internals.registryBashPaths = () => 'R:\\reg\\usr\\bin\\bash.exe'
+    assert.equal(ex.bashPath(), 'R:\\reg\\usr\\bin\\bash.exe')
+  })
+  test('tryBashPath: both probes miss → loud error naming the registry probe', () => {
+    const ex = bareInstance(GitBashExecutor)
+    ex.source = () => ({})
+    ex.internals.resolveBashPath = () => undefined
+    ex.internals.registryBashPaths = () => undefined
+    assert.throws(() => ex.bashPath(), /Git Bash was not found.*GitForWindows registry/)
   })
 }
 

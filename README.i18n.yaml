@@ -4,5 +4,5 @@
 # along and re-record with the harness docs tooling (not shipped with this
 # package):
 #   node scripts/verify-docs.mjs --write <dir>   # run from the deepseek-harness checkout
-README.md: 88d68bab76cb785c5b2a677fb7682a16ee96cf2b
-README.zh.md: 4272f20263e5788a41c05db1f3950116648bb2c1
+README.md: 7d8a32534d209441b69d7c0a172f9a8b5d78a89d
+README.zh.md: 3ff9be395fa8a58bdd90d8ab1f3f6958133d4d34

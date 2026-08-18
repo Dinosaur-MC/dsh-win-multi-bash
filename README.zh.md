@@ -12,7 +12,7 @@
 
 - `shell-select` 占据唯一的 `ctx.shell` 席位，按 `request.shell ?? default` 路由；`default` 保持 `pwsh`。
 - 可执行文件解析与沙箱探测全部惰性化：未安装 Git Bash / WSL 不影响 pwsh，首次使用时才响亮报错。
-- Git Bash 自动查找，顺序为：显式 `gitBash.bashPath` → 常见 Program Files 位置 → PATH 上的 `bash.exe`（**绝不选** Windows 的 WSL 启动器 `System32\bash.exe`——本工具是 MSYS 而非 WSL）→ 从 PATH 上 `git.exe` 布局目录反推的 Git 安装根（因此通过 `git` 可达的安装无需钉定即可找到）。
+- Git Bash 自动查找，顺序为：显式 `gitBash.bashPath` → 常见 Program Files 位置 → PATH 上的 `bash.exe`（**绝不选** Windows 的 WSL 启动器 `System32\bash.exe`——本工具是 MSYS 而非 WSL）→ 从 PATH 上 `git.exe` 布局目录反推的 Git 安装根（因此通过 `git` 可达的安装无需钉定即可找到）→ 最后读取 `HKLM\SOFTWARE\GitForWindows` 注册表安装路径（Git for Windows 安装器必写该键，覆盖自定义盘符与便携安装）。
 - 沙箱 `auto`：Git Bash 探测 windows-acl runner，WSL 探测发行版内 `bwrap`；探测失败如实降级为无限制运行并如实报告。显式 `sandbox: bwrap` 而发行版缺少 bubblewrap 时，在首次执行 `wsl_bash` 命令时响亮报错（不会拖垮启动），其余后端不受影响。
 - 所有行在 host 平面注册：无论会话使用哪个 agent preset，都能看到这两个工具。
 
