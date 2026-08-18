@@ -1,6 +1,8 @@
-# Bilingual-pair consistency record (docs/i18n.md): the git blob hash of each
-# side as of the last confirmed-consistent state. Both languages carry equal authority;
-# after editing either side, bring the other along and re-record with:
-#   node scripts/verify-docs.mjs --write <dir>
-README.md: 52498dcb21dcefb906b9d7370d42b5ddef7913bb
-README.zh.md: 6c86ea3886073c5793bb579b57896b3a8ebd1ef8
+# Bilingual-pair consistency record (docs/i18n.md, deepseek-harness repo): the
+# git blob hash of each side as of the last confirmed-consistent state. Both
+# languages carry equal authority; after editing either side, bring the other
+# along and re-record with the harness docs tooling (not shipped with this
+# package):
+#   node scripts/verify-docs.mjs --write <dir>   # run from the deepseek-harness checkout
+README.md: 6f3a69240e9f5e289f7a4b94ad950331c22e7ea5
+README.zh.md: ecc81d55e18ea148cd52cdf29fe55f01fc18b5b4

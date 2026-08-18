@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     热插 dsh-win-multi-bash（自包含版）：把插件链接进 profile 的 node_modules，
     并把接线块写入 profile 的 cordis.patch.yml。dsh web 会热重载该文件，无需重启。

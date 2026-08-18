@@ -12,7 +12,7 @@
 
 - `shell-select` 占据唯一的 `ctx.shell` 席位，按 `request.shell ?? default` 路由；`default` 保持 `pwsh`。
 - 可执行文件解析与沙箱探测全部惰性化：未安装 Git Bash / WSL 不影响 pwsh，首次使用时才响亮报错。
-- 沙箱 `auto`：Git Bash 探测 windows-acl runner，WSL 探测发行版内 `bwrap`；探测失败如实降级为无限制运行并如实报告。
+- 沙箱 `auto`：Git Bash 探测 windows-acl runner，WSL 探测发行版内 `bwrap`；探测失败如实降级为无限制运行并如实报告。显式 `sandbox: bwrap` 而发行版缺少 bubblewrap 时，在首次执行 `wsl_bash` 命令时响亮报错（不会拖垮启动），其余后端不受影响。
 - 所有行在 host 平面注册：无论会话使用哪个 agent preset，都能看到这两个工具。
 
 ## 包内容
@@ -81,6 +81,8 @@ powershell -ExecutionPolicy Bypass -File .\smoke\run.ps1
 | 引导失败 `Cannot find package '@deepseek-ai/...'` | 包内 `node_modules/@deepseek-ai` junction 缺失（重跑 install.ps1），或 profile 运行时基础包不完整 |
 | `git_bash` 执行报找不到 bash | Git Bash 不在默认探测路径：重跑 install.ps1（注册表自动检测），或手动设置 `gitBash.bashPath` |
 | `wsl_bash` 执行报错 | `wsl.exe --status` 是否有默认发行版；可在 `wslBash.wslDistro` 指定发行版名 |
+| `wsl_bash` 报 `bwrap was not found` | 已配置 `sandbox: bwrap` 但发行版内没有 bubblewrap：安装之（如 `apt install bubblewrap`），或改用 `sandbox: auto` / `none` |
+| `wsl_bash` 沙箱报 bwrap runner 失败 | bwrap 的工作区根取 Windows 盘符路径的 Linux 侧（`/mnt/<盘符>/...`）：UNC 工作区根会响亮报错；发行版自定义了 automount 根（wsl.conf `automount.root`）时需要相应配置 |
 | 执行报 `shell-select: backend "x" is not enabled` | backends 列表与工具名不匹配；保持 `backends: [git-bash, wsl-bash, pwsh]` |
 
 ## 文件布局
