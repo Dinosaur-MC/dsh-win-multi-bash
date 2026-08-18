@@ -1,3 +1,5 @@
+[English](README.md) | 中文
+
 # dsh-win-multi-bash
 
 适用于 DeepSeek Harness 的 Windows multi-bash 插件：`git_bash` / `wsl_bash` 模型工具 + `shell-select` 执行器，在唯一的 `ctx.shell` 席位上路由 Git Bash、WSL 与 pwsh。pwsh 保持默认，未调用 bash 系工具前现有行为完全不变。

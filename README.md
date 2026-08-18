@@ -1,3 +1,5 @@
+English | [中文](README.zh.md)
+
 # dsh-win-multi-bash
 
 A Windows multi-bash plugin for DeepSeek Harness: `git_bash` / `wsl_bash` model tools plus a `shell-select` executor that routes the single `ctx.shell` seat across Git Bash, WSL and pwsh. Pwsh stays the default, so existing behavior is unchanged until a bash-family tool is called.
