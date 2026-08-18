@@ -33,6 +33,18 @@ The three backends do **not** share the same file-sandbox capability:
 > ⚠️ **A denial is only classified when the command exits non-zero.** If a blocked write is followed by a successful command (`echo nope > /etc/x; echo done`), the overall exit is 0 and no `[sandbox: file access denied]` marker is emitted — matching the upstream bash-sandbox rule to avoid false positives.
 >
 > The sandbox constrains **file effects only** (`workspace-write` / `read-only`); network and other resources are not limited.
+> **`requireSandbox`: refuse unconfined runs when the probe fails (optional hardening).** Both backends support `requireSandbox: true` (default `false`, keeping the existing degrade-and-run behavior). When enabled, a failed probe (windows-acl unusable for git-bash / bwrap missing for wsl-bash) means: `danger-full-access` runs as usual (an unconfined run is equivalent to an explicit full-access grant), while `read-only` / `workspace-write` calls are **refused** with an error naming the fix and the escalation path. The tool layer also advertises the sandbox and opens the `sandbox_permissions` argument, so the model can take the approval-based escalation. Example:
+
+> ```yaml
+> # the win-mb-shell-select row in cordis.patch.yml
+> config:
+>   backends: [git-bash, wsl-bash, pwsh]
+>   default: pwsh
+>   gitBash: { requireSandbox: true }
+>   wslBash: { requireSandbox: true }
+> ```
+
+> `requireSandbox` and `sandbox: none` are mutually exclusive in intent — explicit `none` is a deliberate opt-out and stays allowed; `requireSandbox` only governs the "sandbox wanted but probe failed" case.
 
 ### Enabling the bwrap sandbox for `wsl_bash`
 

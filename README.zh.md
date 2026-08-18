@@ -33,6 +33,18 @@
 > ⚠️ **拒绝判定要求命令以非零退出结束。** 被拦截的写操作若以成功命令收尾（如 `echo nope > /etc/x; echo done`），整体退出码为 0，不会标记 `[sandbox: file access denied]`（与上游 bash-sandbox 的判定规则一致，避免误报）。
 >
 > 沙箱只约束**文件系统效果**（`workspace-write` / `read-only`），不限制网络、进程等其它资源。
+> **`requireSandbox`：探针失败时拒绝无沙箱运行（可选强化）。** 两个后端均支持 `requireSandbox: true`（默认 `false`，保持既有降级行为）。开启后，探针失败（git-bash 的 windows-acl 不可用 / wsl-bash 缺少 bwrap）时：`danger-full-access` 模式下照常放行（无沙箱运行等价于显式全权批准），`read-only` / `workspace-write` 模式下**拒绝执行**并报错，提示修复沙箱或升级到 `danger-full-access`。同时工具层会声明沙箱并开放 `sandbox_permissions` 升级参数，使模型可以走审批升级。示例：
+
+> ```yaml
+> # cordis.patch.yml 的 win-mb-shell-select 行
+> config:
+>   backends: [git-bash, wsl-bash, pwsh]
+>   default: pwsh
+>   gitBash: { requireSandbox: true }
+>   wslBash: { requireSandbox: true }
+> ```
+
+> 注意：`requireSandbox` 与 `sandbox: none` 互斥使用——显式 `none` 是用户主动放弃沙箱，保持放行；`requireSandbox` 只管「想沙箱但探针失败」的情形。
 
 ### 为 `wsl_bash` 启用 bwrap 沙箱
 
