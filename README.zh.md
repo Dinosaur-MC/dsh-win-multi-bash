@@ -115,8 +115,9 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 ### 方式 B：bundle 安装（便携，需重启）
 
 ```powershell
-# 安装
-dsh plugin --profile web add github:@Dinosaur-MC/dsh-win-multi-bash
+# 安装（二选一）
+dsh plugin --profile web add dsh-win-multi-bash                    # npm 发布包（推荐）
+dsh plugin --profile web add github:@Dinosaur-MC/dsh-win-multi-bash   # GitHub 仓库源
 
 # 卸载
 dsh plugin --profile web remove dsh-win-multi-bash

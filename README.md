@@ -115,8 +115,9 @@ The script links the package into `<profile>/node_modules/` (a junction), mainta
 ### Path B: bundle install (portable, requires restart)
 
 ```powershell
-# Install
-dsh plugin --profile web add github:@Dinosaur-MC/dsh-win-multi-bash
+# Install (pick one)
+dsh plugin --profile web add dsh-win-multi-bash                    # npm published package (recommended)
+dsh plugin --profile web add github:@Dinosaur-MC/dsh-win-multi-bash   # GitHub repository source
 
 # Uninstall
 dsh plugin --profile web remove dsh-win-multi-bash
