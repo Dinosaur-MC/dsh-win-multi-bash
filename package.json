@@ -49,16 +49,16 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-bash-local": "^0.1.0-rc.7",
-    "@deepseek-ai/dsh-llm": "^0.1.0-rc.7",
-    "@deepseek-ai/dsh-pwsh-local": "^0.1.0-rc.7",
-    "@deepseek-ai/dsh-pwsh-sandbox": "^0.1.0-rc.7",
-    "@deepseek-ai/dsh-sandbox": "^0.1.0-rc.7",
-    "@deepseek-ai/dsh-settings": "^0.1.0-rc.7",
-    "@deepseek-ai/dsh-shell": "^0.1.0-rc.7",
-    "@deepseek-ai/dsh-tools": "^0.1.0-rc.7",
-    "@deepseek-ai/schemastery": "^3.18.0"
+    "@deepseek-ai/cordis": ">=4.0.1",
+    "@deepseek-ai/dsh-bash-local": ">=0.1.0-rc.7",
+    "@deepseek-ai/dsh-llm": ">=0.1.0-rc.7",
+    "@deepseek-ai/dsh-pwsh-local": ">=0.1.0-rc.7",
+    "@deepseek-ai/dsh-pwsh-sandbox": ">=0.1.0-rc.7",
+    "@deepseek-ai/dsh-sandbox": ">=0.1.0-rc.7",
+    "@deepseek-ai/dsh-settings": ">=0.1.0-rc.7",
+    "@deepseek-ai/dsh-shell": ">=0.1.0-rc.7",
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.7",
+    "@deepseek-ai/schemastery": ">=3.18.0"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/cordis": {
