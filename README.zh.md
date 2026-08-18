@@ -16,6 +16,51 @@
 - 沙箱 `auto`：Git Bash 探测 windows-acl runner，WSL 探测发行版内 `bwrap`；探测失败如实降级为无限制运行并如实报告。显式 `sandbox: bwrap` 而发行版缺少 bubblewrap 时，在首次执行 `wsl_bash` 命令时响亮报错（不会拖垮启动），其余后端不受影响。
 - 所有行在 host 平面注册：无论会话使用哪个 agent preset，都能看到这两个工具。
 
+## 沙箱行为（重要，请先阅读 ⚠️）
+
+三个后端的文件沙箱**能力不同**，使用前务必确认：
+
+| 后端 | 沙箱机制 | enforcement | 探针失败时的行为 |
+| --- | --- | --- | --- |
+| `pwsh` | windows-acl 受限令牌（restricted-token runner） | partial | 无探针——始终受限 |
+| `wsl_bash` | 发行版内 `bwrap`（bubblewrap） | full | 无沙箱运行，结果不携带沙箱事实 |
+| `git_bash` | windows-acl runner 包 MSYS bash | partial（探针通过时） | 探针失败则无沙箱运行，结果不携带沙箱事实 |
+
+> ⚠️ **`git_bash` 在 Git for Windows 部署下通常无法沙箱化。** windows-acl runner 以受限令牌拉起 MSYS `bash.exe` 时 `CreateProcessAsUserW` 返回 Win32 error 2（`cmd.exe`、`pwsh.exe` 均可正常拉起）；`sandbox: auto` 的探针失败后按契约降级为**无限制运行**。**不要假设 `git_bash` 受 DSH 沙箱保护**——敏感操作请改用 `pwsh`（受限令牌生效）或 `wsl_bash`（bwrap 生效），或走显式升级审批。
+>
+> ⚠️ **`wsl_bash` 的沙箱依赖发行版内的 bubblewrap。** 未安装 bwrap 时 `auto` 同样降级为无限制运行；探针结果在**宿主进程生命周期内缓存**——安装 bwrap 后必须重启 `dsh web`（或改动 shell 设置节触发后端重建）才会重新探测。
+>
+> ⚠️ **拒绝判定要求命令以非零退出结束。** 被拦截的写操作若以成功命令收尾（如 `echo nope > /etc/x; echo done`），整体退出码为 0，不会标记 `[sandbox: file access denied]`（与上游 bash-sandbox 的判定规则一致，避免误报）。
+>
+> 沙箱只约束**文件系统效果**（`workspace-write` / `read-only`），不限制网络、进程等其它资源。
+
+### 为 `wsl_bash` 启用 bwrap 沙箱
+
+`wsl_bash` 的沙箱需要发行版内有 bubblewrap。Ubuntu/Debian 系安装：
+
+```bash
+wsl.exe -d Ubuntu-24.04 -e sudo apt-get install -y bubblewrap   # 从 Windows 侧直接安装
+wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"   # 验证
+```
+
+- 探针探测的是 `wsl -l -q` 的**第一个发行版**；若目标发行版不是第一个，在 `cordis.patch.yml` 的 `wslBash.wslDistro` 钉定它，并**在该发行版内**安装 bwrap（如 `Ubuntu-24.04`；`docker-desktop` 无 bash，不可用）。
+- `sudo` 可能需要密码（取决于发行版的 sudoers 配置）；脚本化请用 `apt-get install -y`。
+- 其它发行版系：Fedora `dnf install bubblewrap`，Alpine `apk add bubblewrap`。
+- 装完后**必须重启 `dsh web`**（或改动 shell 设置节触发后端重建）——探针结果在宿主进程生命周期内缓存，重启前 `wsl_bash` 仍按无沙箱运行。
+
+## 路径转换（MSYS 自动改写）
+
+Git Bash 在调用原生 Windows 程序时会把形如 `/root` 的 POSIX 路径自动改写成 Windows 路径（如 `<Git 根目录>\root`），这是 MSYS 的标准行为，不是本插件的缺陷。在 `git_bash` 里直接调用 `wsl.exe`（或其他原生 exe）并传 POSIX 路径时会被改写而失败：
+
+```bash
+wsl.exe -e ls /root                       # ✗ ls: cannot access 'D:/Program Files/Git/root'
+MSYS_NO_PATHCONV=1 wsl.exe -e ls /root    # ✓ 原样传递
+```
+
+- 需要原样传参时，给命令加 `MSYS_NO_PATHCONV=1`（或 `MSYS2_ARG_CONV_EXCL="*"`），也可用 `//` 前缀转义单个参数。
+- WSL 相关操作**推荐直接用 `wsl_bash` 工具**：它从 Node 直接 spawn `wsl.exe`，命令以 base64 载荷进入发行版，引号与 Linux 路径原样传递，不存在改写问题。
+- 插件自身的内部路径（Git Bash 探测、bwrap 工作区根、workdir）都由 Node 直接传递，不受 MSYS 改写影响。
+
 ## 包内容
 
 完整功能实现以纯 ESM JS 打包在 `lib/`（无构建步骤），只依赖 dsh 的已发布基础包：
@@ -34,7 +79,7 @@ lib/
 ## 前置条件
 
 - dsh profile 含已发布的 `@deepseek-ai` 基础包（任何标准部署都有）。
-- 本机有 Git Bash 和/或 WSL（缺失的后端仅首次使用时报错，不影响 pwsh）。
+- 主机上有 Git Bash 和/或 WSL（缺失的后端仅首次使用时报错，不影响 pwsh）。
 
 ## 插拔方式（二选一，互斥！）
 
@@ -82,8 +127,10 @@ powershell -ExecutionPolicy Bypass -File .\smoke\run.ps1
 | 引导失败 `Cannot find package '@deepseek-ai/...'` | 包内 `node_modules/@deepseek-ai` junction 缺失（重跑 install.ps1），或 profile 运行时基础包不完整 |
 | `git_bash` 执行报找不到 bash | Git Bash 不在默认探测路径：重跑 install.ps1（注册表自动检测），或手动设置 `gitBash.bashPath` |
 | `wsl_bash` 执行报错 | `wsl.exe --status` 是否有默认发行版；可在 `wslBash.wslDistro` 指定发行版名 |
-| `wsl_bash` 报 `bwrap was not found` | 已配置 `sandbox: bwrap` 但发行版内没有 bubblewrap：安装之（如 `apt install bubblewrap`），或改用 `sandbox: auto` / `none` |
+| `wsl_bash` 报 `bwrap was not found` | 已配置 `sandbox: bwrap` 但发行版内没有 bubblewrap：按上方「沙箱行为 → 为 `wsl_bash` 启用 bwrap 沙箱」安装（`sudo apt-get install -y bubblewrap`）并重启 `dsh web`，或改用 `sandbox: auto` / `none` |
 | `wsl_bash` 沙箱报 bwrap runner 失败 | bwrap 的工作区根取 Windows 盘符路径的 Linux 侧（`/mnt/<盘符>/...`）：UNC 工作区根会响亮报错；发行版自定义了 automount 根（wsl.conf `automount.root`）时需要相应配置 |
+| `git_bash` 里调 `wsl.exe` 等原生程序传 POSIX 路径报 `No such file or directory` | MSYS 把 `/root` 等改写成 `<Git 根目录>\root`：加 `MSYS_NO_PATHCONV=1` / `MSYS2_ARG_CONV_EXCL="*"`，或用 `//` 前缀；WSL 操作直接改用 `wsl_bash` 工具 |
+| 安装 bubblewrap 后 `wsl_bash` 仍无沙箱 | bwrap 探针结果在宿主进程生命周期内缓存：重启 `dsh web`，或改动 shell 设置节触发后端重建后再试 |
 | 执行报 `shell-select: backend "x" is not enabled` | backends 列表与工具名不匹配；保持 `backends: [git-bash, wsl-bash, pwsh]` |
 
 ## 文件布局
