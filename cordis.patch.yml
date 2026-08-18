@@ -1,0 +1,55 @@
+# dsh-win-multi-bash — self-contained Windows multi-bash wiring.
+#
+# This patch is the whole plugin: it disables the base shell rows that would
+# fight for the single ctx.shell seat, then inserts the plugin's own rows.
+# Every inserted row loads code from THIS package (exports ./shell-select,
+# ./tool-git-bash, ./tool-wsl-bash) — nothing depends on runtime packages
+# beyond the published @deepseek-ai base packages (dsh-shell, dsh-sandbox,
+# dsh-pwsh-sandbox, dsh-tools, ...).
+#
+# ── What the rows do ─────────────────────────────────────────────────────────
+#   pwsh-sandbox        — disabled: its pwsh backend is held by our selector's
+#                         `pwsh:` partition (idempotent when the base bundle
+#                         already disables it).
+#   shell-select        — disabled when the base bundle already mounts its own
+#                         selector: two providers would fight for
+#                         the ctx.shell seat. No-op on base bundles without it.
+#   win-mb-shell-select — our bundled selector: routes
+#                         `request.shell ?? default` across git-bash / wsl-bash
+#                         / pwsh backends; pwsh stays the default.
+#   win-mb-tool-git     — registers the model-facing `git_bash` tool
+#                         (request.shell 'git-bash', MSYS dialect) into the
+#                         host tools registry: every session sees it regardless
+#                         of its agent preset.
+#   win-mb-tool-wsl     — the `wsl_bash` tool (request.shell 'wsl-bash').
+#
+# Both tool rows and the selector are win32-only; POSIX keeps the direct
+# bash-sandbox seat untouched.
+
+- id: pwsh-sandbox
+  disabled: true
+
+- id: shell-select
+  disabled: true
+
+- insert:
+    - id: win-mb-shell-select
+      name: 'dsh-win-multi-bash/shell-select'
+      disabled: !!js process.platform !== 'win32'
+      config:
+        backends: [git-bash, wsl-bash, pwsh]
+        default: pwsh
+        # Optional per-machine executable pins (restate the whole config when
+        # uncommenting — a patch replaces the row's entire config):
+        #   gitBash:
+        #     bashPath: 'D:\Program Files\Git\usr\bin\bash.exe'
+        #   wslBash:
+        #     wslDistro: 'Ubuntu-24.04'
+
+    - id: win-mb-tool-git
+      name: 'dsh-win-multi-bash/tool-git-bash'
+      disabled: !!js process.platform !== 'win32'
+
+    - id: win-mb-tool-wsl
+      name: 'dsh-win-multi-bash/tool-wsl-bash'
+      disabled: !!js process.platform !== 'win32'

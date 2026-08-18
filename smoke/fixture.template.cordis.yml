@@ -1,0 +1,47 @@
+# Smoke fixture for dsh-win-multi-bash: boots the real loader with EXACTLY the
+# rows the plugin wires (win-mb-* rows loading from THIS package's own
+# subpaths), then driver.mjs executes one real command through each tool.
+#
+# __BASH_PATH__ is substituted by the test runner: "" (quoted empty - NOT a
+# bare empty value, which YAML parses as null and crashes the executor's
+# resolveBashPath) exercises the schema default resolution, a real path pins
+# gitBash.bashPath explicitly. Single-quoted: double quotes would treat
+# backslashes as escape sequences.
+
+- id: system-prompt
+  name: '@deepseek-ai/dsh-system-prompt'
+
+- id: tools
+  name: '@deepseek-ai/dsh-tools'
+
+- id: subprocess
+  name: '@deepseek-ai/dsh-subprocess-local'
+
+- id: sandbox
+  name: '@deepseek-ai/dsh-sandbox-local'
+
+- id: sandbox-policy
+  name: '@deepseek-ai/dsh-sandbox-policy'
+
+- id: shell-env
+  name: '@deepseek-ai/dsh-shell-env'
+
+- id: tasks
+  name: '@deepseek-ai/dsh-jobs-local'
+
+- id: tool-jobs
+  name: '@deepseek-ai/dsh-tool-jobs'
+
+- id: win-mb-shell-select
+  name: 'dsh-win-multi-bash/shell-select'
+  config:
+    backends: [git-bash, wsl-bash, pwsh]
+    default: pwsh
+    gitBash:
+      bashPath: '__BASH_PATH__'
+
+- id: win-mb-tool-git
+  name: 'dsh-win-multi-bash/tool-git-bash'
+
+- id: win-mb-tool-wsl
+  name: 'dsh-win-multi-bash/tool-wsl-bash'
