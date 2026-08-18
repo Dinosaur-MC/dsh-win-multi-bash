@@ -955,6 +955,15 @@ console.log('\n[B] boot integration: no-pin fixture (auto git-path resolution, n
         const text = await execTool(ctx, 'git_bash', { command: 'git --version' })
         assert.match(text, /git version/i)
       }],
+      ['no-pin git_bash: full MSYS toolchain present (PATH-injected spawn env)', async () => {
+        const TOOLS = ['ls', 'cat', 'grep', 'sed', 'awk', 'find', 'sort', 'uniq', 'wc', 'head', 'tail',
+          'cut', 'tr', 'xargs', 'printf', 'sleep', 'date', 'tar', 'gzip', 'ssh', 'curl', 'cygpath']
+        const text = await execTool(ctx, 'git_bash', {
+          command: `for t in ${TOOLS.join(' ')}; do command -v "$t" >/dev/null 2>&1 && printf 'OK %s\\n' "$t" || printf 'MISS %s\\n' "$t"; done`,
+        })
+        const misses = text.split('\n').filter((l) => l.startsWith('MISS'))
+        assert.deepEqual(misses, [], `missing from spawn PATH: ${misses.join(', ')}`)
+      }],
     ])
   } finally {
     if (ctx) await ctx.fiber.dispose()
