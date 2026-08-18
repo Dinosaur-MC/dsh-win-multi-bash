@@ -1,0 +1,43 @@
+# Third Party Notices
+
+This package bundles compiled JavaScript from the DeepSeek Harness project
+([deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)), which is
+distributed under the MIT License:
+
+> MIT License
+>
+> Copyright (c) 2026 DeepSeek
+>
+> Permission is hereby granted, free of charge, to any person obtaining a copy
+> of this software and associated documentation files (the "Software"), to deal
+> in the Software without restriction, including without limitation the rights
+> to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+> copies of the Software, and to permit persons to whom the Software is
+> furnished to do so, subject to the following conditions:
+>
+> The above copyright notice and this permission notice shall be included in all
+> copies or substantial portions of the Software.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+> IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+> FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+> AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+> LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+> OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+> SOFTWARE.
+
+## Bundled modules
+
+The modules below correspond to the upstream package files they were built
+from; import specifiers were rewired to package-local paths where noted.
+
+| Plugin path | Upstream package | Notes |
+| --- | --- | --- |
+| `lib/shell-select/` | `packages/shell/shell-select` | `ShellSelectExecutor`; imports of `@deepseek-ai/dsh-bash-git` / `dsh-bash-wsl` rewritten to `../bash-git/index.js` / `../bash-wsl/index.js` |
+| `lib/bash-git/` | `packages/shell/bash-git` | `GitBashExecutor`; `@deepseek-ai/dsh-bash-sandbox/helpers` import rewritten to `../vendor/helpers.js` |
+| `lib/bash-wsl/` | `packages/shell/bash-wsl` | `WslBashExecutor`; helpers and `@deepseek-ai/dsh-sandbox-local/profiles` imports rewritten to `../vendor/*.js` |
+| `lib/tool-bash/` | `packages/shell/tool-bash` | `defineShellTool` factory + `git_bash` / `wsl_bash` instances |
+| `lib/vendor/helpers.js` | `packages/shell/bash-sandbox/lib/types/helpers.js` | Self-contained (node:fs only) |
+| `lib/vendor/bwrap-profiles.js` | `packages/sandbox/sandbox-local/lib/types/profiles.js` | Extracted `BWRAP_RUNNER_FAILURE_RULES` + `bwrapProfileArgs` only (drops the landlock native-addon import) |
+
+The bundled files retain their upstream `@module` documentation headers.
