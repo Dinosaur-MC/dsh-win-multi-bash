@@ -48,6 +48,12 @@
         #     bashPath: '<Git 安装目录>\usr\bin\bash.exe'
         #   wslBash:
         #     wslDistro: '<发行版名，如 Ubuntu-24.04>'
+        #
+        # Optional sandbox hardening: when a backend's probe fails (windows-acl
+        # cannot confine MSYS bash / bwrap missing in the distro), refuse to run
+        # unconfined unless the effective mode is danger-full-access:
+        #   gitBash: { requireSandbox: true }
+        #   wslBash: { requireSandbox: true }
 
     - id: win-mb-tool-git
       name: 'dsh-win-multi-bash/tool-git-bash'

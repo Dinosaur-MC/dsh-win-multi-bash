@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     热插 dsh-win-multi-bash（自包含版）：把插件链接进 profile 的 node_modules，
     并把接线块写入 profile 的 cordis.patch.yml。dsh web 会热重载该文件，无需重启。
@@ -151,6 +151,9 @@ $block = @"
         backends: [git-bash, wsl-bash, pwsh]
         default: pwsh
 $gitBashLines
+        # 沙箱强化（可选）：探针失败时拒绝无沙箱运行，仅 danger-full-access 放行：
+        #   gitBash: { requireSandbox: true }
+        #   wslBash: { requireSandbox: true }
     - id: win-mb-tool-git
       name: 'dsh-win-multi-bash/tool-git-bash'
       disabled: !!js process.platform !== 'win32'
