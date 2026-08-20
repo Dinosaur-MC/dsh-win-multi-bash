@@ -19,7 +19,7 @@
 
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -33,7 +33,7 @@ const { isRunnerSpawnFailure, classifyDenial, classifyRunnerFailure, matchesSign
   await import(libUrl('vendor', 'helpers.js'))
 const { BWRAP_RUNNER_FAILURE_RULES, bwrapProfileArgs } =
   await import(libUrl('vendor', 'bwrap-profiles.js'))
-const { GitBashExecutor, candidateBashPaths, gitRootCandidates, gitToolPath, resolveBashPath } =
+const { GitBashExecutor, candidateBashPaths, candidateExists, gitCandidatesUnder, gitRootCandidates, gitToolPath, probeDrives, resolveBashPath } =
   await import(libUrl('bash-git', 'index.js'))
 const { WslBashExecutor } = await import(libUrl('bash-wsl', 'index.js'))
 const { ShellSelectExecutor, SHELL_BACKEND_UNAVAILABLE } =
@@ -431,9 +431,9 @@ console.log('\n[A] unit: GitBashExecutor (internals hooks)')
   }
 }
 
-console.log('\n[A] unit: bash resolution (git-path inference, never the WSL launcher)')
+console.log('\n[A] unit: bash resolution (git-path inference, never the WSL launcher or WindowsApps aliases)')
 {
-  const bareEnv = (path) => ({ PATH: path, SystemRoot: 'C:\\Windows', ProgramFiles: 'G:\\no-such-pf', 'ProgramFiles(x86)': 'G:\\no-such-x86' })
+  const bareEnv = (path) => ({ PATH: path, SystemRoot: 'C:\\Windows', ProgramFiles: 'G:\\no-such-pf', 'ProgramFiles(x86)': 'G:\\no-such-x86', GitProbeDrives: '' })
 
   test('gitRootCandidates: infers root from <root>\\cmd on PATH (git.exe present)', () => {
     const tmp = mkdtempSync(join(tmpdir(), 'dsh-wmb-gitroot-'))
@@ -484,6 +484,58 @@ console.log('\n[A] unit: bash resolution (git-path inference, never the WSL laun
   test('resolveBashPath: configured pin always wins', () => {
     const env = bareEnv('C:\\Windows\\System32')
     assert.equal(resolveBashPath('D:\\pinned\\bash.exe', env, 'win32'), 'D:\\pinned\\bash.exe')
+  })
+  test('candidateExists: rejects a symlink (broken app-alias shape), accepts a regular file', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'dsh-wmb-symlink-'))
+    try {
+      const target = join(tmp, 'target.exe')
+      writeFileSync(target, '')
+      try {
+        symlinkSync(target, join(tmp, 'bash.exe'), 'file')
+      } catch {
+        console.log('  … skipping symlink case: creating symlinks needs admin/developer mode')
+        return
+      }
+      assert.equal(candidateExists(join(tmp, 'bash.exe')), false)
+      assert.equal(candidateExists(target), true)
+    } finally { rmSync(tmp, { recursive: true, force: true }) }
+  })
+  test('candidateBashPaths: a WindowsApps dir on PATH is never a candidate', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'dsh-wmb-wa-'))
+    try {
+      const wa = join(tmp, 'WindowsApps')
+      mkdirSync(wa, { recursive: true })
+      writeFileSync(join(wa, 'bash.exe'), '')
+      const env = bareEnv(wa)
+      const paths = candidateBashPaths(env)
+      assert.ok(!paths.some((p) => p.toLowerCase() === join(wa, 'bash.exe').toLowerCase()))
+      assert.equal(resolveBashPath(undefined, env, 'win32'), undefined)
+    } finally { rmSync(tmp, { recursive: true, force: true }) }
+  })
+  test('gitCandidatesUnder: well-known layout under a drive root', () => {
+    assert.deepEqual(gitCandidatesUnder('D:\\Program Files'), [
+      'D:\\Program Files\\Git\\bin\\bash.exe',
+      'D:\\Program Files\\Git\\usr\\bin\\bash.exe',
+    ])
+  })
+  test('probeDrives: explicit override wins; empty override disables probing', () => {
+    assert.deepEqual(probeDrives({ GitProbeDrives: '' }), [])
+    assert.deepEqual(probeDrives({ GitProbeDrives: 'C' }), ['C:\\'])
+  })
+  test('resolveBashPath: git-root inference wins over an earlier PATH bash', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'dsh-wmb-order-'))
+    try {
+      const root = join(tmp, 'Git')
+      mkdirSync(join(root, 'cmd'), { recursive: true })
+      mkdirSync(join(root, 'usr', 'bin'), { recursive: true })
+      writeFileSync(join(root, 'cmd', 'git.exe'), '')
+      writeFileSync(join(root, 'usr', 'bin', 'bash.exe'), '')
+      const foreign = join(tmp, 'Strawberry', 'c', 'bin')
+      mkdirSync(foreign, { recursive: true })
+      writeFileSync(join(foreign, 'bash.exe'), '')
+      const env = bareEnv(`${foreign};${join(root, 'cmd')}`)
+      assert.equal(resolveBashPath(undefined, env, 'win32'), join(root, 'usr', 'bin', 'bash.exe'))
+    } finally { rmSync(tmp, { recursive: true, force: true }) }
   })
   test('gitToolPath: <root>\\usr\\bin bash injects cmd/bin/usr\\bin (full toolchain)', () => {
     const p = gitToolPath('D:\\Program Files\\Git\\usr\\bin\\bash.exe', 'C:\\Windows\\System32')
@@ -1087,9 +1139,11 @@ console.log('\n[B] boot integration: misconfiguration matrices')
     if (ctx2) await ctx2.fiber.dispose()
   }
 
-  // #3 (fixed): explicit `sandbox: bwrap` without bubblewrap must NOT brick the
-  // boot (the selector's sandboxMode advertisement now tolerates a backend's
-  // probe failure); the error surfaces loudly at the first wsl_bash command.
+  // #3 (fixed): explicit `sandbox: bwrap` must NOT brick the boot (the
+  // selector's sandboxMode advertisement now tolerates a backend's probe
+  // failure). What the first wsl_bash command does is host-dependent: with
+  // bubblewrap in the distro it confines and runs; without it, the explicit
+  // stance fails loudly instead of running unconfined.
   let ctx3
   try {
     ctx3 = await bootFixture(`
@@ -1108,7 +1162,7 @@ console.log('\n[B] boot integration: misconfiguration matrices')
   name: 'dsh-win-multi-bash/tool-wsl-bash'
 `, 'explicit-bwrap.yml')
     await runTests(ctx3, [
-      ['#3: boot succeeds with explicit bwrap + missing bubblewrap', async () => {
+      ['#3: boot succeeds with explicit bwrap', async () => {
         const names = ctx3.tools.schemas().map((t) => t.name)
         assert.ok(names.includes('git_bash'))
         assert.ok(names.includes('wsl_bash'))
@@ -1117,9 +1171,12 @@ console.log('\n[B] boot integration: misconfiguration matrices')
         const text = await execTool(ctx3, 'git_bash', { command: 'echo still-works' })
         assert.match(text, /still-works/)
       }],
-      ['#3: first wsl_bash use fails loud with the bwrap message', async () => {
+      ['#3: first wsl_bash use — confined run when bwrap exists, loud failure when absent', async () => {
         const r = await execToolResult(ctx3, 'wsl_bash', { command: 'echo x' })
-        assert.ok(/bwrap was not found/.test(r.text), `text: ${r.text.slice(0, 200)}`)
+        // Host without bubblewrap: the explicit stance must fail loud, never run unconfined.
+        if (/bwrap was not found/.test(r.text)) return
+        // Host with bubblewrap: the explicit stance confines and the command runs.
+        assert.match(r.text, /x/, `unexpected result: ${r.text.slice(0, 200)}`)
       }],
     ])
   } finally {

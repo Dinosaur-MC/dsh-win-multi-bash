@@ -14,7 +14,7 @@
 
 - `shell-select` 占据唯一的 `ctx.shell` 席位，按 `request.shell ?? default` 路由；`default` 保持 `pwsh`。
 - 可执行文件解析与沙箱探测全部惰性化：未安装 Git Bash / WSL 不影响 pwsh，首次使用时才响亮报错。
-- Git Bash 自动查找，顺序为：显式 `gitBash.bashPath` → 常见 Program Files 位置 → PATH 上的 `bash.exe`（**绝不选** Windows 的 WSL 启动器 `System32\bash.exe`——本工具是 MSYS 而非 WSL）→ 从 PATH 上 `git.exe` 布局目录反推的 Git 安装根（因此通过 `git` 可达的安装无需钉定即可找到）→ 最后读取 `HKLM\SOFTWARE\GitForWindows` 注册表安装路径（Git for Windows 安装器必写该键，覆盖自定义盘符与便携安装）。
+- Git Bash 自动查找，顺序为：显式 `gitBash.bashPath` → 从 PATH 上 `git.exe` 布局目录反推的 Git 安装根（因此通过 `git` 可达的安装无需钉定即可找到，即使不在常见位置）→ 每个固定盘上的常见 Program Files 布局（`C:\Program Files\Git`、`D:\Program Files\Git` 等）→ PATH 上的 `bash.exe` → 最后读取 `HKLM\SOFTWARE\GitForWindows` 注册表安装路径（Git for Windows 安装器必写该键，覆盖便携安装）。Windows 的 WSL 启动器 `System32\bash.exe` 与 `WindowsApps` 应用执行别名目录**绝不入选**，且候选必须是真实普通文件——符号链接 / reparse point 一律拒绝——因此失效的 WSL `bash.exe` 别名永远无法遮蔽真实 Git Bash（本工具是 MSYS 而非 WSL）。
 - 沙箱 `auto`：Git Bash 探测 windows-acl runner，WSL 探测发行版内 `bwrap`；探测失败如实降级为无限制运行并如实报告。显式 `sandbox: bwrap` 而发行版缺少 bubblewrap 时，在首次执行 `wsl_bash` 命令时响亮报错（不会拖垮启动），其余后端不受影响。
 - 所有行在 host 平面注册：无论会话使用哪个 agent preset，都能看到这两个工具。
 
@@ -140,7 +140,7 @@ powershell -ExecutionPolicy Bypass -File .\smoke\run.ps1
 | 新会话看不到 `git_bash` / `wsl_bash` | 检查 profile patch 里 managed 块存在、profile `node_modules/dsh-win-multi-bash` junction 存在、包内 `node_modules/@deepseek-ai` junction 存在（重跑 install.ps1）；确认运行中 `dsh web` 热重载生效 |
 | 引导失败 `duplicate loader entry id` | 两种插拔方式混用了；先卸载其中一种 |
 | 引导失败 `Cannot find package '@deepseek-ai/...'` | 包内 `node_modules/@deepseek-ai` junction 缺失（重跑 install.ps1），或 profile 运行时基础包不完整 |
-| `git_bash` 执行报找不到 bash | Git Bash 不在默认探测路径：重跑 install.ps1（注册表自动检测），或手动设置 `gitBash.bashPath` |
+| `git_bash` 执行报找不到 bash（或去 spawn WSL 的 `WindowsApps\bash.exe` 别名并报 `spawn ... ENOENT`） | Git Bash 不在探测路径，或失效的 WSL 应用执行别名遮蔽了解析：删除 `%LOCALAPPDATA%\Microsoft\WindowsApps\bash.exe`（设置 → 应用 → 高级应用设置 → 应用执行别名），重跑 install.ps1（注册表自动检测），或手动设置 `gitBash.bashPath` |
 | `wsl_bash` 执行报错 | `wsl.exe --status` 是否有默认发行版；可在 `wslBash.wslDistro` 指定发行版名 |
 | `wsl_bash` 报 `bwrap was not found` | 已配置 `sandbox: bwrap` 但发行版内没有 bubblewrap：按上方「沙箱行为 → 为 `wsl_bash` 启用 bwrap 沙箱」安装（`sudo apt-get install -y bubblewrap`）并重启 `dsh web`，或改用 `sandbox: auto` / `none` |
 | `wsl_bash` 沙箱报 bwrap runner 失败 | bwrap 的工作区根取 Windows 盘符路径的 Linux 侧（`/mnt/<盘符>/...`）：UNC 工作区根会响亮报错；发行版自定义了 automount 根（wsl.conf `automount.root`）时需要相应配置 |

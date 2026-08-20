@@ -39,25 +39,19 @@ function Ensure-Junction([string]$Path, [string]$Target) {
 <#
 .SYNOPSIS
     探测本机真实 Git Bash 路径（与插件 resolveBashPath 同一策略，绝不硬编码）：
-    Program Files 常见位置 → PATH 上的 bash.exe（排除 System32 的 WSL 启动器）
-    → 从 PATH 上 git.exe 布局目录（cmd/bin/usr\bin）反推 Git 根。
+    PATH 上 git.exe 布局目录反推的 Git 根（最优先）→ 每个固定盘的
+    Program Files 常见位置（含 D 盘等非 C 盘安装）→ PATH 上的 bash.exe
+    （排除 System32 的 WSL 启动器与 WindowsApps 别名目录，拒绝 reparse point）。
     探测不到返回 $null。
 #>
 function Find-GitBash {
     $candidates = [System.Collections.Generic.List[string]]::new()
-    foreach ($pf in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
-        if ($pf) {
-            $candidates.Add((Join-Path $pf 'Git\bin\bash.exe'))
-            $candidates.Add((Join-Path $pf 'Git\usr\bin\bash.exe'))
-        }
-    }
-    $wslLauncher = (Join-Path $env:SystemRoot 'System32\bash.exe').ToLowerInvariant()
+    # 1) git.exe 布局反推的 Git 根最优先：真实安装的最强信号，先于一切 PATH 扫描。
     $roots = [System.Collections.Generic.List[string]]::new()
     $seen = @{}
     foreach ($pe in ($env:PATH -split ';')) {
         $t = $pe.Trim().Trim('"')
         if (-not $t) { continue }
-        $candidates.Add((Join-Path $t 'bash.exe'))
         $base = Split-Path -Leaf $t
         if ($base -ne 'cmd' -and $base -ne 'bin') { continue }
         $parent = Split-Path -Parent $t
@@ -73,9 +67,27 @@ function Find-GitBash {
         $candidates.Add((Join-Path $root 'usr\bin\bash.exe'))
         $candidates.Add((Join-Path $root 'bin\bash.exe'))
     }
+    # 2) 每个固定盘的 Program Files 常见位置（含 Program Files (x86)）。
+    foreach ($drive in (Get-PSDrive -PSProvider FileSystem | Select-Object -ExpandProperty Root)) {
+        foreach ($pf in @((Join-Path $drive 'Program Files'), (Join-Path $drive 'Program Files (x86)'))) {
+            $candidates.Add((Join-Path $pf 'Git\bin\bash.exe'))
+            $candidates.Add((Join-Path $pf 'Git\usr\bin\bash.exe'))
+        }
+    }
+    # 3) PATH 扫描——跳过 System32 的 WSL 启动器与 WindowsApps 别名目录。
+    $wslLauncher = (Join-Path $env:SystemRoot 'System32\bash.exe').ToLowerInvariant()
+    foreach ($pe in ($env:PATH -split ';')) {
+        $t = $pe.Trim().Trim('"')
+        if (-not $t) { continue }
+        if ((Split-Path -Leaf $t).ToLowerInvariant() -eq 'windowsapps') { continue }
+        $candidates.Add((Join-Path $t 'bash.exe'))
+    }
     foreach ($c in $candidates) {
         if ($c.ToLowerInvariant() -eq $wslLauncher) { continue }
-        if (Test-Path $c) { return $c }
+        $item = Get-Item $c -Force -ErrorAction SilentlyContinue
+        if (-not $item) { continue }
+        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
+        if (-not $item.PSIsContainer) { return $c }
     }
     return $null
 }

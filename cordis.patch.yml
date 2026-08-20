@@ -42,8 +42,9 @@
         # Optional per-machine executable pins (restate the whole config when
         # uncommenting — a patch replaces the row's entire config). The values
         # below are placeholders only — omit the pins entirely and let
-        # resolution probe automatically (well-known locations → PATH, the WSL
-        # launcher excluded, git.exe layout inference):
+        # resolution probe automatically (git.exe layout inference → well-known
+        # Program Files on every fixed drive → PATH, with the WSL launcher and
+        # WindowsApps aliases excluded):
         #   gitBash:
         #     bashPath: '<Git 安装目录>\usr\bin\bash.exe'
         #   wslBash:
