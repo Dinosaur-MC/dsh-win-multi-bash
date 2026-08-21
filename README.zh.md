@@ -62,6 +62,16 @@ wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"   # 验
 - 其它发行版系：Fedora `dnf install bubblewrap`，Alpine `apk add bubblewrap`。
 - 装完后**必须重启 `dsh web`**（或改动 shell 设置节触发后端重建）——探针结果在宿主进程生命周期内缓存，重启前 `wsl_bash` 仍按无沙箱运行。
 
+## 工具提示词（面向模型的描述）
+
+`git_bash` / `wsl_bash` 的工具描述刻意保持精简，与官方 `tool-pwsh` 同构：每次调用全新 shell、方言的路径/环境变量写法、`[exit code: N]` 标记、`$DSH_*` 环境事实、沙箱行为、输出截断、后台任务与升级契约。更长的方言说明（MSYS 路径改写、WSL base64 载荷）放在本文档而不是模型可见的描述里。
+
+`git_bash` 的描述还带一条路径格式提示：
+
+> MSYS paths work inside Git Bash only — dsh's file tools (`read`, `write`, `edit`) on Windows take native `C:\...` paths.
+
+即命令输出里的 MSYS 路径（如 `/d/WorkSpace/foo`）在交给 dsh 文件工具前要转成 Windows 形式（`D:\WorkSpace\foo`）；而在 bash 命令内部，MSYS 路径才是 shell 期望的写法。
+
 ## 路径转换（MSYS 自动改写）
 
 Git Bash 在调用原生 Windows 程序时会把形如 `/root` 的 POSIX 路径自动改写成 Windows 路径（如 `<Git 根目录>\root`），这是 MSYS 的标准行为，不是本插件的缺陷。在 `git_bash` 里直接调用 `wsl.exe`（或其他原生 exe）并传 POSIX 路径时会被改写而失败：

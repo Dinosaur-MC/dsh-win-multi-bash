@@ -20,8 +20,13 @@
 #   win-mb-tool-git     — registers the model-facing `git_bash` tool
 #                         (request.shell 'git-bash', MSYS dialect) into the
 #                         host tools registry: every session sees it regardless
-#                         of its agent preset.
-#   win-mb-tool-wsl     — the `wsl_bash` tool (request.shell 'wsl-bash').
+#                         of its agent preset. Its model-facing description
+#                         mirrors the official tool-pwsh skeleton (concise)
+#                         and reminds the model that MSYS paths are valid only
+#                         inside Git Bash — dsh's file tools on Windows take
+#                         native C:\... paths.
+#   win-mb-tool-wsl     — the `wsl_bash` tool (request.shell 'wsl-bash');
+#                         its description mirrors tool-pwsh's concise skeleton.
 #
 # Both tool rows and the selector are win32-only; POSIX keeps the direct
 # bash-sandbox seat untouched.

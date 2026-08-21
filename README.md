@@ -62,6 +62,16 @@ wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"   # ver
 - Other distro families: Fedora `dnf install bubblewrap`, Alpine `apk add bubblewrap`.
 - After installing you **must restart `dsh web`** (or touch the shell settings section to rebuild backends) — the probe verdict is cached for the host process lifetime, and `wsl_bash` stays unconfined until then.
 
+## Tool prompts (model-facing descriptions)
+
+The `git_bash` / `wsl_bash` tool descriptions are deliberately concise and mirror the official `tool-pwsh` skeleton: a fresh shell per call, the dialect's paths/env form, `[exit code: N]` markers, `$DSH_*` environment facts, sandbox behavior, output truncation, background jobs, and the escalation contract. The longer dialect notes (MSYS path rewriting, WSL base64 payloads) live in this README rather than in the model-facing text.
+
+`git_bash`'s description additionally carries a path-format hint:
+
+> MSYS paths work inside Git Bash only — dsh's file tools (`read`, `write`, `edit`) on Windows take native `C:\...` paths.
+
+So when a command prints an MSYS path (e.g. `/d/WorkSpace/foo`), convert it to its Windows form (`D:\WorkSpace\foo`) before handing it to dsh's file tools; inside the bash command itself, MSYS paths are what the shell expects.
+
 ## Path conversion (MSYS auto-rewriting)
 
 Git Bash rewrites leading-slash POSIX paths into Windows paths (e.g. `<Git root>\root`) whenever a native Windows program is called — standard MSYS behavior, not a plugin defect. Calling `wsl.exe` (or any native exe) with POSIX paths from inside `git_bash` therefore fails:
