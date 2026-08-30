@@ -20,6 +20,11 @@
 - id: sandbox
   name: '@deepseek-ai/dsh-sandbox-local'
 
+# dsh-sandbox-policy (0.1.2+) activates only once the shared projection
+# registry is present; mirrors the base bundle ordering.
+- id: session-projection
+  name: '@deepseek-ai/dsh-session-projection'
+
 - id: sandbox-policy
   name: '@deepseek-ai/dsh-sandbox-policy'
 

@@ -10,7 +10,7 @@
  */
 
 import { boot, resolveConfigPath } from '@deepseek-ai/dsh-app-boot'
-import { CallId } from '@deepseek-ai/dsh-llm'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
 
 const configPath = process.argv[2]
 if (!configPath) throw new Error('usage: node driver.mjs <fixture.yml>')
@@ -36,7 +36,7 @@ try {
     try {
       const result = await ctx.tools.execute({
         signal: new AbortController().signal,
-        callId: CallId(callId),
+        callId: ToolCallId(callId),
         name,
         arguments: { command, description: `smoke ${name}` },
       })
