@@ -2,17 +2,18 @@
 
 # dsh-win-multi-bash
 
-适用于 DeepSeek Harness 的 Windows multi-bash 插件：`git_bash` / `wsl_bash` 模型工具 + `shell-select` 执行器，在唯一的 `ctx.shell` 席位上路由 Git Bash、WSL 与 pwsh。pwsh 保持默认，未调用 bash 系工具前现有行为完全不变。
+适用于 DeepSeek Harness 的 Windows multi-bash 插件：`git_bash` / `wsl_bash` 两个模型工具，各自持有自己的 Git Bash / WSL 执行器。插件不碰 `ctx.shell` 席位——该席位仍由 dsh 自带的 pwsh 执行器持有——因此 pwsh 行为与未装插件时完全一致。
 
 ## 功能一览
 
 | 工具名 | 后端 | 方言 | 说明 |
 | --- | --- | --- | --- |
-| `git_bash` | git-bash | MSYS | `request.shell: 'git-bash'`，Git for Windows 工具链 |
-| `wsl_bash` | wsl-bash | Linux | `request.shell: 'wsl-bash'`，WSL 发行版内 Linux userland |
-| `pwsh`（原有） | pwsh | — | 选择器默认路由，行为与未装插件时完全一致 |
+| `git_bash` | git-bash | MSYS | 自带 `GitBashExecutor`；Git for Windows 工具链 |
+| `wsl_bash` | wsl-bash | Linux | 自带 `WslBashExecutor`；WSL 发行版内 Linux userland |
+| `pwsh`（dsh 自带） | pwsh | — | 由基座的 `pwsh-sandbox` 行提供，本插件完全不介入 |
 
-- `shell-select` 占据唯一的 `ctx.shell` 席位，按 `request.shell ?? default` 路由；`default` 保持 `pwsh`。
+- 每个工具自行构建并驱动自己的执行器，都不注册为 `ctx.shell`；因此该席位——以及所有 inject `shell` 的插件（dsh 的 `tool-pwsh`、`permission-presets` 等）——不受本插件加载影响。
+- 为什么不再有选择器：dsh 0.1.7 删除了 `ShellExecRequest.shell`，也就是 0.1.7 之前 `shell-select` 用来路由的字段。路由输入没了，只有工具自己知道要哪个 shell——选择器已无从可选，随之取消。
 - 可执行文件解析与沙箱探测全部惰性化：未安装 Git Bash / WSL 不影响 pwsh，首次使用时才响亮报错。
 - Git Bash 自动查找，顺序为：显式 `gitBash.bashPath` → 从 PATH 上 `git.exe` 布局目录反推的 Git 安装根（因此通过 `git` 可达的安装无需钉定即可找到，即使不在常见位置）→ 每个固定盘上的常见 Program Files 布局（`C:\Program Files\Git`、`D:\Program Files\Git` 等）→ PATH 上的 `bash.exe` → 最后读取 `HKLM\SOFTWARE\GitForWindows` 注册表安装路径（Git for Windows 安装器必写该键，覆盖便携安装）。Windows 的 WSL 启动器 `System32\bash.exe` 与 `WindowsApps` 应用执行别名目录**绝不入选**，且候选必须是真实普通文件——符号链接 / reparse point 一律拒绝——因此失效的 WSL `bash.exe` 别名永远无法遮蔽真实 Git Bash（本工具是 MSYS 而非 WSL）。
 - 沙箱 `auto`：Git Bash 探测 windows-acl runner，WSL 探测发行版内 `bwrap`；探测失败如实降级为无限制运行并如实报告。显式 `sandbox: bwrap` 而发行版缺少 bubblewrap 时，在首次执行 `wsl_bash` 命令时响亮报错（不会拖垮启动），其余后端不受影响。
@@ -30,7 +31,7 @@
 
 > ⚠️ **`git_bash` 在 Git for Windows 部署下通常无法沙箱化。** windows-acl runner 以受限令牌拉起 MSYS `bash.exe` 时 `CreateProcessAsUserW` 返回 Win32 error 2（`cmd.exe`、`pwsh.exe` 均可正常拉起）；`sandbox: auto` 的探针失败后按契约降级为**无限制运行**。**不要假设 `git_bash` 受 DSH 沙箱保护**——敏感操作请改用 `pwsh`（受限令牌生效）或 `wsl_bash`（bwrap 生效），或走显式升级审批。
 >
-> ⚠️ **`wsl_bash` 的沙箱依赖发行版内的 bubblewrap。** 未安装 bwrap 时 `auto` 同样降级为无限制运行；探针结果在**宿主进程生命周期内缓存**——安装 bwrap 后必须重启 `dsh web`（或改动 shell 设置节触发后端重建）才会重新探测。
+> ⚠️ **`wsl_bash` 的沙箱依赖发行版内的 bubblewrap。** 未安装 bwrap 时 `auto` 同样降级为无限制运行；探针结果在**宿主进程生命周期内缓存**——安装 bwrap 后必须重启 `dsh web`（或编辑 profile patch 触发工具行重载）才会重新探测。
 >
 > ⚠️ **拒绝判定要求命令以非零退出结束。** 被拦截的写操作若以成功命令收尾（如 `echo nope > /etc/x; echo done`），整体退出码为 0，不会标记 `[sandbox: file access denied]`（与上游 bash-sandbox 的判定规则一致，避免误报）。
 >
@@ -38,12 +39,17 @@
 > **`requireSandbox`：探针失败时拒绝无沙箱运行（可选强化）。** 两个后端均支持 `requireSandbox: true`（默认 `false`，保持既有降级行为）。开启后，探针失败（git-bash 的 windows-acl 不可用 / wsl-bash 缺少 bwrap）时：`danger-full-access` 模式下照常放行（无沙箱运行等价于显式全权批准），`read-only` / `workspace-write` 模式下**拒绝执行**并报错，提示修复沙箱或升级到 `danger-full-access`。同时工具层会声明沙箱并开放 `sandbox_permissions` 升级参数，使模型可以走审批升级。示例：
 
 > ```yaml
-> # cordis.patch.yml 的 win-mb-shell-select 行
-> config:
->   backends: [git-bash, wsl-bash, pwsh]
->   default: pwsh
->   gitBash: { requireSandbox: true }
->   wslBash: { requireSandbox: true }
+> # cordis.patch.yml 的 win-mb-tool-git / win-mb-tool-wsl 行：
+> # 每个工具行只带自己后端的配置分区
+> - id: win-mb-tool-git
+>   name: 'dsh-win-multi-bash/tool-git-bash'
+>   config:
+>     gitBash: { requireSandbox: true }
+>
+> - id: win-mb-tool-wsl
+>   name: 'dsh-win-multi-bash/tool-wsl-bash'
+>   config:
+>     wslBash: { requireSandbox: true }
 > ```
 
 > 注意：`requireSandbox` 与 `sandbox: none` 互斥使用——显式 `none` 是用户主动放弃沙箱，保持放行；`requireSandbox` 只管「想沙箱但探针失败」的情形。
@@ -60,7 +66,7 @@ wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"   # 验
 - 探针探测的是 `wsl -l -q` 的**第一个发行版**；若目标发行版不是第一个，在 `cordis.patch.yml` 的 `wslBash.wslDistro` 钉定它，并**在该发行版内**安装 bwrap（如 `Ubuntu-24.04`；`docker-desktop` 无 bash，不可用）。
 - `sudo` 可能需要密码（取决于发行版的 sudoers 配置）；脚本化请用 `apt-get install -y`。
 - 其它发行版系：Fedora `dnf install bubblewrap`，Alpine `apk add bubblewrap`。
-- 装完后**必须重启 `dsh web`**（或改动 shell 设置节触发后端重建）——探针结果在宿主进程生命周期内缓存，重启前 `wsl_bash` 仍按无沙箱运行。
+- 装完后**必须重启 `dsh web`**（或编辑 profile patch 触发工具行重载）——探针结果在宿主进程生命周期内缓存，重启前 `wsl_bash` 仍按无沙箱运行。
 
 ## 工具提示词（面向模型的描述）
 
@@ -91,14 +97,14 @@ MSYS_NO_PATHCONV=1 wsl.exe -e ls /root    # ✓ 原样传递
 
 ```
 lib/
-├── shell-select/   ShellSelectExecutor（ctx.shell 选择器）
 ├── bash-git/       GitBashExecutor（MSYS）
 ├── bash-wsl/       WslBashExecutor（WSL，base64 载荷）
-├── tool-bash/      工具工厂 + git_bash / wsl_bash 实例
+├── tool-bash/      工具工厂 + git_bash / wsl_bash 实例、
+│                   后端持有逻辑（types/backend.js）
 └── vendor/         运行器失败分类与 bwrap 配置辅助模块
 ```
 
-若部署的 base bundle 已自带 `shell-select` 行，插件的 patch 会禁用该行、由本插件选择器占据席位（两个提供者会冲突）；基座没有该行时此条目是无害 no-op。
+由于本插件没有任何行注册为 `ctx.shell`，patch 只插入自己的两个工具行、不禁用任何行：基座自身的 shell 接线（Windows 上是 `pwsh-sandbox`，其他平台是 `bash-sandbox`）保持原样，pwsh 无论本插件是否加载都正常工作。
 
 ## 前置条件
 
@@ -141,7 +147,13 @@ dsh plugin --profile web remove dsh-win-multi-bash
 powershell -ExecutionPolicy Bypass -File .\smoke\run.ps1
 ```
 
-在 profile 运行时上 boot 真实组合（不修改任何 profile），验证 `git_bash` / `wsl_bash` 注册并真实执行，含显式 `bashPath` 变体；需要 node >= 20。
+在 profile 运行时上 boot 真实组合（不修改任何 profile），验证 `git_bash` / `wsl_bash` 注册并真实执行（含显式 `bashPath` 变体），并断言 `ctx.shell` 仍由基座自带的行提供——这正是本插件曾经弄坏的那一点。需要 node >= 20。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\smoke\audit.ps1
+```
+
+改为运行完整审计套件：vendor 辅助模块、executor 内部与工具配置 schema 的纯单元覆盖，外加真实 `cordis.patch.yml` 与各类错误配置的 boot 集成矩阵。
 
 ## 故障排查
 
@@ -155,14 +167,14 @@ powershell -ExecutionPolicy Bypass -File .\smoke\run.ps1
 | `wsl_bash` 报 `bwrap was not found` | 已配置 `sandbox: bwrap` 但发行版内没有 bubblewrap：按上方「沙箱行为 → 为 `wsl_bash` 启用 bwrap 沙箱」安装（`sudo apt-get install -y bubblewrap`）并重启 `dsh web`，或改用 `sandbox: auto` / `none` |
 | `wsl_bash` 沙箱报 bwrap runner 失败 | bwrap 的工作区根取 Windows 盘符路径的 Linux 侧（`/mnt/<盘符>/...`）：UNC 工作区根会响亮报错；发行版自定义了 automount 根（wsl.conf `automount.root`）时需要相应配置 |
 | `git_bash` 里调 `wsl.exe` 等原生程序传 POSIX 路径报 `No such file or directory` | MSYS 把 `/root` 等改写成 `<Git 根目录>\root`：加 `MSYS_NO_PATHCONV=1` / `MSYS2_ARG_CONV_EXCL="*"`，或用 `//` 前缀；WSL 操作直接改用 `wsl_bash` 工具 |
-| 安装 bubblewrap 后 `wsl_bash` 仍无沙箱 | bwrap 探针结果在宿主进程生命周期内缓存：重启 `dsh web`，或改动 shell 设置节触发后端重建后再试 |
-| 执行报 `shell-select: backend "x" is not enabled` | backends 列表与工具名不匹配；保持 `backends: [git-bash, wsl-bash, pwsh]` |
+| 安装 bubblewrap 后 `wsl_bash` 仍无沙箱 | bwrap 探针结果在宿主进程生命周期内缓存：重启 `dsh web`，或编辑 profile patch 触发工具行重载后再试 |
+| 启动告警 `win-mb-tool-git … waiting for service: shell`（或 dsh 自带的 `tool-pwsh` / `permission-presets` 如此） | 没有任何行提供 `ctx.shell`。本插件已不提供该席位：检查基座的 `pwsh-sandbox` 行是否被别的 patch 禁用了 |
 
 ## 文件布局
 
 ```
 dsh-win-multi-bash/
-├── package.json            # dsh.bundle 清单；exports 暴露 ./shell-select ./tool-git-bash ./tool-wsl-bash
+├── package.json            # dsh.bundle 清单；exports 暴露 ./tool-git-bash ./tool-wsl-bash
 ├── cordis.patch.yml        # 组合接线（即文档）
 ├── install.ps1             # 方式 A 热插（junction + managed 块 + Git Bash 检测）
 ├── uninstall.ps1           # 方式 A 热拔

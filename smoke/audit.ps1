@@ -1,7 +1,8 @@
 ﻿<#
 .SYNOPSIS
     运行 dsh-win-multi-bash 综合审计测试：单元测试（helpers/schema/executor
-    internals）+ 真实 boot 集成测试（工具矩阵、路由、沙箱、后台任务、patch 语义）。
+    internals、后端归属、后台任务适配）+ 真实 boot 集成测试（工具矩阵、
+    shell 座位、沙箱、后台任务、patch 语义）。
 
 .DESCRIPTION
     与 run.ps1 相同的 junction 方案（不修改任何 profile）：

@@ -2,17 +2,18 @@ English | [中文](README.zh.md)
 
 # dsh-win-multi-bash
 
-A Windows multi-bash plugin for DeepSeek Harness: `git_bash` / `wsl_bash` model tools plus a `shell-select` executor that routes the single `ctx.shell` seat across Git Bash, WSL and pwsh. Pwsh stays the default, so existing behavior is unchanged until a bash-family tool is called.
+A Windows multi-bash plugin for DeepSeek Harness: the `git_bash` / `wsl_bash` model tools, each owning its own Git Bash / WSL executor. The plugin never touches the `ctx.shell` seat — dsh's own pwsh executor keeps it — so pwsh behavior is identical to a deployment without the plugin.
 
 ## What it provides
 
 | Tool | Backend | Dialect | Notes |
 | --- | --- | --- | --- |
-| `git_bash` | git-bash | MSYS | `request.shell: 'git-bash'`, Git for Windows toolchain |
-| `wsl_bash` | wsl-bash | Linux | `request.shell: 'wsl-bash'`, WSL distro Linux userland |
-| `pwsh` (existing) | pwsh | — | Selector default route; behavior identical to a deployment without the plugin |
+| `git_bash` | git-bash | MSYS | Owns a `GitBashExecutor`; Git for Windows toolchain |
+| `wsl_bash` | wsl-bash | Linux | Owns a `WslBashExecutor`; WSL distro Linux userland |
+| `pwsh` (dsh's own) | pwsh | — | Served by the base bundle's `pwsh-sandbox` row, untouched by this plugin |
 
-- `shell-select` occupies the single `ctx.shell` seat and routes `request.shell ?? default` to one backend; `default` stays `pwsh`.
+- Each tool constructs and drives its own executor; neither registers as `ctx.shell`, so the seat — and every plugin that injects `shell` (dsh's `tool-pwsh`, `permission-presets`, …) — is unaffected by this plugin being loaded.
+- Why there is no selector any more: dsh 0.1.7 dropped `ShellExecRequest.shell`, the routing field the pre-0.1.7 `shell-select` design dispatched on. With no routing input left, the tool is what knows which shell it wants — so the selector has nothing to select on, and is gone.
 - Executable resolution and sandbox probing are lazy: a host without Git Bash or WSL does not affect pwsh; failures are loud at first use.
 - Git Bash is found automatically, in order: an explicit `gitBash.bashPath`, Git install roots inferred from `git.exe` layout directories on PATH (so an install reachable through `git` is found without a pin, even outside the well-known locations), the well-known Program Files layout on every fixed drive (`C:\Program Files\Git`, `D:\Program Files\Git`, ...), `bash.exe` on PATH, and finally the `HKLM\SOFTWARE\GitForWindows` install path (which the Git for Windows installer always records, covering portable installs). The Windows WSL launcher `System32\bash.exe` and `WindowsApps` app-execution alias directories are **never** selected, and candidates must be real regular files — symlinks/reparse points are rejected — so a stale WSL `bash.exe` alias can never shadow a real Git Bash (this tool is MSYS, not WSL).
 - Sandbox `auto`: Git Bash probes the windows-acl runner, WSL probes `bwrap` inside the distro; a failed probe degrades honestly to an unconfined run with no sandbox facts. An explicit `sandbox: bwrap` with bubblewrap missing fails loudly at the first `wsl_bash` command (never at boot), leaving the other backends untouched.
@@ -24,13 +25,13 @@ The three backends do **not** share the same file-sandbox capability:
 
 | Backend | Mechanism | enforcement | On probe failure |
 | --- | --- | --- | --- |
-| `pwsh` | windows-acl restricted-token runner | partial | no probe — always confined |
+| `pwsh` | windows-acl restricted-token runner | partial | no probe — always confined (dsh's own executor) |
 | `wsl_bash` | `bwrap` (bubblewrap) inside the distro | full | runs unconfined, no sandbox facts |
 | `git_bash` | windows-acl runner wrapping MSYS bash | partial (when the probe passes) | runs unconfined, no sandbox facts when the probe fails |
 
 > ⚠️ **`git_bash` usually cannot be sandboxed in Git for Windows deployments.** The windows-acl runner fails to launch the MSYS `bash.exe` under a restricted token (`CreateProcessAsUserW` returns Win32 error 2; `cmd.exe` and `pwsh.exe` launch fine). With `sandbox: auto`, a failed probe degrades to an **unconfined run** by contract. **Do not assume `git_bash` is protected by the DSH sandbox** — for sensitive operations use `pwsh` (restricted token active) or `wsl_bash` (bwrap active), or take the explicit escalation-approval path.
 >
-> ⚠️ **`wsl_bash` sandboxing depends on bubblewrap inside the distro.** Without bwrap, `auto` degrades to unconfined as well; the probe verdict is cached for the **host process lifetime** — after installing bwrap you must restart `dsh web` (or touch the shell settings section to trigger a backend rebuild) before it is re-probed.
+> ⚠️ **`wsl_bash` sandboxing depends on bubblewrap inside the distro.** Without bwrap, `auto` degrades to unconfined as well; the probe verdict is cached for the **host process lifetime** — after installing bwrap you must restart `dsh web` (or reload the tool row by editing the profile patch) before it is re-probed.
 >
 > ⚠️ **A denial is only classified when the command exits non-zero.** If a blocked write is followed by a successful command (`echo nope > /etc/x; echo done`), the overall exit is 0 and no `[sandbox: file access denied]` marker is emitted — matching the upstream bash-sandbox rule to avoid false positives.
 >
@@ -38,12 +39,17 @@ The three backends do **not** share the same file-sandbox capability:
 > **`requireSandbox`: refuse unconfined runs when the probe fails (optional hardening).** Both backends support `requireSandbox: true` (default `false`, keeping the existing degrade-and-run behavior). When enabled, a failed probe (windows-acl unusable for git-bash / bwrap missing for wsl-bash) means: `danger-full-access` runs as usual (an unconfined run is equivalent to an explicit full-access grant), while `read-only` / `workspace-write` calls are **refused** with an error naming the fix and the escalation path. The tool layer also advertises the sandbox and opens the `sandbox_permissions` argument, so the model can take the approval-based escalation. Example:
 
 > ```yaml
-> # the win-mb-shell-select row in cordis.patch.yml
-> config:
->   backends: [git-bash, wsl-bash, pwsh]
->   default: pwsh
->   gitBash: { requireSandbox: true }
->   wslBash: { requireSandbox: true }
+> # the win-mb-tool-git / win-mb-tool-wsl rows in cordis.patch.yml:
+> # each tool row carries only its own backend's partition
+> - id: win-mb-tool-git
+>   name: 'dsh-win-multi-bash/tool-git-bash'
+>   config:
+>     gitBash: { requireSandbox: true }
+>
+> - id: win-mb-tool-wsl
+>   name: 'dsh-win-multi-bash/tool-wsl-bash'
+>   config:
+>     wslBash: { requireSandbox: true }
 > ```
 
 > `requireSandbox` and `sandbox: none` are mutually exclusive in intent — explicit `none` is a deliberate opt-out and stays allowed; `requireSandbox` only governs the "sandbox wanted but probe failed" case.
@@ -60,7 +66,7 @@ wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"   # ver
 - The probe targets the **first distro** from `wsl -l -q`; if your target distro is not the first, pin it via `wslBash.wslDistro` in `cordis.patch.yml` and install bwrap **inside that distro** (e.g. `Ubuntu-24.04`; `docker-desktop` has no bash and cannot be used).
 - `sudo` may require a password (depending on the distro's sudoers configuration); use `apt-get install -y` for scripting.
 - Other distro families: Fedora `dnf install bubblewrap`, Alpine `apk add bubblewrap`.
-- After installing you **must restart `dsh web`** (or touch the shell settings section to rebuild backends) — the probe verdict is cached for the host process lifetime, and `wsl_bash` stays unconfined until then.
+- After installing you **must restart `dsh web`** (or reload the tool row by editing the profile patch) — the probe verdict is cached for the host process lifetime, and `wsl_bash` stays unconfined until then.
 
 ## Tool prompts (model-facing descriptions)
 
@@ -91,14 +97,14 @@ The full feature implementation ships in `lib/` as plain ESM JS — no build ste
 
 ```
 lib/
-├── shell-select/   ShellSelectExecutor (the ctx.shell selector)
 ├── bash-git/       GitBashExecutor (MSYS)
 ├── bash-wsl/       WslBashExecutor (WSL, base64 payloads)
-├── tool-bash/      tool factory + git_bash / wsl_bash instances
+├── tool-bash/      tool factory + git_bash / wsl_bash instances,
+│                   backend ownership (types/backend.js)
 └── vendor/         helper modules for runner-failure classification and bwrap profiles
 ```
 
-When the deployment's base bundle already provides its own `shell-select` row, the patch disables that row and lets this plugin's selector own the seat (two providers would conflict). On base bundles without it, the entry is a harmless no-op.
+Because no row of this plugin registers as `ctx.shell`, the patch inserts only its own two tool rows and disables nothing: the base bundle's shell wiring (`pwsh-sandbox` on win32, `bash-sandbox` elsewhere) stays exactly as shipped, and pwsh keeps working whether or not this plugin is loaded.
 
 ## Prerequisites
 
@@ -141,7 +147,13 @@ Requires `pnpm` (dsh plugin is a pnpm forwarder); the bundle layer is assembled 
 powershell -ExecutionPolicy Bypass -File .\smoke\run.ps1
 ```
 
-Boots a real composition over the profile runtime (modifying nothing), verifies `git_bash` / `wsl_bash` register and execute real commands — including an explicit `bashPath` variant. Requires node >= 20.
+Boots a real composition over the profile runtime (modifying nothing), verifies `git_bash` / `wsl_bash` register and execute real commands — including an explicit `bashPath` variant — and asserts `ctx.shell` is still provided by the base bundle's own row (the regression this plugin once caused). Requires node >= 20.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\smoke\audit.ps1
+```
+
+Runs the full audit suite instead: pure-unit coverage of the vendor helpers, executor internals and tool config schemas, plus boot-integration matrices for the real `cordis.patch.yml` and for misconfigurations.
 
 ## Troubleshooting
 
@@ -155,14 +167,14 @@ Boots a real composition over the profile runtime (modifying nothing), verifies 
 | `wsl_bash` fails with `bwrap was not found` | `sandbox: bwrap` is set but bubblewrap is missing inside the distro: install it per “Sandbox behavior → Enabling the bwrap sandbox for `wsl_bash`” (`sudo apt-get install -y bubblewrap`) and restart `dsh web`, or use `sandbox: auto` / `none` |
 | `wsl_bash` sandbox reports a runner failure on bwrap | The bwrap workspace root is the Linux side of a Windows drive path (`/mnt/<drive>/...`): a UNC workspace root fails loud, and a distro with a custom automount root (wsl.conf `automount.root`) needs a matching configuration |
 | Calling `wsl.exe` (or other native exes) with POSIX paths from `git_bash` reports `No such file or directory` | MSYS rewrote `/root` etc. to `<Git root>\root`: prefix with `MSYS_NO_PATHCONV=1` / `MSYS2_ARG_CONV_EXCL="*"`, or use a `//` prefix; use the `wsl_bash` tool for WSL work |
-| `wsl_bash` still runs without a sandbox after installing bubblewrap | The bwrap probe verdict is cached for the host process lifetime: restart `dsh web`, or touch the shell settings section to trigger a backend rebuild |
-| `shell-select: backend "x" is not enabled` | The `backends` list does not match the tool names; keep `backends: [git-bash, wsl-bash, pwsh]` |
+| `wsl_bash` still runs without a sandbox after installing bubblewrap | The bwrap probe verdict is cached for the host process lifetime: restart `dsh web`, or reload the tool row by editing the profile patch |
+| Boot warns `win-mb-tool-git … waiting for service: shell` (or dsh's own `tool-pwsh` / `permission-presets` do) | Nothing provides `ctx.shell`. This plugin no longer provides it either: check the base bundle's `pwsh-sandbox` row is not disabled by some other patch |
 
 ## Layout
 
 ```
 dsh-win-multi-bash/
-├── package.json            # dsh.bundle manifest; exports ./shell-select ./tool-git-bash ./tool-wsl-bash
+├── package.json            # dsh.bundle manifest; exports ./tool-git-bash ./tool-wsl-bash
 ├── cordis.patch.yml        # the composition wiring (documented inline)
 ├── install.ps1             # Path A hot plug (junctions + managed block + Git Bash detection)
 ├── uninstall.ps1           # Path A hot unplug

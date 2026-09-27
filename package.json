@@ -1,12 +1,12 @@
 {
   "name": "dsh-win-multi-bash",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": "Dinosaur_MC",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Dinosaur-MC/dsh-win-multi-bash.git"
   },
-  "description": "Windows multi-bash plugin for dsh: git_bash / wsl_bash model tools plus a shell-select executor routing the single ctx.shell seat across Git Bash, WSL and pwsh (pwsh stays the default).",
+  "description": "Windows multi-bash plugin for dsh: git_bash / wsl_bash model tools, each owning its own Git Bash / WSL executor and leaving the ctx.shell seat to dsh's own pwsh executor.",
   "keywords": [
     "dsh-plugin",
     "windows",
@@ -26,7 +26,6 @@
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
-    "./shell-select": "./lib/shell-select/index.js",
     "./tool-git-bash": "./lib/tool-bash/types/git-bash.js",
     "./tool-wsl-bash": "./lib/tool-bash/types/wsl-bash.js",
     "./package.json": "./package.json"
@@ -50,14 +49,11 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.1",
-    "@deepseek-ai/dsh-bash-local": ">=0.1.0-rc.7",
-    "@deepseek-ai/dsh-llm": ">=0.1.0-rc.7",
-    "@deepseek-ai/dsh-pwsh-local": ">=0.1.0-rc.7",
-    "@deepseek-ai/dsh-pwsh-sandbox": ">=0.1.0-rc.7",
-    "@deepseek-ai/dsh-sandbox": ">=0.1.0-rc.7",
-    "@deepseek-ai/dsh-settings": ">=0.1.2-alpha.2",
-    "@deepseek-ai/dsh-shell": ">=0.1.0-rc.7",
-    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.7",
+    "@deepseek-ai/dsh-bash-local": ">=0.1.7-rc.2",
+    "@deepseek-ai/dsh-llm": ">=0.1.7-rc.2",
+    "@deepseek-ai/dsh-sandbox": ">=0.1.7-rc.2",
+    "@deepseek-ai/dsh-shell": ">=0.1.7-rc.2",
+    "@deepseek-ai/dsh-tools": ">=0.1.7-rc.2",
     "@deepseek-ai/schemastery": ">=3.18.0"
   },
   "peerDependenciesMeta": {
@@ -70,16 +66,7 @@
     "@deepseek-ai/dsh-llm": {
       "optional": true
     },
-    "@deepseek-ai/dsh-pwsh-local": {
-      "optional": true
-    },
-    "@deepseek-ai/dsh-pwsh-sandbox": {
-      "optional": true
-    },
     "@deepseek-ai/dsh-sandbox": {
-      "optional": true
-    },
-    "@deepseek-ai/dsh-settings": {
       "optional": true
     },
     "@deepseek-ai/dsh-shell": {

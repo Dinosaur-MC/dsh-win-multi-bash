@@ -3,8 +3,9 @@
  * Smoke driver for the dsh-win-multi-bash plugin rows: boot the real app boot
  * path over the real runtime packages with the plugin's exact rows, verify the
  * git_bash / wsl_bash tools are registered, then execute one real command
- * through each (plus the selector default → pwsh route), and print a JSON
- * report. Same boot pattern as the harness's own windows-loader smoke spec.
+ * through each and through the base bundle's own `ctx.shell` seat, and print a
+ * JSON report. Same boot pattern as the harness's own windows-loader smoke
+ * spec.
  *
  * Usage: node driver.mjs <fixture.yml>
  */
@@ -29,6 +30,10 @@ try {
     wslBashPresent: wslBash !== undefined,
     gitBashDescriptionHasMsys: gitBash?.description.includes('Git Bash') ?? false,
     wslBashDescriptionHasWsl: wslBash?.description.includes('WSL') ?? false,
+    // Regression guard: our tools own their executors and never occupy the
+    // seat, so the base bundle's pwsh executor — and with it every plugin that
+    // injects `shell` — must still be alive while our rows are loaded.
+    shellSeatPresent: ctx.shell !== undefined,
     runs: {},
   }
 
@@ -54,12 +59,13 @@ try {
   await runTool('git_bash', 'echo git-bash-ok', 'smoke-git-bash')
   await runTool('wsl_bash', 'echo wsl-ok', 'smoke-wsl-bash')
 
-  // Selector default route (no request.shell) must land on the pwsh backend.
+  // The base bundle's seat: resolved and executed exactly as dsh's own
+  // tool-pwsh would, proving our rows left `ctx.shell` intact.
   try {
-    const result = await ctx.shell.run(ctx.shell.resolve({
+    const result = await (await ctx.shell.execute(ctx.shell.resolve({
       command: 'echo pwsh-ok',
       signal: new AbortController().signal,
-    }))
+    }))).result()
     report.runs.pwsh = {
       ok: result.exitCode === 0,
       text: result.stdout.text.replace(/\r\n/g, '\n').slice(0, 200),

@@ -31,22 +31,25 @@
 - id: shell-env
   name: '@deepseek-ai/dsh-shell-env'
 
+# The base bundle's own ctx.shell provider on win32, mirroring dsh-base's
+# ordering. Loading it here beside our rows is the regression guard for the
+# failure this fixture first caught: the plugin must neither contend for the
+# shell seat (0.1.7 deleted the routing field a selector would need) nor leave
+# it unprovided — everything that injects `shell` waits otherwise.
+- id: pwsh-sandbox
+  name: '@deepseek-ai/dsh-pwsh-sandbox'
+
 - id: tasks
   name: '@deepseek-ai/dsh-jobs-local'
 
 - id: tool-jobs
   name: '@deepseek-ai/dsh-tool-jobs'
 
-- id: win-mb-shell-select
-  name: 'dsh-win-multi-bash/shell-select'
-  config:
-    backends: [git-bash, wsl-bash, pwsh]
-    default: pwsh
-    gitBash:
-      bashPath: '__BASH_PATH__'
-
 - id: win-mb-tool-git
   name: 'dsh-win-multi-bash/tool-git-bash'
+  config:
+    gitBash:
+      bashPath: '__BASH_PATH__'
 
 - id: win-mb-tool-wsl
   name: 'dsh-win-multi-bash/tool-wsl-bash'

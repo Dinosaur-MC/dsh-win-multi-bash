@@ -4,17 +4,27 @@
  *
  * Two layers:
  *   A) Unit tests — pure helpers (vendor/helpers.js, vendor/bwrap-profiles.js),
- *      config schemas, and executor routing/sandbox logic via the documented
- *      `internals` test hooks (no boot, fake ctx/subprocess).
+ *      config schemas, backend ownership, background-job adapters, and executor
+ *      routing/sandbox logic via the documented `internals` test hooks (no
+ *      boot, fake ctx/subprocess).
  *   B) Boot integration — boots the real loader over the profile runtime with
  *      the plugin's exact rows (plus a real-patch-shape fixture with
  *      `- insert:` blocks and `!!js` disabled tags) and executes a scenario
- *      matrix through git_bash / wsl_bash / the selector default.
+ *      matrix through git_bash / wsl_bash and the base bundle's shell seat.
  *
  * Run via smoke/audit.ps1 (it sets up the smoke/node_modules junctions and
  * cleans up after). Requires the profile runtime at ~/.dsh/profiles.
  *
  * Exit code 0 = all assertions passed; every failure prints a ✗ line.
+ *
+ * ── 0.1.7 shape ──────────────────────────────────────────────────────────────
+ * dsh 0.1.7 removed the shell seam's routing field (`ShellExecRequest.shell`),
+ * so the pre-0.1.7 `ShellSelectExecutor` — one executor on the `ctx.shell` seat
+ * dispatching by name — no longer exists in this plugin. Each tool now OWNS
+ * one executor (see lib/tool-bash/types/backend.js) and drives it directly,
+ * and the seat is left to the base bundle's own `pwsh-sandbox` row. The
+ * executor seam itself is a single `execute(spec)` returning a handle whose
+ * `result()` is the foreground projection.
  */
 
 import assert from 'node:assert/strict'
@@ -36,8 +46,11 @@ const { BWRAP_RUNNER_FAILURE_RULES, bwrapProfileArgs } =
 const { GitBashExecutor, candidateBashPaths, candidateExists, gitCandidatesUnder, gitRootCandidates, gitToolPath, probeDrives, resolveBashPath } =
   await import(libUrl('bash-git', 'index.js'))
 const { WslBashExecutor } = await import(libUrl('bash-wsl', 'index.js'))
-const { ShellSelectExecutor, SHELL_BACKEND_UNAVAILABLE } =
-  await import(libUrl('shell-select', 'index.js'))
+const { ownExecutor } = await import(libUrl('tool-bash', 'types', 'backend.js'))
+const { processJob, processOutcome, processSources } =
+  await import(libUrl('tool-bash', 'types', 'background.js'))
+const gitBashTool = await import(libUrl('tool-bash', 'types', 'git-bash.js'))
+const wslBashTool = await import(libUrl('tool-bash', 'types', 'wsl-bash.js'))
 const { LocalBashExecutor } = await import('@deepseek-ai/dsh-bash-local')
 
 let passed = 0
@@ -136,24 +149,41 @@ function fakeCtx(overrides = {}) {
   }
 }
 
-/** Instantiate an executor class without running its constructor (unit isolation). */
+/**
+ * Instantiate an executor class without running its constructor (unit
+ * isolation). `config` is a plain readonly property assigned by the real
+ * constructor (NOT a getter over some source), so it must be supplied
+ * directly — and it must be a REAL resolved config (`Executor.Config({...})`)
+ * for any path that reaches `resolve()`/`execute()`, which validate it.
+ *
+ * The constructor's own reads from that config are mirrored here so a bare
+ * instance behaves like a constructed one; explicit props still win, which is
+ * how the stance-specific tests override a single field.
+ */
 function bareInstance(cls, props) {
   const inst = Object.create(cls.prototype)
-  const { config, source, ...rest } = props ?? {}
+  const { config, ...rest } = props ?? {}
+  const resolved = config ?? {}
   Object.assign(inst, {
     internals: {},
-    sandboxStance: 'auto',
-    probeTimeoutMs: 10000,
     bwrapVerdict: undefined,
-    confinedVerdict: undefined,
+    confinedProbe: undefined,
+    sandboxModeVerdict: undefined,
     distroProbed: false,
     distroVerdict: undefined,
+    // A class field, so Object.create() never installs it.
+    processFacts: new Map(),
+    sandboxStance: resolved.sandbox ?? undefined,
+    probeTimeoutMs: resolved.probeTimeoutMs ?? 10000,
+    requireSandbox: resolved.requireSandbox ?? false,
+    config: resolved,
     ...rest,
   })
-  // `config` is a getter-only accessor reading `this.source()` — shadow it via `source`.
-  inst.source = source ?? (() => config ?? {})
   return inst
 }
+
+/** A resolved git-bash config pinned to the probed bash (skips the probes). */
+const gitConfig = (extra = {}) => GitBashExecutor.Config({ bashPath: GIT_BASH, ...extra })
 
 // Git Bash for the real-spawn unit tests is NEVER hardcoded: it is probed with
 // the plugin's own resolver (well-known locations → PATH, WSL launcher
@@ -162,6 +192,11 @@ function bareInstance(cls, props) {
 // probing finds none, so the suite stays portable.
 const GIT_BASH = process.env.DSH_AUDIT_GIT_BASH ?? resolveBashPath(undefined, process.env, process.platform) ?? ''
 const HAS_GIT_BASH = GIT_BASH.length > 0
+
+// WSL is likewise never hardcoded: only the canonical launcher location is
+// considered, and the real-spawn WSL test skips when it is absent.
+const WSL_EXE = process.env.DSH_AUDIT_WSL ?? 'C:\\Windows\\System32\\wsl.exe'
+const HAS_WSL = existsSync(WSL_EXE)
 
 // ═════════════════════════════════════════════════════════════════════════════
 // A) Unit tests
@@ -279,19 +314,44 @@ console.log('\n[A] unit: config schemas')
   test('WslBashExecutor.Config rejects unknown sandbox stances', () => {
     assert.throws(() => WslBashExecutor.Config({ sandbox: 'bogus' }))
   })
-  test('ShellSelectExecutor.Config defaults backends + pwsh default', () => {
-    const c = ShellSelectExecutor.Config({})
-    assert.deepEqual(c.backends, ['git-bash', 'wsl-bash', 'pwsh'])
-    assert.equal(c.default, 'pwsh')
+  test('git_bash tool Config partitions the backend under `gitBash`', () => {
+    const c = gitBashTool.Config({})
+    assert.equal(c.enableRunInBackground, true)
+    assert.equal(c.gitBash.sandbox, 'auto')
+    assert.equal(c.gitBash.probeTimeoutMs, 10000)
+    assert.equal(c.gitBash.requireSandbox, false)
+    assert.equal('wslBash' in c, false, 'the git tool has no wsl partition')
   })
-  test('ShellSelectExecutor.Config merges partial partitions', () => {
-    const c = ShellSelectExecutor.Config({ backends: ['git-bash'], gitBash: { bashPath: 'X' } })
-    assert.deepEqual(c.backends, ['git-bash'])
+  test('wsl_bash tool Config partitions the backend under `wslBash`', () => {
+    const c = wslBashTool.Config({})
+    assert.equal(c.enableRunInBackground, true)
+    assert.equal(c.wslBash.sandbox, 'auto')
+    assert.equal(c.wslBash.probeTimeoutMs, 30000, 'wsl keeps its own 3e4 probe default')
+    assert.equal('gitBash' in c, false)
+  })
+  test('git_bash tool Config merges a partial backend partition', () => {
+    const c = gitBashTool.Config({ gitBash: { bashPath: 'X' } })
     assert.equal(c.gitBash.bashPath, 'X')
-    assert.equal(c.pwsh.timeoutMs, 120000)
+    assert.equal(c.gitBash.probeTimeoutMs, 10000, 'unspecified fields keep their defaults')
   })
-  test('ShellSelectExecutor.Config negative probeTimeoutMs rejected', () => {
-    assert.throws(() => ShellSelectExecutor.Config({ gitBash: { probeTimeoutMs: -1 } }))
+  test('git_bash tool Config rejects a negative probeTimeoutMs', () => {
+    assert.throws(() => gitBashTool.Config({ gitBash: { probeTimeoutMs: -1 } }))
+  })
+  test('tool Config keeps each backend stance set distinct', () => {
+    assert.throws(() => gitBashTool.Config({ gitBash: { sandbox: 'bwrap' } }), 'bwrap is not a git-bash stance')
+    assert.equal(wslBashTool.Config({ wslBash: { sandbox: 'bwrap' } }).wslBash.sandbox, 'bwrap')
+  })
+  test('tool plugins declare the name/inject/apply/Config shape cordis needs', () => {
+    for (const t of [gitBashTool, wslBashTool]) {
+      assert.equal(typeof t.name, 'string')
+      assert.equal(typeof t.apply, 'function')
+      assert.ok(t.Config)
+      // The owned executor's own requirements must be injected by the tool.
+      for (const s of ['tools', 'systemPrompt', 'shellEnv', 'subprocess', 'sandbox', 'sandboxPolicy']) {
+        assert.ok(t.inject.includes(s), `${t.name} must inject ${s}`)
+      }
+      assert.ok(!t.inject.includes('shell'), `${t.name} must NOT contend for the ctx.shell seat`)
+    }
   })
   test('#2: git-bash Config is independent of wsl-bash (no .set() cross-pollution)', () => {
     assert.equal(GitBashExecutor.Config({}).probeTimeoutMs, 10000, 'git-bash keeps its own 1e4 default')
@@ -309,124 +369,140 @@ console.log('\n[A] unit: config schemas')
 console.log('\n[A] unit: GitBashExecutor (internals hooks)')
 {
   test('bashPath(): configured pin is returned verbatim', () => {
-    const ex = bareInstance(GitBashExecutor)
-    ex.source = () => ({ bashPath: 'C:\\pinned\\bash.exe' })
+    const ex = bareInstance(GitBashExecutor, { config: GitBashExecutor.Config({ bashPath: 'C:\\pinned\\bash.exe' }) })
     assert.equal(ex.bashPath(), 'C:\\pinned\\bash.exe')
   })
   test('bashPath(): undefined resolution throws loud naming probes', () => {
-    const ex = bareInstance(GitBashExecutor)
-    ex.source = () => ({})
+    const ex = bareInstance(GitBashExecutor, { config: GitBashExecutor.Config({}) })
     ex.internals.resolveBashPath = () => undefined
     ex.internals.registryBashPaths = () => undefined // registry may hit on hosts with Git installed
     assert.throws(() => ex.bashPath(), /Git Bash was not found \(probed/)
   })
   test('gitArgv: [bashPath, -c, command]', () => {
-    const ex = bareInstance(GitBashExecutor)
-    ex.source = () => ({ bashPath: 'C:\\b.exe' })
+    const ex = bareInstance(GitBashExecutor, { config: GitBashExecutor.Config({ bashPath: 'C:\\b.exe' }) })
     assert.deepEqual(ex.gitArgv({ command: 'ls -la' }), ['C:\\b.exe', '-c', 'ls -la'])
   })
-  test('sandboxMode: stance none → undefined (no sandbox advertisement)', () => {
-    const ex = bareInstance(GitBashExecutor, { sandboxStance: 'none' })
+  test('sandboxMode: undeclared until resolveSandboxMode settles it', () => {
+    const ex = bareInstance(GitBashExecutor, { config: GitBashExecutor.Config({}) })
+    assert.equal(ex.sandboxMode, undefined, 'no mode before the async probe runs')
+  })
+  testAsync('resolveSandboxMode(): stance none → undefined (no sandbox advertisement)', async () => {
+    const ex = bareInstance(GitBashExecutor, { sandboxStance: 'none', config: GitBashExecutor.Config({}) })
+    assert.equal(await ex.resolveSandboxMode(), undefined)
     assert.equal(ex.sandboxMode, undefined)
   })
-  test('sandboxMode: failed probe → undefined (honest degrade)', () => {
+  testAsync('resolveSandboxMode(): failed probe → undefined, and the probe is memoized', async () => {
     let calls = 0
-    const ex = bareInstance(GitBashExecutor)
+    const ex = bareInstance(GitBashExecutor, { config: GitBashExecutor.Config({}) })
     ex.internals.probeConfined = () => { calls += 1; return false }
-    assert.equal(ex.sandboxMode, undefined)
-    assert.equal(ex.sandboxMode, undefined)
+    assert.equal(await ex.resolveSandboxMode(), undefined)
+    assert.equal(await ex.resolveSandboxMode(), undefined)
     assert.equal(calls, 1, 'probe cached after first call')
   })
-  test('sandboxMode: successful probe → policy defaultMode', () => {
+  testAsync('resolveSandboxMode(): successful probe → policy defaultMode', async () => {
     const ex = bareInstance(GitBashExecutor, {
-      ctx: fakeCtx({ sandboxPolicy: { resolve: () => ({ mode: 'read-only', workspaceRoot: 'X' }) } }),
+      config: GitBashExecutor.Config({}),
+      ctx: { sandboxPolicy: { resolve: () => ({ mode: 'read-only', workspaceRoot: 'X' }), defaultMode: 'read-only' } },
     })
-    ex.ctx.sandboxPolicy.defaultMode = 'read-only'
-    ex.internals.probeConfined = () => true
-    assert.equal(ex.sandboxMode, 'read-only')
+    ex.internals.probeConfined = async () => true
+    assert.equal(await ex.resolveSandboxMode(), 'read-only')
+    assert.equal(ex.sandboxMode, 'read-only', 'the sync getter reads back the settled verdict')
+  })
+  testAsync('resolveSandboxMode(): requireSandbox declares the mode even when the probe fails', async () => {
+    const ex = bareInstance(GitBashExecutor, {
+      config: GitBashExecutor.Config({ requireSandbox: true }),
+      ctx: { sandboxPolicy: { resolve: () => ({ mode: 'read-only', workspaceRoot: 'X' }), defaultMode: 'read-only' } },
+    })
+    ex.internals.probeConfined = async () => false
+    assert.equal(await ex.resolveSandboxMode(), 'read-only', 'escalation must stay advertised so it can be refused')
   })
   if (!HAS_GIT_BASH) {
-    console.log('  … skipping real-spawn run() tests: no Git Bash probed on this host')
+    console.log('  … skipping real-spawn execute() tests: no Git Bash probed on this host')
   } else {
-  testAsync('run(): unconfined path passes plain git argv (no sandbox facts)', async () => {
-    const sub = fakeSubprocess()
+  testAsync('execute(): unconfined path passes plain git argv (no sandbox facts)', async () => {
     const ex = bareInstance(GitBashExecutor, {
-      ctx: fakeCtx({ subprocess: sub }),
+      ctx: fakeCtx({ subprocess: fakeSubprocess() }),
       sandboxStance: 'none',
-      config: { bashPath: GIT_BASH },
+      config: gitConfig(),
     })
-    const result = await ex.run({ command: 'echo unconfined-ok', timeoutMs: 30000, stdoutMaxBytes: 4096, workdir: process.cwd() })
+    const result = await (await ex.execute(ex.resolve({ command: 'echo unconfined-ok', timeoutMs: 30000, stdoutMaxBytes: 4096, workdir: process.cwd() }))).result()
     assert.equal(result.exitCode, 0)
     assert.match(result.stdout.text, /unconfined-ok/)
     assert.equal(result.sandbox, undefined)
   })
-  testAsync('run(): confined path stamps sandbox facts (denied=false)', async () => {
-    const sub = fakeSubprocess()
+  testAsync('execute(): confined path stamps sandbox facts (denied=false)', async () => {
     const ex = bareInstance(GitBashExecutor, {
-      ctx: fakeCtx({ subprocess: sub }),
-      config: { bashPath: GIT_BASH },
+      ctx: fakeCtx({ subprocess: fakeSubprocess() }),
+      config: gitConfig(),
     })
     ex.internals.probeConfined = () => true
     ex.ctx.sandbox = {
-      confine: () => ({ argv: [GIT_BASH, '-c', 'echo confined-ok'], denialSignatures: ['denied by policy'], runnerFailureRules: [], enforcement: 'full' }),
+      confine: async () => ({ argv: [GIT_BASH, '-c', 'echo confined-ok'], denialSignatures: ['denied by policy'], runnerFailureRules: [], enforcement: 'full' }),
     }
-    const result = await ex.run({ command: 'echo confined-ok', timeoutMs: 30000, stdoutMaxBytes: 4096, workdir: process.cwd() })
+    const result = await (await ex.execute(ex.resolve({ command: 'echo confined-ok', timeoutMs: 30000, stdoutMaxBytes: 4096, workdir: process.cwd() }))).result()
     assert.equal(result.exitCode, 0)
     assert.deepEqual(result.sandbox, { mode: 'read-only', denied: false, enforcement: 'full' })
   })
-  testAsync('run(): denial signature classifies sandbox.denied=true', async () => {
-    const sub = fakeSubprocess()
+  testAsync('execute(): denial signature classifies sandbox.denied=true', async () => {
     const ex = bareInstance(GitBashExecutor, {
-      ctx: fakeCtx({ subprocess: sub }),
-      config: { bashPath: GIT_BASH },
+      ctx: fakeCtx({ subprocess: fakeSubprocess() }),
+      config: gitConfig(),
     })
     ex.internals.probeConfined = () => true
     ex.ctx.sandbox = {
-      confine: () => ({ argv: [GIT_BASH, '-c', 'echo denied by policy >&2; exit 1'], denialSignatures: ['denied by policy'], runnerFailureRules: [], enforcement: 'full' }),
+      confine: async () => ({ argv: [GIT_BASH, '-c', 'echo denied by policy >&2; exit 1'], denialSignatures: ['denied by policy'], runnerFailureRules: [], enforcement: 'full' }),
     }
-    const result = await ex.run({ command: 'x', timeoutMs: 30000, stdoutMaxBytes: 4096, workdir: process.cwd() })
+    const result = await (await ex.execute(ex.resolve({ command: 'x', timeoutMs: 30000, stdoutMaxBytes: 4096, workdir: process.cwd() }))).result()
     assert.equal(result.sandbox.denied, true)
   })
-  testAsync('run(): runner failure falls back to unconfined run', async () => {
-    const sub = fakeSubprocess()
+  testAsync('execute(): runner failure falls back to an unconfined run', async () => {
     const ex = bareInstance(GitBashExecutor, {
-      ctx: fakeCtx({ subprocess: sub }),
-      config: { bashPath: GIT_BASH },
+      ctx: fakeCtx({ subprocess: fakeSubprocess() }),
+      config: gitConfig(),
     })
     ex.internals.probeConfined = () => true
     ex.ctx.sandbox = {
-      confine: () => ({ argv: [GIT_BASH, '-c', 'echo bwrap: runner exploded >&2; exit 1'], denialSignatures: [], runnerFailureRules: BWRAP_RUNNER_FAILURE_RULES, enforcement: 'full' }),
+      confine: async () => ({ argv: [GIT_BASH, '-c', 'echo bwrap: runner exploded >&2; exit 1'], denialSignatures: [], runnerFailureRules: BWRAP_RUNNER_FAILURE_RULES, enforcement: 'full' }),
     }
-    const result = await ex.run({ command: 'echo fallback-ok', timeoutMs: 30000, stdoutMaxBytes: 4096, workdir: process.cwd() })
+    const result = await (await ex.execute(ex.resolve({ command: 'echo fallback-ok', timeoutMs: 30000, stdoutMaxBytes: 4096, workdir: process.cwd() }))).result()
     // stderr "bwrap: " is a *fake* runner-failure signature from our confined argv,
     // so the executor must have re-run the ORIGINAL argv unconfined: no sandbox facts.
     assert.equal(result.sandbox, undefined)
     assert.match(result.stdout.text, /fallback-ok/)
   })
-  testAsync('run(): spawn failure of runner falls back unconfined', async () => {
-    const sub = fakeSubprocess()
+  testAsync('execute(): spawn failure of the runner falls back unconfined', async () => {
     const ex = bareInstance(GitBashExecutor, {
-      ctx: fakeCtx({ subprocess: sub }),
-      config: { bashPath: GIT_BASH },
+      ctx: fakeCtx({ subprocess: fakeSubprocess() }),
+      config: gitConfig(),
     })
     ex.internals.probeConfined = () => true
     ex.ctx.sandbox = {
-      confine: () => ({ argv: ['G:\\no-such-runner-xyz.exe', '-c', 'x'], denialSignatures: [], runnerFailureRules: [], enforcement: 'full' }),
+      confine: async () => ({ argv: ['G:\\no-such-runner-xyz.exe', '-c', 'x'], denialSignatures: [], runnerFailureRules: [], enforcement: 'full' }),
     }
-    const result = await ex.run({ command: 'echo respawn-ok', timeoutMs: 30000, stdoutMaxBytes: 4096, workdir: process.cwd() })
+    const result = await (await ex.execute(ex.resolve({ command: 'echo respawn-ok', timeoutMs: 30000, stdoutMaxBytes: 4096, workdir: process.cwd() }))).result()
     assert.equal(result.sandbox, undefined)
     assert.match(result.stdout.text, /respawn-ok/)
   })
-  testAsync('run(): danger-full-access bypasses confinement with honest facts', async () => {
-    const sub = fakeSubprocess()
+  testAsync('execute(): danger-full-access bypasses confinement with honest facts', async () => {
     const ex = bareInstance(GitBashExecutor, {
-      ctx: fakeCtx({ subprocess: sub }),
-      config: { bashPath: GIT_BASH },
+      ctx: fakeCtx({ subprocess: fakeSubprocess() }),
+      config: gitConfig(),
     })
     ex.internals.probeConfined = () => true
-    const result = await ex.run({ command: 'echo dfa-ok', timeoutMs: 30000, stdoutMaxBytes: 4096, workdir: process.cwd(), sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: 'X' } })
+    const result = await (await ex.execute(ex.resolve({ command: 'echo dfa-ok', timeoutMs: 30000, stdoutMaxBytes: 4096, workdir: process.cwd(), sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: 'X' } }))).result()
     assert.equal(result.exitCode, 0)
     assert.deepEqual(result.sandbox, { mode: 'danger-full-access', denied: false })
+  })
+  testAsync('execute(): requireSandbox refuses an unconfined run when the probe failed', async () => {
+    const ex = bareInstance(GitBashExecutor, {
+      ctx: fakeCtx({ subprocess: fakeSubprocess() }),
+      config: gitConfig({ requireSandbox: true }),
+    })
+    ex.internals.probeConfined = () => false
+    await assert.rejects(
+      () => ex.execute(ex.resolve({ command: 'echo forbidden', timeoutMs: 30000, stdoutMaxBytes: 4096, workdir: process.cwd() })),
+      /refusing to run unconfined/,
+    )
   })
   }
 }
@@ -560,15 +636,13 @@ console.log('\n[A] unit: bash resolution (git-path inference, never the WSL laun
     assert.deepEqual(p.split(';').slice(0, 1), ['D:\\tools\\other-bash'])
   })
   test('tryBashPath: registry fallback used after standard probes miss (internals hook)', () => {
-    const ex = bareInstance(GitBashExecutor)
-    ex.source = () => ({})
+    const ex = bareInstance(GitBashExecutor, { config: GitBashExecutor.Config({}) })
     ex.internals.resolveBashPath = () => undefined
     ex.internals.registryBashPaths = () => 'R:\\reg\\usr\\bin\\bash.exe'
     assert.equal(ex.bashPath(), 'R:\\reg\\usr\\bin\\bash.exe')
   })
   test('tryBashPath: both probes miss → loud error naming the registry probe', () => {
-    const ex = bareInstance(GitBashExecutor)
-    ex.source = () => ({})
+    const ex = bareInstance(GitBashExecutor, { config: GitBashExecutor.Config({}) })
     ex.internals.resolveBashPath = () => undefined
     ex.internals.registryBashPaths = () => undefined
     assert.throws(() => ex.bashPath(), /Git Bash was not found.*GitForWindows registry/)
@@ -578,13 +652,11 @@ console.log('\n[A] unit: bash resolution (git-path inference, never the WSL laun
 console.log('\n[A] unit: WslBashExecutor (internals hooks)')
 {
   test('wslPath(): configured pin returned verbatim', () => {
-    const ex = bareInstance(WslBashExecutor)
-    ex.source = () => ({ wslPath: 'C:\\wsl-pinned.exe' })
+    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: 'C:\\wsl-pinned.exe' }) })
     assert.equal(ex.wslPath(), 'C:\\wsl-pinned.exe')
   })
   test('wslPath(): undefined resolution throws loud naming probes', () => {
-    const ex = bareInstance(WslBashExecutor)
-    ex.source = () => ({})
+    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({}) })
     ex.internals.resolveWslPath = () => undefined
     assert.throws(() => ex.wslPath(), /WSL was not found \(probed/)
   })
@@ -596,57 +668,73 @@ console.log('\n[A] unit: WslBashExecutor (internals hooks)')
     const decoded = Buffer.from(payload.match(/^echo ([A-Za-z0-9+/=]+) \|/)[1], 'base64').toString('utf8')
     assert.equal(decoded, cmd)
   })
-  test('argv(): no --cd when workdir equals default', () => {
-    const ex = bareInstance(WslBashExecutor)
-    ex.source = () => ({ wslPath: 'C:\\wsl.exe' })
-    ex.distro = () => 'Ubuntu-24.04'
-    const argv = ex.argv({ command: 'x', workdir: process.cwd() })
-    assert.deepEqual(argv.slice(0, 3), ['C:\\wsl.exe', '-d', 'Ubuntu-24.04'])
-    assert.deepEqual(argv.slice(3), ['--', 'bash', '-c', ex.payload('x')])
-  })
-  test('argv(): --cd inserted before -d when workdir differs', () => {
-    const ex = bareInstance(WslBashExecutor)
-    ex.source = () => ({ wslPath: 'C:\\wsl.exe' })
+  // `--cd` is the auto-cd contract: it always carries the resolved workdir, so
+  // the WSL start directory is a property of the spec rather than of the
+  // distro's automount/inheritance behaviour.
+  test('argv(): --cd always carries the resolved workdir', () => {
+    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: 'C:\\wsl.exe' }) })
     ex.distro = () => 'Ubuntu-24.04'
     const argv = ex.argv({ command: 'x', workdir: 'G:\\other' })
     assert.deepEqual(argv.slice(0, 5), ['C:\\wsl.exe', '--cd', 'G:\\other', '-d', 'Ubuntu-24.04'])
+    assert.deepEqual(argv.slice(5), ['--', 'bash', '-c', ex.payload('x')])
+  })
+  test('argv(): a workdir equal to process.cwd() still gets --cd (auto-cd, not a skip)', () => {
+    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: 'C:\\wsl.exe' }) })
+    ex.distro = () => 'Ubuntu-24.04'
+    const argv = ex.argv({ command: 'x', workdir: process.cwd() })
+    assert.deepEqual(argv.slice(0, 3), ['C:\\wsl.exe', '--cd', process.cwd()])
+  })
+  test('argv(): a Linux workdir passes through verbatim', () => {
+    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: 'C:\\wsl.exe' }) })
+    ex.distro = () => undefined
+    assert.deepEqual(ex.argv({ command: 'x', workdir: '/mnt/g/LAB' }), ['C:\\wsl.exe', '--cd', '/mnt/g/LAB', '--', 'bash', '-c', ex.payload('x')])
   })
   test('argv(): distro omitted when probe found none', () => {
-    const ex = bareInstance(WslBashExecutor)
-    ex.source = () => ({ wslPath: 'C:\\wsl.exe' })
+    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: 'C:\\wsl.exe' }) })
     ex.distro = () => undefined
-    assert.deepEqual(ex.argv({ command: 'x', workdir: process.cwd() }), ['C:\\wsl.exe', '--', 'bash', '-c', ex.payload('x')])
+    assert.deepEqual(ex.argv({ command: 'x', workdir: process.cwd() }), ['C:\\wsl.exe', '--cd', process.cwd(), '--', 'bash', '-c', ex.payload('x')])
+  })
+  test('defaultWorkdir() is gone — no consumer compares against a config default any more', () => {
+    assert.equal(typeof WslBashExecutor.prototype.defaultWorkdir, 'undefined')
   })
   test('distro(): explicit wslDistro wins over probe', () => {
-    const ex = bareInstance(WslBashExecutor)
-    ex.source = () => ({ wslDistro: 'Pinned' })
+    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslDistro: 'Pinned' }) })
     ex.internals.probeDistro = () => { throw new Error('must not probe') }
     assert.equal(ex.distro(), 'Pinned')
   })
   test('distro(): probe result cached and used', () => {
     let calls = 0
-    const ex = bareInstance(WslBashExecutor)
-    ex.source = () => ({})
+    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({}) })
     ex.internals.probeDistro = () => { calls += 1; return 'Ubuntu-24.04' }
     assert.equal(ex.distro(), 'Ubuntu-24.04')
     assert.equal(ex.distro(), 'Ubuntu-24.04')
     assert.equal(calls, 1)
   })
   test('requireBwrapUsable(): auto + failed probe → false (honest degrade)', () => {
-    const ex = bareInstance(WslBashExecutor)
-    ex.source = () => ({})
+    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({}) })
     ex.internals.probeBwrap = () => false
     assert.equal(ex.requireBwrapUsable(), false)
   })
   test('requireBwrapUsable(): explicit bwrap + failed probe throws loud', () => {
-    const ex = bareInstance(WslBashExecutor, { sandboxStance: 'bwrap' })
-    ex.source = () => ({})
+    const ex = bareInstance(WslBashExecutor, { sandboxStance: 'bwrap', config: WslBashExecutor.Config({ sandbox: 'bwrap' }) })
     ex.internals.probeBwrap = () => false
     assert.throws(() => ex.requireBwrapUsable(), /bwrap was not found/)
   })
+  testAsync('resolveSandboxMode(): mirrors the sync getter (auto + failed probe → undefined)', async () => {
+    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({}) })
+    ex.internals.probeBwrap = () => false
+    assert.equal(await ex.resolveSandboxMode(), undefined)
+  })
+  testAsync('resolveSandboxMode(): usable bwrap → policy defaultMode', async () => {
+    const ex = bareInstance(WslBashExecutor, {
+      config: WslBashExecutor.Config({}),
+      ctx: { sandboxPolicy: { resolve: () => ({ mode: 'read-only', workspaceRoot: 'X' }), defaultMode: 'read-only' } },
+    })
+    ex.internals.probeBwrap = () => true
+    assert.equal(await ex.resolveSandboxMode(), 'read-only')
+  })
   test('bwrapArgv(): workspace root converted to /mnt/<drive>', () => {
-    const ex = bareInstance(WslBashExecutor)
-    ex.source = () => ({ wslPath: 'C:\\wsl.exe' })
+    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: 'C:\\wsl.exe' }) })
     ex.distro = () => 'Ubuntu-24.04'
     const argv = ex.bwrapArgv({
       command: 'x',
@@ -662,8 +750,7 @@ console.log('\n[A] unit: WslBashExecutor (internals hooks)')
     assert.ok(bwrap.includes('--tmpfs'))
   })
   test('bwrapArgv(): read-only mode has no --bind/--tmpfs', () => {
-    const ex = bareInstance(WslBashExecutor)
-    ex.source = () => ({ wslPath: 'C:\\wsl.exe' })
+    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: 'C:\\wsl.exe' }) })
     ex.distro = () => undefined
     const argv = ex.bwrapArgv({
       command: 'x',
@@ -674,8 +761,7 @@ console.log('\n[A] unit: WslBashExecutor (internals hooks)')
     assert.ok(!argv.includes('--tmpfs'))
   })
   test('bwrapArgv(): UNC/non-drive workspace root fails loud', () => {
-    const ex = bareInstance(WslBashExecutor)
-    ex.source = () => ({ wslPath: 'C:\\wsl.exe' })
+    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: 'C:\\wsl.exe' }) })
     ex.distro = () => undefined
     assert.throws(() => ex.bwrapArgv({
       command: 'x',
@@ -683,81 +769,129 @@ console.log('\n[A] unit: WslBashExecutor (internals hooks)')
       sandboxPolicy: { mode: 'read-only', workspaceRoot: '\\\\server\\share\\x' },
     }), /unsupported Windows path/)
   })
-  testAsync('run(): unconfined path passes plain argv (no sandbox facts)', async () => {
-    const sub = fakeSubprocess()
+  if (!HAS_WSL) {
+    console.log('  … skipping real-spawn WSL tests: no wsl.exe on this host')
+  } else {
+  testAsync('execute(): unconfined path passes plain argv (no sandbox facts)', async () => {
     const ex = bareInstance(WslBashExecutor, {
-      ctx: fakeCtx({ subprocess: sub }),
+      ctx: fakeCtx({ subprocess: fakeSubprocess() }),
       sandboxStance: 'none',
-      config: { wslPath: 'C:\\Windows\\System32\\wsl.exe' },
+      config: WslBashExecutor.Config({ wslPath: WSL_EXE, wslDistro: undefined }),
     })
     ex.distro = () => undefined
-    const result = await ex.run({ command: 'echo wsl-unconfined-ok', timeoutMs: 30000, stdoutMaxBytes: 4096, workdir: process.cwd() })
+    const result = await (await ex.execute(ex.resolve({ command: 'echo wsl-unconfined-ok', timeoutMs: 30000, stdoutMaxBytes: 4096, workdir: process.cwd() }))).result()
     assert.equal(result.exitCode, 0)
     assert.match(result.stdout.text, /wsl-unconfined-ok/)
     assert.equal(result.sandbox, undefined)
   })
+  }
 }
 
-console.log('\n[A] unit: ShellSelectExecutor (internals hooks)')
+console.log('\n[A] unit: backend ownership + background-job adapters')
 {
-  const makeSelector = () => {
-    const sel = Object.create(ShellSelectExecutor.prototype)
-    sel.backends = new Map()
-    sel.fibers = []
-    sel.internals = {}
-    sel.source = () => ({ backends: ['git-bash', 'wsl-bash', 'pwsh'], default: 'pwsh' })
-    return sel
-  }
-  test('requireBackend: unknown name throws SHELL_BACKEND_UNAVAILABLE', () => {
-    const sel = makeSelector()
-    assert.throws(() => sel.requireBackend('bogus'), (e) => e.code === SHELL_BACKEND_UNAVAILABLE)
-  })
-  test('resolve(): routes request.shell ?? default and stamps shellBackend', () => {
-    const sel = makeSelector()
-    sel.backends.set('git-bash', { resolve: (r) => ({ ...r, via: 'git' }) })
-    sel.backends.set('pwsh', { resolve: (r) => ({ ...r, via: 'pwsh' }) })
-    const routed = sel.resolve({ command: 'x', shell: 'git-bash' })
-    assert.equal(routed.via, 'git')
-    assert.equal(routed.shellBackend, 'git-bash')
-    const dflt = sel.resolve({ command: 'x' })
-    assert.equal(dflt.via, 'pwsh')
-    assert.equal(dflt.shellBackend, 'pwsh')
-  })
-  test('run(): dispatches on spec.shellBackend ?? default', async () => {
-    const sel = makeSelector()
-    sel.backends.set('wsl-bash', { run: async (s) => ({ via: 'wsl', spec: s }) })
-    const out = await sel.run({ shellBackend: 'wsl-bash' })
-    assert.equal(out.via, 'wsl')
-  })
-  test('sandboxMode: first enabled backend declaring a mode wins', () => {
-    const sel = makeSelector()
-    sel.source = () => ({ backends: ['git-bash', 'pwsh'], default: 'pwsh' })
-    sel.backends.set('git-bash', { sandboxMode: undefined })
-    sel.backends.set('pwsh', { sandboxMode: 'read-only' })
-    assert.equal(sel.sandboxMode, 'read-only')
-  })
-  test('rebuildBackends: unknown backend name fails loud', () => {
-    const sel = makeSelector()
-    sel.ctx = { plugin: () => { throw new Error('must not construct') } }
-    assert.throws(() => sel.rebuildBackends({ backends: ['bogus'] }), /unknown backend "bogus"/)
-  })
-  test('rebuildBackends: internals.factories override + config partitions', () => {
-    const sel = makeSelector()
-    const received = []
-    // `rebuildBackends` chains fiber.ctx.isolate(...).isolate(...) — a self-returning isolate.
-    const fiberCtx = { isolate: () => fiberCtx }
-    sel.ctx = {
-      plugin: () => ({ ctx: fiberCtx }),
+  test('ownExecutor: constructs the backend on an isolated child fiber', () => {
+    const isolated = { tag: 'isolated' }
+    const isolateCalls = []
+    const fiberCtx = {
+      isolate: (name, label) => { isolateCalls.push([name, typeof label]); return isolated },
     }
-    sel.internals.factories = {
-      'git-bash': (ctx, cfg) => { received.push(['git-bash', cfg]); return { name: 'gb' } },
-      'wsl-bash': (ctx, cfg) => { received.push(['wsl-bash', cfg]); return { name: 'wb' } },
+    const specs = []
+    const ctx = { plugin: (spec) => { specs.push(spec); return { ctx: fiberCtx } } }
+    class FakeExecutor { constructor(c, cfg) { this.ctx = c; this.config = cfg } }
+
+    const { executor, fiber } = ownExecutor(ctx, FakeExecutor, { bashPath: 'X' })
+
+    assert.ok(executor instanceof FakeExecutor)
+    assert.equal(executor.ctx, isolated, 'the backend never sees the tool ctx (seat isolation)')
+    assert.deepEqual(executor.config, { bashPath: 'X' })
+    assert.equal(fiber.ctx, fiberCtx, 'the owning fiber is handed back for teardown')
+    assert.deepEqual(isolateCalls, [['shell', 'symbol']], 'only the shell scope is isolated')
+    assert.deepEqual(specs[0].inject, ['subprocess', 'sandbox', 'sandboxPolicy'])
+    assert.equal(typeof specs[0].apply, 'function')
+  })
+  test('ownExecutor: isolate key is derived from the executor class name', () => {
+    const seen = []
+    const fiberCtx = { isolate: (name, label) => { seen.push(label); return {} } }
+    const ctx = { plugin: () => ({ ctx: fiberCtx }) }
+    class NamedExecutor { constructor() {} }
+    ownExecutor(ctx, NamedExecutor, {})
+    assert.equal(String(seen[0]), String(Symbol('NamedExecutor')))
+  })
+
+  test('processSources: one pull source per stream, stdout first', () => {
+    const sources = processSources(() => undefined)
+    assert.deepEqual(sources.map((s) => s.channel), ['stdout', 'stderr'])
+  })
+  test('processSources: binds lazily — a read before the spawn yields nothing', () => {
+    const sources = processSources(() => undefined)
+    assert.deepEqual(sources[0].read(7), { text: '', nextOffset: 7, lossy: false })
+    assert.deepEqual(sources[1].read(0), { text: '', nextOffset: 0, lossy: false })
+  })
+  test('processSources: reads through the live handle observed readers', () => {
+    const seen = []
+    const live = {
+      observed: {
+        stdout: { readFrom: (o) => { seen.push(['stdout', o]); return { text: 'out', nextOffset: 3, lossy: false } } },
+        stderr: { readFrom: (o) => { seen.push(['stderr', o]); return { text: 'err', nextOffset: 4, lossy: true } } },
+      },
     }
-    sel.rebuildBackends({ backends: ['git-bash', 'wsl-bash'], default: 'git-bash', gitBash: { bashPath: 'GB' }, wslBash: { wslDistro: 'WB' } })
-    assert.equal(sel.backends.size, 2)
-    assert.equal(sel.backends.get('git-bash').name, 'gb')
-    assert.equal(received[0][1].bashPath, 'GB')
-    assert.equal(received[1][1].wslDistro, 'WB')
+    const sources = processSources(() => live)
+    assert.equal(sources[0].read(0).text, 'out')
+    assert.equal(sources[1].read(0).lossy, true)
+    assert.deepEqual(seen, [['stdout', 0], ['stderr', 0]], 'non-consuming observed readers, not readOutput')
+  })
+
+  testAsync('processJob: done resolves with the outcome once the process settles', async () => {
+    let killed = false
+    const proc = {
+      status: 'completed',
+      exitCode: 0,
+      signal: null,
+      done: Promise.resolve(),
+      kill: () => { killed = true },
+    }
+    const hooks = processJob(async () => proc, (p) => processOutcome(p))
+    assert.equal(typeof hooks.cancel, 'function')
+    assert.deepEqual(await hooks.done, { status: 'completed', detail: 'exit code: 0' })
+    assert.equal(killed, false)
+  })
+  testAsync('processJob: a start throw reports failed with the message', async () => {
+    const hooks = processJob(async () => { throw new Error('spawn exploded') }, (p) => processOutcome(p))
+    assert.deepEqual(await hooks.done, { status: 'failed', detail: 'spawn exploded' })
+  })
+  testAsync('processJob: cancel during preparation reports killed', async () => {
+    const hooks = processJob(async () => { throw new Error('aborted mid-preparation') }, (p) => processOutcome(p))
+    hooks.cancel('stop')
+    assert.deepEqual(await hooks.done, { status: 'killed', detail: 'aborted mid-preparation' })
+  })
+  testAsync('processJob: cancel after the spawn kills the live process', async () => {
+    let killed = false
+    let settle
+    const donePromise = new Promise((r) => { settle = r })
+    const proc = {
+      status: 'running',
+      exitCode: null,
+      signal: null,
+      done: donePromise,
+      kill: () => { killed = true; proc.status = 'killed'; proc.signal = 'SIGTERM'; settle() },
+    }
+    const hooks = processJob(async () => proc, (p) => processOutcome(p))
+    // Let `process = await start(...)` land before cancelling.
+    await new Promise((r) => setTimeout(r, 0))
+    hooks.cancel('stop')
+    assert.equal(killed, true, 'the live handle is killed')
+    assert.deepEqual(await hooks.done, { status: 'killed', detail: 'signal: SIGTERM' })
+  })
+  testAsync('processJob: cancel is idempotent', async () => {
+    const proc = { status: 'completed', exitCode: 0, signal: null, done: Promise.resolve(), kill: () => {} }
+    let kills = 0
+    proc.kill = () => { kills += 1 }
+    const hooks = processJob(async () => proc, (p) => processOutcome(p))
+    await new Promise((r) => setTimeout(r, 0))
+    hooks.cancel('first')
+    hooks.cancel('second')
+    await hooks.done
+    assert.equal(kills, 1)
   })
 }
 
@@ -765,7 +899,7 @@ console.log('\n[A] unit: ShellSelectExecutor (internals hooks)')
 // B) Boot integration
 // ═════════════════════════════════════════════════════════════════════════════
 const { boot, resolveConfigPath, loadOverlayPatches } = await import('@deepseek-ai/dsh-app-boot')
-const { CallId } = await import('@deepseek-ai/dsh-llm')
+const { ToolCallId } = await import('@deepseek-ai/dsh-llm')
 
 const PLUGIN = join(__dirname, '..')
 
@@ -774,6 +908,9 @@ const PLUGIN = join(__dirname, '..')
 const FIXTURE_DIR = __dirname
 const writtenFixtures = []
 
+// `session-projection` is required: dsh-sandbox-policy waits on the shared
+// projection registry, and every sandbox-consuming row (including the base
+// bundle's own pwsh executor) waits on `sandboxPolicy` in turn.
 const BASE_ROWS = `- id: system-prompt
   name: '@deepseek-ai/dsh-system-prompt'
 
@@ -786,11 +923,20 @@ const BASE_ROWS = `- id: system-prompt
 - id: sandbox
   name: '@deepseek-ai/dsh-sandbox-local'
 
+- id: session-projection
+  name: '@deepseek-ai/dsh-session-projection'
+
 - id: sandbox-policy
   name: '@deepseek-ai/dsh-sandbox-policy'
 
 - id: shell-env
   name: '@deepseek-ai/dsh-shell-env'
+
+# The base bundle's own ctx.shell provider on win32. Loading it beside our rows
+# is the regression guard for the failure that motivated the 0.1.7 migration:
+# the plugin must neither contend for the seat nor leave it unprovided.
+- id: pwsh-sandbox
+  name: '@deepseek-ai/dsh-pwsh-sandbox'
 
 - id: tasks
   name: '@deepseek-ai/dsh-jobs-local'
@@ -817,18 +963,15 @@ async function runTests(ctx, tests) {
 }
 
 // The pinned fixture uses the PROBED bash (never a hardcoded path); when
-// probing finds none the pinned variant is skipped by the caller.
+// probing finds none the pinned variant is skipped by the caller. Each tool
+// now carries its OWN backend config: there is no shared selector row, and no
+// `backends`/`default` keys — the shell seam has no routing field to feed.
 const PLUGIN_ROWS = (bashPath) => `
-- id: win-mb-shell-select
-  name: 'dsh-win-multi-bash/shell-select'
-  config:
-    backends: [git-bash, wsl-bash, pwsh]
-    default: pwsh
-    gitBash:
-      bashPath: '${bashPath}'
-
 - id: win-mb-tool-git
   name: 'dsh-win-multi-bash/tool-git-bash'
+  config:
+    gitBash:
+      bashPath: '${bashPath}'
 
 - id: win-mb-tool-wsl
   name: 'dsh-win-multi-bash/tool-wsl-bash'
@@ -843,7 +986,7 @@ async function execTool(ctx, name, args) {
 async function execToolResult(ctx, name, args) {
   const result = await ctx.tools.execute({
     signal: new AbortController().signal,
-    callId: CallId(`audit-${name}-${Math.random().toString(36).slice(2)}`),
+    callId: ToolCallId(`audit-${name}-${Math.random().toString(36).slice(2)}`),
     name,
     arguments: { description: `audit ${name}`, ...args },
   })
@@ -867,6 +1010,19 @@ console.log('\n[B] boot integration: default fixture (pinned via probed bash)')
       ['boot: tools registered (git_bash, wsl_bash + job tools)', async () => {
         const names = ctx.tools.schemas().map((t) => t.name)
         for (const n of ['git_bash', 'wsl_bash', 'job_output', 'job_kill']) assert.ok(names.includes(n), `missing ${n}`)
+      }],
+      ['seat: ctx.shell is still provided by the base pwsh-sandbox row', async () => {
+        // The regression guard. Pre-migration our rows owned this seat; when
+        // the selector failed to import, the seat went unprovided and every
+        // `shell`-injecting plugin (tool-pwsh, permission-presets, our own
+        // tools) stayed pending forever.
+        assert.ok(ctx.shell !== undefined, 'ctx.shell must be provided')
+        const result = await (await ctx.shell.execute(ctx.shell.resolve({
+          command: 'echo seat-ok',
+          signal: new AbortController().signal,
+        }))).result()
+        assert.equal(result.exitCode, 0)
+        assert.match(result.stdout.text, /seat-ok/)
       }],
       ['git_bash: echo round-trip', async () => {
         const text = await execTool(ctx, 'git_bash', { command: 'echo git-audit-ok' })
@@ -940,6 +1096,19 @@ console.log('\n[B] boot integration: default fixture (pinned via probed bash)')
         const read2 = await execTool(ctx, 'job_output', { job_id: jobId })
         assert.match(read2, /killed|stopping|cancelled/i)
       }],
+      ['git_bash: background output reaches the registry ring (pull sources)', async () => {
+        // 0.1.7 moved background reads into the registry: the tool registers
+        // `output` pull sources instead of handing back a readOutput hook, so
+        // this proves the lazy `proc` binding actually carries the streams.
+        const text = await execTool(ctx, 'git_bash', { command: 'echo bg-line-1; echo bg-line-2', run_in_background: true })
+        const jobId = text.match(/started background job (\S+)/)?.[1]
+        assert.ok(jobId, `no job id in: ${text}`)
+        await new Promise((r) => setTimeout(r, 2500))
+        const read = await execTool(ctx, 'job_output', { job_id: jobId })
+        assert.match(read, /bg-line-1/)
+        assert.match(read, /bg-line-2/)
+        assert.match(read, /completed|exit code/i)
+      }],
       ['wsl_bash: echo round-trip', async () => {
         const text = await execTool(ctx, 'wsl_bash', { command: 'echo wsl-audit-ok' })
         assert.match(text, /wsl-audit-ok/)
@@ -960,6 +1129,14 @@ console.log('\n[B] boot integration: default fixture (pinned via probed bash)')
         const text = await execTool(ctx, 'wsl_bash', { command: 'pwd', workdir: 'G:\\LAB\\202608\\dsh-win-multi-bash' })
         assert.match(text, /\/mnt\/g\/LAB\/202608\/dsh-win-multi-bash/)
       }],
+      ['wsl_bash: auto-cds to the session dir when no workdir is given', async () => {
+        // The auto-cd contract: with no explicit workdir the command still
+        // starts in the WSL view of the session directory rather than in the
+        // distro's home. This is what `--cd` always being passed buys.
+        const text = await execTool(ctx, 'wsl_bash', { command: 'pwd' })
+        assert.match(text, /\/mnt\/[a-z]\//i, `expected the session drive, got: ${text}`)
+        assert.doesNotMatch(text, /^\/home\//m, `fell back to the distro home: ${text}`)
+      }],
       ['wsl_bash: background job lifecycle', async () => {
         const text = await execTool(ctx, 'wsl_bash', { command: 'while :; do :; done', run_in_background: true })
         const jobId = text.match(/started background job (\S+)/)?.[1]
@@ -968,38 +1145,16 @@ console.log('\n[B] boot integration: default fixture (pinned via probed bash)')
         const read2 = await execTool(ctx, 'job_output', { job_id: jobId })
         assert.match(read2, /killed|stopping|cancelled/i)
       }],
-      ['selector: default route lands on pwsh', async () => {
-        const result = await ctx.shell.run(ctx.shell.resolve({ command: 'echo selector-default-ok', signal: new AbortController().signal }))
+      ['tools own their executors — ctx.shell keeps the base pwsh identity', async () => {
+        // If a tool had registered on the seat, cordis would have thrown on the
+        // duplicate. Proving the seat runs pwsh (not a bash dialect) is the
+        // strongest available statement that our rows never took it.
+        const result = await (await ctx.shell.execute(ctx.shell.resolve({
+          command: 'Write-Output pwsh-seat-identity',
+          signal: new AbortController().signal,
+        }))).result()
         assert.equal(result.exitCode, 0)
-        assert.match(result.stdout.text, /selector-default-ok/)
-      }],
-      ['selector: explicit shell routes to each backend', async () => {
-        const git = await ctx.shell.run(ctx.shell.resolve({ command: 'echo routed-git', shell: 'git-bash', signal: new AbortController().signal }))
-        assert.match(git.stdout.text, /routed-git/)
-        const wsl = await ctx.shell.run(ctx.shell.resolve({ command: 'echo routed-wsl', shell: 'wsl-bash', signal: new AbortController().signal }))
-        assert.match(wsl.stdout.text, /routed-wsl/)
-        const pwsh = await ctx.shell.run(ctx.shell.resolve({ command: 'echo routed-pwsh', shell: 'pwsh', signal: new AbortController().signal }))
-        assert.match(pwsh.stdout.text, /routed-pwsh/)
-      }],
-      ['selector: unknown backend fails with SHELL_BACKEND_UNAVAILABLE', async () => {
-        // resolve() throws synchronously (HarnessError, code SHELL_BACKEND_UNAVAILABLE).
-        assert.throws(() => ctx.shell.resolve({ command: 'echo x', shell: 'bogus', signal: new AbortController().signal }), (e) => {
-          assert.equal(e.code, SHELL_BACKEND_UNAVAILABLE)
-          return true
-        })
-      }],
-      ['git_bash sandbox facts (records actual probe outcome)', async () => {
-        const result = await ctx.shell.run(ctx.shell.resolve({ command: 'echo sandbox-facts', signal: new AbortController().signal, shell: 'git-bash' }))
-        const facts = result.sandbox
-        console.log(`      git_bash sandbox facts: ${JSON.stringify(facts)}`)
-        if (facts !== undefined) {
-          assert.equal(typeof facts.mode, 'string')
-          assert.equal(typeof facts.denied, 'boolean')
-        }
-      }],
-      ['wsl_bash sandbox facts (bwrap missing on this host → honest degrade)', async () => {
-        const result = await ctx.shell.run(ctx.shell.resolve({ command: 'echo wsl-sandbox-facts', signal: new AbortController().signal, shell: 'wsl-bash' }))
-        console.log(`      wsl_bash sandbox facts: ${JSON.stringify(result.sandbox)}`)
+        assert.match(result.stdout.text, /pwsh-seat-identity/)
       }],
       ['long command (40k chars) does not crash the tool', async () => {
         const text = await execTool(ctx, 'git_bash', { command: `echo ${'a'.repeat(40000)} | wc -c` })
@@ -1019,12 +1174,6 @@ console.log('\n[B] boot integration: no-pin fixture (auto git-path resolution, n
   // itself (well-known probes → PATH → git.exe layout inference) and must
   // NEVER land in WSL via the System32 launcher.
   const NO_PIN_ROWS = `
-- id: win-mb-shell-select
-  name: 'dsh-win-multi-bash/shell-select'
-  config:
-    backends: [git-bash, wsl-bash, pwsh]
-    default: pwsh
-
 - id: win-mb-tool-git
   name: 'dsh-win-multi-bash/tool-git-bash'
 
@@ -1061,12 +1210,13 @@ console.log('\n[B] boot integration: no-pin fixture (auto git-path resolution, n
 
 console.log('\n[B] boot integration: REAL cordis.patch.yml applied as overlay patches')
 {
-  // The plugin's own patch disables base rows (absent here → loader warns+skips)
-  // and inserts the win-mb-* rows — exactly the Path A/B wiring. `!!js` tags are
-  // evaluated by loadOverlayPatches, proving the shipped patch file parses.
+  // The shipped patch inserts the two win-mb-* tool rows and touches nothing
+  // else — it no longer disables `pwsh-sandbox` (the base bundle's seat
+  // provider must survive) and no longer mounts a selector. `!!js` tags are
+  // evaluated by loadOverlayPatches, proving the shipped file parses.
   const patchPath = join(PLUGIN, 'cordis.patch.yml')
   const patches = loadOverlayPatches('dsh-wmb-audit', patchPath)
-  assert.ok(patches.length >= 3, `expected ≥3 patch entries, got ${patches.length}`)
+  assert.ok(patches.length >= 1, `expected ≥1 patch entry, got ${patches.length}`)
   let ctx
   try {
     ctx = await bootFixture('', 'patch-overlay.yml', patches)
@@ -1082,6 +1232,14 @@ console.log('\n[B] boot integration: REAL cordis.patch.yml applied as overlay pa
         const wsl = await execTool(ctx, 'wsl_bash', { command: 'echo patch-overlay-wsl' })
         assert.match(wsl, /patch-overlay-wsl/)
       }],
+      ['the shipped patch does not leave the shell seat unprovided', async () => {
+        assert.ok(ctx.shell !== undefined, 'the base bundle keeps ctx.shell')
+      }],
+      ['the shipped patch disables no base row (no selector to make room for)', async () => {
+        const raw = readFileSync(patchPath, 'utf8')
+        assert.ok(!/disabled:\s*true/.test(raw), 'no unconditional `disabled: true` row remains')
+        assert.ok(!/shell-select/.test(raw), 'no selector row remains')
+      }],
     ])
   } finally {
     if (ctx) await ctx.fiber.dispose()
@@ -1090,22 +1248,22 @@ console.log('\n[B] boot integration: REAL cordis.patch.yml applied as overlay pa
 
 console.log('\n[B] boot integration: misconfiguration matrices')
 {
-  const BOGUS_BACKEND_ROWS = (bashPath) => `
-- id: win-mb-shell-select
-  name: 'dsh-win-multi-bash/shell-select'
-  config:
-    backends: [git-bash, bogus]
-    default: git-bash
-    gitBash:
-      bashPath: '${bashPath}'
-`
+  // A pinned bashPath that does not exist: resolution trusts an explicit pin
+  // verbatim, so the failure must surface as a loud per-command error rather
+  // than a crash or a silent fallback to another shell.
   let ctx
   try {
-    ctx = await bootFixture(BOGUS_BACKEND_ROWS(GIT_BASH), 'bogus-backend.yml')
+    ctx = await bootFixture(`
+- id: win-mb-tool-git
+  name: 'dsh-win-multi-bash/tool-git-bash'
+  config:
+    gitBash:
+      bashPath: 'G:\\no-such-git\\usr\\bin\\bash.exe'
+`, 'bad-bashpin.yml')
     await runTests(ctx, [
-      ['unknown backend in config fails loud at first use', async () => {
+      ['unresolvable pinned bashPath surfaces as a failed command, not a crash', async () => {
         const r = await execToolResult(ctx, 'git_bash', { command: 'echo x' })
-        assert.ok(r.isError || /unknown backend "bogus"/.test(r.text), `text: ${r.text.slice(0, 200)}`)
+        assert.equal(r.isError, true, `expected an error result, got: ${r.text.slice(0, 200)}`)
       }],
     ])
   } finally {
@@ -1115,66 +1273,57 @@ console.log('\n[B] boot integration: misconfiguration matrices')
   let ctx2
   try {
     ctx2 = await bootFixture(`
-- id: win-mb-shell-select
-  name: 'dsh-win-multi-bash/shell-select'
-  config:
-    backends: [git-bash, wsl-bash, pwsh]
-    default: pwsh
-    wslBash:
-      wslDistro: 'NoSuchDistro-999'
-
 - id: win-mb-tool-git
   name: 'dsh-win-multi-bash/tool-git-bash'
 
 - id: win-mb-tool-wsl
   name: 'dsh-win-multi-bash/tool-wsl-bash'
+  config:
+    wslBash:
+      wslDistro: 'NoSuchDistro-999'
 `, 'bad-distro.yml')
     await runTests(ctx2, [
       ['nonexistent wslDistro surfaces as a failed command, not a crash', async () => {
         const r = await execToolResult(ctx2, 'wsl_bash', { command: 'echo x' })
         assert.ok(r.text.length > 0)
       }],
+      ['a broken wsl backend leaves git_bash fully usable (no shared seat to poison)', async () => {
+        const text = await execTool(ctx2, 'git_bash', { command: 'echo git-still-fine' })
+        assert.match(text, /git-still-fine/)
+      }],
     ])
   } finally {
     if (ctx2) await ctx2.fiber.dispose()
   }
 
-  // #3 (fixed): explicit `sandbox: bwrap` must NOT brick the boot (the
-  // selector's sandboxMode advertisement now tolerates a backend's probe
-  // failure). What the first wsl_bash command does is host-dependent: with
-  // bubblewrap in the distro it confines and runs; without it, the explicit
-  // stance fails loudly instead of running unconfined.
+  // #3: explicit `sandbox: bwrap` must never run unconfined. The tool's apply
+  // awaits `resolveSandboxMode()`, so a host without bubblewrap deactivates the
+  // wsl row loudly at load rather than degrading per command; a host with
+  // bubblewrap confines every command. Either way the safety property holds:
+  // wsl_bash never executes unconfined under this stance.
   let ctx3
   try {
     ctx3 = await bootFixture(`
-- id: win-mb-shell-select
-  name: 'dsh-win-multi-bash/shell-select'
-  config:
-    backends: [git-bash, wsl-bash, pwsh]
-    default: pwsh
-    wslBash:
-      sandbox: bwrap
-
 - id: win-mb-tool-git
   name: 'dsh-win-multi-bash/tool-git-bash'
 
 - id: win-mb-tool-wsl
   name: 'dsh-win-multi-bash/tool-wsl-bash'
+  config:
+    wslBash:
+      sandbox: bwrap
 `, 'explicit-bwrap.yml')
     await runTests(ctx3, [
-      ['#3: boot succeeds with explicit bwrap', async () => {
+      ['#3: git_bash is unaffected by the wsl sandbox stance', async () => {
         const names = ctx3.tools.schemas().map((t) => t.name)
         assert.ok(names.includes('git_bash'))
-        assert.ok(names.includes('wsl_bash'))
-      }],
-      ['#3: other backends unaffected (git_bash still executes)', async () => {
         const text = await execTool(ctx3, 'git_bash', { command: 'echo still-works' })
         assert.match(text, /still-works/)
       }],
-      ['#3: first wsl_bash use — confined run when bwrap exists, loud failure when absent', async () => {
+      ['#3: explicit bwrap never runs wsl_bash unconfined', async () => {
+        const names = ctx3.tools.schemas().map((t) => t.name)
+        if (!names.includes('wsl_bash')) return // row deactivated loud: bwrap absent in the distro
         const r = await execToolResult(ctx3, 'wsl_bash', { command: 'echo x' })
-        // Host without bubblewrap: the explicit stance must fail loud, never run unconfined.
-        if (/bwrap was not found/.test(r.text)) return
         // Host with bubblewrap: the explicit stance confines and the command runs.
         assert.match(r.text, /x/, `unexpected result: ${r.text.slice(0, 200)}`)
       }],
@@ -1185,7 +1334,6 @@ console.log('\n[B] boot integration: misconfiguration matrices')
 }
 
 for (const p of writtenFixtures) rmSync(p, { force: true })
-try { rmSync(join(__dirname, '_repro.mjs'), { force: true }) } catch { /* not ours */ }
 
 // ── summary ──────────────────────────────────────────────────────────────────
 console.log(`\n==== audit summary: ${passed} passed, ${failed} failed ====`)
