@@ -70,13 +70,19 @@ wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"   # 验
 
 ## 工具提示词（面向模型的描述）
 
-`git_bash` / `wsl_bash` 的工具描述刻意保持精简，与官方 `tool-pwsh` 同构：每次调用全新 shell、方言的路径/环境变量写法、`[exit code: N]` 标记、`$DSH_*` 环境事实、沙箱行为、输出截断、后台任务与升级契约。更长的方言说明（MSYS 路径改写、WSL base64 载荷）放在本文档而不是模型可见的描述里。
+`git_bash` / `wsl_bash` 的工具描述刻意保持精简，与官方 `tool-pwsh` 同构：每次调用全新 shell、方言的路径/环境变量写法、`[exit code: N]` 标记、`$DSH_*` 环境事实、沙箱行为、输出截断、删除/移动前的目标路径校验、未设变量的 `${VAR:?}` 兜底、后台任务与升级契约。更长的方言说明（MSYS 路径改写、WSL base64 载荷）放在本文档而不是模型可见的描述里。
+
+这两个工具都用 `bash -c`，因此上述安全提示采用 `tool-bash` 的 bash 版措辞而非 `tool-pwsh` 的：bash 里 `$HOME` 是可赋值的普通变量，pwsh 的「不要给自动变量赋值」那句在此会误导；bash 对计算路径的兜底就是上面的 `${VAR:?}` 写法——它让未设变量直接报错，而不是静默展开成空串。
 
 `git_bash` 的描述还带一条路径格式提示：
 
 > MSYS paths work inside Git Bash only — dsh's file tools (`read`, `write`, `edit`) on Windows take native `C:\...` paths.
 
 即命令输出里的 MSYS 路径（如 `/d/WorkSpace/foo`）在交给 dsh 文件工具前要转成 Windows 形式（`D:\WorkSpace\foo`）；而在 bash 命令内部，MSYS 路径才是 shell 期望的写法。
+
+**`workdir` 接受原生、MSYS 与 WSL 挂载三种写法。** 模型在被告知方言路径是 MSYS／WSL 形式后，自然会用同样的形式写 `workdir`；解析器因此把单字母盘符形式（`/c/...`）与 WSL 挂载形式（`/mnt/c/...`）在交给 `spawn` 之前转成原生 `C:\...`，而 MSYS 的 POSIX 根（`/etc`、`/usr`、`/tmp`）与发行版侧路径（如 `/mnt/data`）保持原样，相对路径仍相对会话工作区解析。在此转换之前，MSYS 形式的 `workdir` 会以 `spawn <shell> ENOENT` 失败——一个「找不到 shell」的假象，实际是 cwd 不可用。
+
+工具行还会注册一段系统提示词小节（`tool:<name>`）：每次结果都要核对 `[exit code: N]` 标记，且依赖前一步的后续命令要用 `&&` 或 `set -o pipefail` 串接——`;` 不会因失败中止，而 `cmd | tail` 返回的是 `tail` 的状态而非 `cmd` 的。这属于「如何组合多步命令」的跨调用指导，因此放在提示词里而不是单次调用的 schema 里；它也让运行时自带的截尾能力成为「不必用管道限制输出」的理由。
 
 ## 路径转换（MSYS 自动改写）
 

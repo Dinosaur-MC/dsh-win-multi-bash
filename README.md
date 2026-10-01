@@ -70,13 +70,19 @@ wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"   # ver
 
 ## Tool prompts (model-facing descriptions)
 
-The `git_bash` / `wsl_bash` tool descriptions are deliberately concise and mirror the official `tool-pwsh` skeleton: a fresh shell per call, the dialect's paths/env form, `[exit code: N]` markers, `$DSH_*` environment facts, sandbox behavior, output truncation, background jobs, and the escalation contract. The longer dialect notes (MSYS path rewriting, WSL base64 payloads) live in this README rather than in the model-facing text.
+The `git_bash` / `wsl_bash` tool descriptions are deliberately concise and mirror the official `tool-pwsh` skeleton: a fresh shell per call, the dialect's paths/env form, `[exit code: N]` markers, `$DSH_*` environment facts, sandbox behavior, output truncation, delete/move target verification, the unset-variable `${VAR:?}` guard, background jobs, and the escalation contract. The longer dialect notes (MSYS path rewriting, WSL base64 payloads) live in this README rather than in the model-facing text.
+
+Both tools run `bash -c`, so that safety guidance is worded as in `tool-bash`, not as in `tool-pwsh`: `$HOME` is an ordinary assignable variable in bash, so pwsh's "do not assign to automatic variables" sentence would be wrong here — the bash guard for a computed path is the `${VAR:?}` form above, which makes an unset variable fail instead of silently expanding to an empty string.
 
 `git_bash`'s description additionally carries a path-format hint:
 
 > MSYS paths work inside Git Bash only — dsh's file tools (`read`, `write`, `edit`) on Windows take native `C:\...` paths.
 
 So when a command prints an MSYS path (e.g. `/d/WorkSpace/foo`), convert it to its Windows form (`D:\WorkSpace\foo`) before handing it to dsh's file tools; inside the bash command itself, MSYS paths are what the shell expects.
+
+**`workdir` accepts native, MSYS and WSL-automount forms.** A model told that the dialect's paths are MSYS- or WSL-shaped will naturally write `workdir` that way, so the resolver translates a single-letter drive form (`/c/...`) and the WSL automount form (`/mnt/c/...`) into the native `C:\...` before the executor hands the value to `spawn`; MSYS POSIX roots (`/etc`, `/usr`, `/tmp`) and distro-side paths such as `/mnt/data` are left untouched, and a relative `workdir` still resolves against the session workspace. Before that translation an MSYS-form `workdir` failed as `spawn <shell> ENOENT` — a missing-shell symptom for what is really an unusable cwd.
+
+Each tool row also registers a short system-prompt section (`tool:<name>`): check the `[exit code: N]` marker on every result, and chain dependent steps with `&&` or `set -o pipefail` — `;` never stops on failure, and `cmd | tail` returns the status of `tail`, not of `cmd`. That is guidance about *composing* a multi-step command rather than about one call's arguments, so it belongs to the prompt instead of the per-call schema; it also makes the runtime's own tail truncation the reason not to bound output with a pipe.
 
 ## Path conversion (MSYS auto-rewriting)
 

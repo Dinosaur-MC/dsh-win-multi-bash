@@ -51,6 +51,7 @@ const { processJob, processOutcome, processSources } =
   await import(libUrl('tool-bash', 'types', 'background.js'))
 const gitBashTool = await import(libUrl('tool-bash', 'types', 'git-bash.js'))
 const wslBashTool = await import(libUrl('tool-bash', 'types', 'wsl-bash.js'))
+const { SHELL_EXIT_STATUS_SECTION, shellDescription, toNativeWorkdir } = await import(libUrl('tool-bash', 'types', 'factory.js'))
 const { LocalBashExecutor } = await import('@deepseek-ai/dsh-bash-local')
 
 let passed = 0
@@ -998,6 +999,53 @@ async function execToolResult(ctx, name, args) {
   return { text, isError: result.isError === true, error: result.error }
 }
 
+console.log('\n[A] unit: factory workdir drive-form normalization')
+{
+  // `/c/...` and `/mnt/c/...` are absolute to node:path yet Windows resolves
+  // them against the current drive; the executor hands the value straight to
+  // `spawn` as the child's cwd, so an untranslated form fails with the
+  // misleading `spawn <shell> ENOENT`.
+  test('toNativeWorkdir: MSYS drive form becomes a native path', () => {
+    assert.equal(toNativeWorkdir('/c/Users/Dinos'), 'C:\\Users\\Dinos')
+  })
+  test('toNativeWorkdir: WSL automount form becomes a native path', () => {
+    assert.equal(toNativeWorkdir('/mnt/c/Users/Dinos'), 'C:\\Users\\Dinos')
+  })
+  test('toNativeWorkdir: a bare drive root keeps its trailing separator', () => {
+    assert.equal(toNativeWorkdir('/mnt/c'), 'C:\\')
+  })
+  test('toNativeWorkdir: MSYS POSIX roots and distro paths are never drive-mapped', () => {
+    // Only a single-letter first segment qualifies, so the MSYS root dirs and
+    // any distro-side `/mnt/<name>` path keep their own meaning.
+    for (const p of ['/etc/hosts', '/usr/bin', '/tmp/x', '/dev/null', '/proc/1', '/var/log', '/mnt/data/x'])
+      assert.equal(toNativeWorkdir(p), p)
+  })
+  test('toNativeWorkdir: native and relative paths pass through', () => {
+    assert.equal(toNativeWorkdir('C:\\Users'), 'C:\\Users')
+    assert.equal(toNativeWorkdir('smoke'), 'smoke')
+    assert.equal(toNativeWorkdir('\\\\server\\share'), '\\\\server\\share')
+  })
+  test('toNativeWorkdir: a letter with no such drive is left alone', () => {
+    if (existsSync('Q:\\')) return
+    assert.equal(toNativeWorkdir('/q/WorkSpace'), '/q/WorkSpace')
+  })
+}
+
+console.log('\n[A] unit: shell prompt section (exit status + gating)')
+{
+  // Registered per tool via ctx.systemPrompt.section as `tool:<name>`. The
+  // section guards a composition trap, not one call's arguments, so it must
+  // keep both halves: the exit-marker instruction and the gating rule.
+  test('prompt section keeps the [exit code: N] marker instruction', () => {
+    assert.match(SHELL_EXIT_STATUS_SECTION, /\[exit code: N\] marker/)
+  })
+  test('prompt section warns that `;` never stops and a pipe hides the failure', () => {
+    assert.match(SHELL_EXIT_STATUS_SECTION, /Chain dependent steps with `&&` or `set -o pipefail`/)
+    assert.match(SHELL_EXIT_STATUS_SECTION, /`;` never stops on failure/)
+    assert.match(SHELL_EXIT_STATUS_SECTION, /`cmd \| tail` returns the status of `tail`/)
+  })
+}
+
 console.log('\n[B] boot integration: default fixture (pinned via probed bash)')
 {
   if (!HAS_GIT_BASH) {
@@ -1047,6 +1095,17 @@ console.log('\n[B] boot integration: default fixture (pinned via probed bash)')
       }],
       ['git_bash: workdir honored (absolute)', async () => {
         const text = await execTool(ctx, 'git_bash', { command: 'pwd', workdir: 'C:\\Users\\Dinos' })
+        assert.match(text, /Dinos/)
+      }],
+      ['git_bash: MSYS-drive workdir translated, not passed to spawn as cwd', async () => {
+        // Regression guard: `/c/...` is absolute to node:path but resolves to
+        // `G:\c\...` in Windows, so spawn used to fail with `spawn bash.exe
+        // ENOENT` — a missing-shell symptom for what is really a bad cwd.
+        const text = await execTool(ctx, 'git_bash', { command: 'pwd', workdir: '/c/Users/Dinos' })
+        assert.match(text, /Dinos/)
+      }],
+      ['git_bash: WSL automount workdir translated (same guard)', async () => {
+        const text = await execTool(ctx, 'git_bash', { command: 'pwd', workdir: '/mnt/c/Users/Dinos' })
         assert.match(text, /Dinos/)
       }],
       ['git_bash: workdir relative resolved against session workspace', async () => {
@@ -1127,6 +1186,12 @@ console.log('\n[B] boot integration: default fixture (pinned via probed bash)')
       }],
       ['wsl_bash: workdir translated by wsl --cd', async () => {
         const text = await execTool(ctx, 'wsl_bash', { command: 'pwd', workdir: 'G:\\LAB\\202608\\dsh-win-multi-bash' })
+        assert.match(text, /\/mnt\/g\/LAB\/202608\/dsh-win-multi-bash/)
+      }],
+      ['wsl_bash: automount workdir translated, not passed to spawn as cwd', async () => {
+        // Same guard as git_bash: `/mnt/g/...` is a valid `--cd` value but an
+        // impossible process cwd, so it must be normalized before spawn.
+        const text = await execTool(ctx, 'wsl_bash', { command: 'pwd', workdir: '/mnt/g/LAB/202608/dsh-win-multi-bash' })
         assert.match(text, /\/mnt\/g\/LAB\/202608\/dsh-win-multi-bash/)
       }],
       ['wsl_bash: auto-cds to the session dir when no workdir is given', async () => {

@@ -1,3 +1,21 @@
+# dsh-win-multi-bash v0.3.1
+
+## Bug fixes
+
+- **An MSYS- or WSL-form `workdir` no longer fails as a missing shell.** An absolute `workdir` was handed to `spawn` as the child's `cwd` unchanged: `node:path` calls both MSYS `/d/WorkSpace` and the WSL automount view `/mnt/d/WorkSpace` absolute, but Windows resolves them against the current drive (`G:\d\WorkSpace`), so the spawn failed and reported ENOENT **against the executable** — `bash.exe` / `wsl.exe` — which reads as a missing shell rather than an unusable directory. Both forms are now translated to the native `D:\WorkSpace` before the executor sees them. Only a single-letter first segment (optionally under `/mnt/`) whose drive exists qualifies, so MSYS POSIX roots (`/etc`, `/usr`, `/tmp`, `/dev`) and distro-side paths such as `/mnt/data` keep their own meaning, and a relative `workdir` still resolves against the session workspace. `toNativeWorkdir` is exported for the audit.
+
+## Improvements
+
+- **Tool descriptions track the dsh 0.2.0 skeleton.** `tool-bash` and `tool-pwsh` each gained two sentences upstream; `git_bash` / `wsl_bash` now carry the bash-family wording — verify the resolved absolute target path before any delete or move, and guard a computed path against an unset variable with `${VAR:?}`. They deliberately do not adopt pwsh's `$HOME` sentence: in bash `$HOME` is an ordinary assignable variable.
+- **The exit-status prompt section now states the gating rule.** Alongside the `[exit code: N]` instruction, each tool row tells the model to chain dependent steps with `&&` or `set -o pipefail`, because `;` never stops on failure and `cmd | tail` returns `tail`'s status rather than the command's. It stays in the prompt rather than the per-call schema (cross-call guidance), and the runtime's own tail truncation is the reason not to bound output with a pipe. The text lives in the exported `SHELL_EXIT_STATUS_SECTION` so the audit can pin it.
+
+## Verification
+
+Verified on dsh **0.2.0-rc.2**; the peer floors stay at `>=0.1.7-rc.2`, which that release satisfies, so 0.1.7 deployments are unaffected.
+
+- `npm test` (`smoke/run.ps1`): `git_bash`, `wsl_bash` and the base bundle's own `pwsh` seat each executed a real command (`git-bash-ok` / `wsl-ok` / `pwsh-ok`) with `shellSeatPresent: true`, in both the schema-default and pinned-`bashPath` variants.
+- `smoke/audit.ps1`: **140 assertions, 0 failures**. Nine of them are the new regression guards, and they do fail on the previous code: six unit assertions over the drive-form translation plus three boot assertions that run a real command through an MSYS-form and a WSL-automount `workdir`.
+
 # dsh-win-multi-bash v0.3.0
 
 ## Breaking: rewritten for dsh 0.1.7
