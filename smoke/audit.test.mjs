@@ -58,6 +58,7 @@ const {
   shellFamilySectionText, shellFamilySectionOrder,
 } = await import(libUrl('tool-bash', 'types', 'shell-family.js'))
 const shellPromptRow = await import(libUrl('tool-bash', 'shell-prompt.js'))
+const packageRow = await import(libUrl('index.js'))
 const { LocalBashExecutor } = await import('@deepseek-ai/dsh-bash-local')
 
 let passed = 0
@@ -1018,6 +1019,9 @@ async function runTests(ctx, tests) {
 // now carries its OWN backend config: there is no shared selector row, and no
 // `backends`/`default` keys — the shell seam has no routing field to feed.
 const PLUGIN_ROWS = (bashPath) => `
+- id: win-mb-plugin
+  name: 'dsh-win-multi-bash'
+
 - id: win-mb-shell-prompt
   name: 'dsh-win-multi-bash/tool-shell-prompt'
 
@@ -1442,6 +1446,39 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.equal(rowKey('win-mb-tool-git'), 'dsh-win-multi-bash#win-mb-tool-git')
     assert.deepEqual(planOps([], new Map()), [], 'no drafts, no writes')
   })
+
+  test('the bundle declares a BARE package row — the only thing that serves the browser half', () => {
+    // dsh-client-modules discovers a browser half by resolving a Loader row's
+    // package name to its package.json (`locatePkgJson` →
+    // `exactPackageSpecifier`), and that helper answers `undefined` for a
+    // subpath. A bundle whose rows are all subpaths therefore serves NO client
+    // bundle at all — which is exactly how the first version of this browser
+    // half failed to appear on the Plugins page.
+    const exactPackageSpecifier = (specifier) => {
+      if (specifier.startsWith('@')) {
+        const parts = specifier.split('/')
+        return parts.length === 2 && parts.every(Boolean) ? specifier : undefined
+      }
+      return specifier.length > 0 && !specifier.includes('/') && !specifier.includes(':') ? specifier : undefined
+    }
+    const patch = readFileSync(join(PLUGIN, 'cordis.patch.yml'), 'utf8')
+    const rows = [...patch.matchAll(/- id: (win-mb-[a-z-]+)\n\s+name: '([^']+)'/g)].map((match) => ({ id: match[1], name: match[2] }))
+    assert.ok(rows.length >= 4, `expected the runtime rows plus the package row, got ${rows.length}`)
+    const carriers = rows.filter((row) => exactPackageSpecifier(row.name) === 'dsh-win-multi-bash')
+    assert.equal(carriers.length, 1, 'exactly one row must name the bare package specifier')
+
+    // What that row loads must be a Loader-shaped plugin: the documented empty
+    // host half of a browser-only companion.
+    assert.equal(typeof packageRow.apply, 'function', 'the package main must hold the empty apply')
+
+    // And the declaration the scan reads next must be complete.
+    const manifest = JSON.parse(readFileSync(join(PLUGIN, 'package.json'), 'utf8'))
+    assert.equal(manifest.name, 'dsh-win-multi-bash')
+    assert.equal(manifest.dsh.client.platform, 'web')
+    const clientExport = manifest.exports['./client']
+    assert.equal(typeof clientExport, 'string', 'exports["./client"] must be a string path')
+    assert.ok(existsSync(join(PLUGIN, clientExport)), `exports["./client"] must exist: ${clientExport}`)
+  })
 }
 
 console.log('\n[A] unit: family section placement (between TOOL_BASH and TOOL_PWSH)')
@@ -1723,6 +1760,17 @@ console.log('\n[B] boot integration: REAL cordis.patch.yml applied as overlay pa
         const raw = readFileSync(patchPath, 'utf8')
         assert.ok(!/disabled:\s*true/.test(raw), 'no unconditional `disabled: true` row remains')
         assert.ok(!/shell-select/.test(raw), 'no selector row remains')
+      }],
+      ['the shipped patch composes the package row that carries the browser half', async () => {
+        // `loader.entries()` is a cosmokit collection, not an Array: iterate it.
+        const rows = []
+        for (const entry of ctx.loader.entries()) rows.push({ id: entry.options.id, name: entry.options.name, enabled: !entry.disabled })
+        const composed = rows.map((row) => `${String(row.id)}|${String(row.name)}|${String(row.enabled)}`).join(', ')
+        const carrier = rows.find((row) => row.name === 'dsh-win-multi-bash')
+        assert.ok(carrier !== undefined, `the bare package row must be composed; composed rows: ${composed}`)
+        assert.equal(carrier.enabled, true, 'and it must be enabled')
+        for (const name of ['dsh-win-multi-bash/tool-shell-prompt', 'dsh-win-multi-bash/tool-git-bash', 'dsh-win-multi-bash/tool-wsl-bash'])
+          assert.ok(rows.some((row) => row.name === name), `${name} must be composed too; composed rows: ${composed}`)
       }],
     ])
   } finally {

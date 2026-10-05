@@ -88,6 +88,8 @@ So when a command prints an MSYS path (e.g. `/d/WorkSpace/foo`), convert it to i
 
 Both tool rows carry their own configuration, and every knob is declared `.volatile()` — which is what makes it addressable by the runtime's settings service. The Web **Plugins** page therefore edits it: open **Plugins** in the sidebar, open the `dsh-win-multi-bash` bundle, and each row has a **Configure** page. The browser half (`lib/client.js`, declared as `dsh.client` + the `./client` export) registers that page into the page's `plugins.row.config` slot, keyed `dsh-win-multi-bash#<row id>`; a save goes to the profile's Cordis patch through `settings`/`ctx.configForms` — the same place a hand edit lands, with no HTTP route, no second settings file, and no YAML editing.
 
+The patch therefore also inserts a fourth, behavior-free row — `win-mb-plugin`, `name: 'dsh-win-multi-bash'` — and it is not optional: `dsh-client-modules` discovers a browser half by resolving a row's **bare package specifier** to its `package.json` and reading `dsh.client` there (`locatePkgJson` → `exactPackageSpecifier`, which answers `undefined` for a subpath). All three runtime rows are subpaths, so without that row the client bundle is never served and the rows show no Configure control at all. Its module (`lib/index.js`) is the documented shape for such a carrier: an empty `apply`.
+
 | Row | Options (in page order) |
 |---|---|
 | `git_bash` | Background jobs (`enableRunInBackground`); `cwd`, `timeoutMs`, `maxTimeoutMs`, `maxOutputBytes`, `maxSpillBytes`, `graceMs`; `bashPath`; sandbox stance (`auto` / `none`); `probeTimeoutMs`; `requireSandbox` |

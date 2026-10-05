@@ -45,6 +45,9 @@
 - id: tool-jobs
   name: '@deepseek-ai/dsh-tool-jobs'
 
+- id: win-mb-plugin
+  name: 'dsh-win-multi-bash'
+
 - id: win-mb-shell-prompt
   name: 'dsh-win-multi-bash/tool-shell-prompt'
 

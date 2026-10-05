@@ -1,12 +1,24 @@
 # dsh-win-multi-bash — self-contained Windows multi-bash wiring.
 #
 # This patch is the whole plugin: it inserts the plugin's own rows. Every
-# inserted row loads code from THIS package (exports ./tool-shell-prompt,
-# ./tool-git-bash, ./tool-wsl-bash) — nothing depends on runtime packages
-# beyond the published @deepseek-ai base packages (dsh-bash-local, dsh-sandbox,
-# dsh-tools, dsh-shell, dsh-llm, ...).
+# inserted row loads code from THIS package (exports ., ./client,
+# ./tool-shell-prompt, ./tool-git-bash, ./tool-wsl-bash) — nothing depends on
+# runtime packages beyond the published @deepseek-ai base packages
+# (dsh-bash-local, dsh-sandbox, dsh-tools, dsh-shell, dsh-llm, ...).
 #
 # ── What the rows do ─────────────────────────────────────────────────────────
+#   win-mb-plugin       — the package row itself: `name` is the BARE package
+#                         specifier and the module is the package main, whose
+#                         `apply` is empty. It carries no behavior; it exists
+#                         because the Web client discovers a browser half by
+#                         resolving a row's package name to its package.json
+#                         (dsh-client-modules: locatePkgJson →
+#                         exactPackageSpecifier, which answers `undefined` for a
+#                         subpath) and reading `dsh.client` + the `./client`
+#                         export there. The three rows below are subpaths, so
+#                         without this row `lib/client.js` is never served and
+#                         the tool rows show no Configure page on the Plugins
+#                         page.
 #   win-mb-shell-prompt
 #                       — registers the ONE prompt section the two bash tools
 #                         share (`tool:win-mb-bash`, order = midpoint of dsh's
@@ -28,10 +40,11 @@
 #   win-mb-tool-wsl     — the `wsl_bash` tool, owning its own WslBashExecutor;
 #                         its description carries only the WSL facts.
 #
-# Both tool rows and the prompt row are win32-only; POSIX keeps the base
-# bundle's own bash wiring. The prompt row owns no tool: it is required for the
-# shared shell guidance, and the tool rows stay independently switchable
-# without it (a composition that drops it loses the shared section only).
+# All four rows are win32-only; POSIX keeps the base bundle's own bash wiring.
+# The package row and the prompt row own no tool, so the tool rows stay
+# independently switchable without them: dropping the prompt row loses the
+# shared section only, dropping the package row loses the Plugins-page
+# configuration only.
 #
 # ── Why nothing here touches the ctx.shell seat ──────────────────────────────
 # dsh 0.1.7 removed the shell seam's routing field (`ShellExecRequest.shell`),
@@ -49,6 +62,12 @@
 # itself rather than by us.
 
 - insert:
+    # Bare specifier on purpose: this is the row that lets the Web client find
+    # this package's `dsh.client` declaration (see the header note).
+    - id: win-mb-plugin
+      name: 'dsh-win-multi-bash'
+      disabled: !!js process.platform !== 'win32'
+
     - id: win-mb-shell-prompt
       name: 'dsh-win-multi-bash/tool-shell-prompt'
       disabled: !!js process.platform !== 'win32'

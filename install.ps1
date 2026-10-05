@@ -11,8 +11,10 @@
          junction，让组合行（name: 'dsh-win-multi-bash/...'）能解析到本包代码；
       2) 把 managed 接线块写入 profile 的 cordis.patch.yml（幂等：先删旧块再生成）。
 
-    接线块是统一的：插入本插件的三行——win-mb-shell-prompt（两个 bash 工具
-    共有的那段系统提示词，只注册一次）、win-mb-tool-git / win-mb-tool-wsl。
+    接线块是统一的：插入本插件的四行——win-mb-plugin（包自身那一行，name 用
+    裸包名，供 Web 端发现 dsh.client 并加载浏览器半边；空 apply）、
+    win-mb-shell-prompt（两个 bash 工具共有的那段系统提示词，只注册一次）、
+    win-mb-tool-git / win-mb-tool-wsl。
     每个工具自带执行器（0.1.7 起 shell 接缝已无 request.shell 路由字段，
     选择器无从路由），不占用 ctx.shell 席位；基座自带的 pwsh-sandbox 行
     继续提供 shell 席位，pwsh 行为与未装插件时一致。
@@ -140,6 +142,11 @@ $block = @"
 # 每个工具自带执行器，不占用 ctx.shell 席位；基座自带的 pwsh-sandbox 行
 # 继续提供 shell 席位，pwsh 行为不变。
 - insert:
+    - id: win-mb-plugin
+      name: 'dsh-win-multi-bash'
+      disabled: !!js process.platform !== 'win32'
+      # 包自身那一行：name 必须是**裸包名**，Web 端才能解析到本包的 package.json
+      # 并读到 dsh.client（下面三行的 name 都是子路径，承载不了该声明）。空 apply。
     - id: win-mb-shell-prompt
       name: 'dsh-win-multi-bash/tool-shell-prompt'
       disabled: !!js process.platform !== 'win32'

@@ -88,6 +88,8 @@ wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"   # 验
 
 两个工具行各自携带配置，且每个可配置项都声明了 `.volatile()`——这正是运行时设置服务能够寻址它们的条件。因此 Web 侧栏 **插件** 页可以直接编辑：侧栏打开 **插件** → 打开 `dsh-win-multi-bash` 包 → 每个行都有 **配置** 页。该页由浏览器半边（`lib/client.js`，通过 `dsh.client` 与 `./client` 导出声明）注册进页面的 `plugins.row.config` 槽位，key 为 `dsh-win-multi-bash#<行 id>`；保存经 `settings` / `ctx.configForms` 写入 profile 的 Cordis patch——与手改落点相同，没有自建 HTTP 路由、没有第二份设置文件，也不用碰 YAML。
 
+因此接线块还会插入**第四行**（`win-mb-plugin`，`name: 'dsh-win-multi-bash'`，空 `apply`），它不是可选项：`dsh-client-modules` 发现浏览器半边的方式是把行的**裸包名**解析到其 `package.json` 再读 `dsh.client`（`locatePkgJson` → `exactPackageSpecifier`，对子路径返回 `undefined`）。三个运行行都是子路径，缺了这一行浏览器半边永远不会被服务，行上也就没有任何配置入口。
+
 | 行 | 可配置项（按页面顺序） |
 |---|---|
 | `git_bash` | 后台任务（`enableRunInBackground`）；`cwd`、`timeoutMs`、`maxTimeoutMs`、`maxOutputBytes`、`maxSpillBytes`、`graceMs`；`bashPath`；沙箱立场（`auto` / `none`）；`probeTimeoutMs`；`requireSandbox` |
