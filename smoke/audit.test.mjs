@@ -163,26 +163,28 @@ function fakeCtx(overrides = {}) {
  * directly — and it must be a REAL resolved config (`Executor.Config({...})`)
  * for any path that reaches `resolve()`/`execute()`, which validate it.
  *
- * The constructor's own reads from that config are mirrored here so a bare
- * instance behaves like a constructed one; explicit props still win, which is
- * how the stance-specific tests override a single field.
+ * The volatile knobs (`sandbox` / `probeTimeoutMs` / `requireSandbox`) are
+ * getters over that config, so every bare instance carries a resolved one and
+ * a test overrides a knob through the schema (`Config({ sandbox: 'none' })`),
+ * exactly as the loader would.
  */
 function bareInstance(cls, props) {
   const inst = Object.create(cls.prototype)
   const { config, ...rest } = props ?? {}
-  const resolved = config ?? {}
+  // The volatile knobs are getters over `config` (the loader hands live
+  // references), so a bare instance always needs a schema-resolved config; the
+  // class fields Object.create() never installs are mirrored here.
+  const resolved = config ?? cls.Config({})
   Object.assign(inst, {
     internals: {},
     bwrapVerdict: undefined,
     confinedProbe: undefined,
     sandboxModeVerdict: undefined,
+    sandboxModeVerdictKey: undefined,
     distroProbed: false,
     distroVerdict: undefined,
     // A class field, so Object.create() never installs it.
     processFacts: new Map(),
-    sandboxStance: resolved.sandbox ?? undefined,
-    probeTimeoutMs: resolved.probeTimeoutMs ?? 10000,
-    requireSandbox: resolved.requireSandbox ?? false,
     config: resolved,
     ...rest,
   })
@@ -208,6 +210,26 @@ const HAS_WSL = existsSync(WSL_EXE)
 // ═════════════════════════════════════════════════════════════════════════════
 // A) Unit tests
 // ═════════════════════════════════════════════════════════════════════════════
+
+/**
+ * The paths dsh-settings would project for a Config schema, by the same rule
+ * `volatileForm` applies: a node whose own meta is volatile contributes its
+ * whole subtree, an object node recurses, anything else stays ordinary
+ * configuration the Plugins page never shows.
+ */
+function volatilePaths(schema) {
+  const paths = []
+  const walk = (node, path) => {
+    if (node?.meta?.volatile === true) { paths.push(path.join('.')); return }
+    if (node?.type === 'object') for (const [key, child] of Object.entries(node.dict ?? {})) walk(child, [...path, key])
+  }
+  walk(schema, [])
+  return paths
+}
+
+/** Allowed values of a constant union, as a settings select would offer them. */
+const unionOptions = (node) => (node?.list ?? []).map((member) => member.value)
+
 console.log('\n[A] unit: vendor/helpers.js')
 {
   // isRunnerSpawnFailure
@@ -310,43 +332,43 @@ console.log('\n[A] unit: vendor/bwrap-profiles.js')
 console.log('\n[A] unit: config schemas')
 {
   test('GitBashExecutor.Config defaults sandbox=auto', () => {
-    assert.equal(GitBashExecutor.Config({}).sandbox, 'auto')
+    assert.equal(GitBashExecutor.Config({}).sandbox.get(), 'auto')
   })
   test('GitBashExecutor.Config rejects unknown sandbox stances', () => {
     assert.throws(() => GitBashExecutor.Config({ sandbox: 'bogus' }))
   })
   test('WslBashExecutor.Config accepts auto/none/bwrap', () => {
-    for (const s of ['auto', 'none', 'bwrap']) assert.equal(WslBashExecutor.Config({ sandbox: s }).sandbox, s)
+    for (const s of ['auto', 'none', 'bwrap']) assert.equal(WslBashExecutor.Config({ sandbox: s }).sandbox.get(), s)
   })
   test('WslBashExecutor.Config rejects unknown sandbox stances', () => {
     assert.throws(() => WslBashExecutor.Config({ sandbox: 'bogus' }))
   })
   test('git_bash tool Config partitions the backend under `gitBash`', () => {
     const c = gitBashTool.Config({})
-    assert.equal(c.enableRunInBackground, true)
-    assert.equal(c.gitBash.sandbox, 'auto')
-    assert.equal(c.gitBash.probeTimeoutMs, 10000)
-    assert.equal(c.gitBash.requireSandbox, false)
+    assert.equal(c.enableRunInBackground.get(), true)
+    assert.equal(c.gitBash.sandbox.get(), 'auto')
+    assert.equal(c.gitBash.probeTimeoutMs.get(), 10000)
+    assert.equal(c.gitBash.requireSandbox.get(), false)
     assert.equal('wslBash' in c, false, 'the git tool has no wsl partition')
   })
   test('wsl_bash tool Config partitions the backend under `wslBash`', () => {
     const c = wslBashTool.Config({})
-    assert.equal(c.enableRunInBackground, true)
-    assert.equal(c.wslBash.sandbox, 'auto')
-    assert.equal(c.wslBash.probeTimeoutMs, 30000, 'wsl keeps its own 3e4 probe default')
+    assert.equal(c.enableRunInBackground.get(), true)
+    assert.equal(c.wslBash.sandbox.get(), 'auto')
+    assert.equal(c.wslBash.probeTimeoutMs.get(), 30000, 'wsl keeps its own 3e4 probe default')
     assert.equal('gitBash' in c, false)
   })
   test('git_bash tool Config merges a partial backend partition', () => {
     const c = gitBashTool.Config({ gitBash: { bashPath: 'X' } })
-    assert.equal(c.gitBash.bashPath, 'X')
-    assert.equal(c.gitBash.probeTimeoutMs, 10000, 'unspecified fields keep their defaults')
+    assert.equal(c.gitBash.bashPath.get(), 'X')
+    assert.equal(c.gitBash.probeTimeoutMs.get(), 10000, 'unspecified fields keep their defaults')
   })
   test('git_bash tool Config rejects a negative probeTimeoutMs', () => {
     assert.throws(() => gitBashTool.Config({ gitBash: { probeTimeoutMs: -1 } }))
   })
   test('tool Config keeps each backend stance set distinct', () => {
     assert.throws(() => gitBashTool.Config({ gitBash: { sandbox: 'bwrap' } }), 'bwrap is not a git-bash stance')
-    assert.equal(wslBashTool.Config({ wslBash: { sandbox: 'bwrap' } }).wslBash.sandbox, 'bwrap')
+    assert.equal(wslBashTool.Config({ wslBash: { sandbox: 'bwrap' } }).wslBash.sandbox.get(), 'bwrap')
   })
   test('tool plugins declare the name/inject/apply/Config shape cordis needs', () => {
     for (const t of [gitBashTool, wslBashTool]) {
@@ -372,10 +394,10 @@ console.log('\n[A] unit: config schemas')
     for (const s of ['systemPrompt', 'tools']) assert.ok(shellPromptRow.inject.includes(s), `prompt row must inject ${s}`)
   })
   test('#2: git-bash Config is independent of wsl-bash (no .set() cross-pollution)', () => {
-    assert.equal(GitBashExecutor.Config({}).probeTimeoutMs, 10000, 'git-bash keeps its own 1e4 default')
+    assert.equal(GitBashExecutor.Config({}).probeTimeoutMs.get(), 10000, 'git-bash keeps its own 1e4 default')
     assert.throws(() => GitBashExecutor.Config({ sandbox: 'bwrap' }), 'bwrap is not a valid git-bash stance')
-    assert.equal(WslBashExecutor.Config({}).probeTimeoutMs, 30000, 'wsl-bash keeps its own 3e4 default')
-    assert.equal(WslBashExecutor.Config({ sandbox: 'bwrap' }).sandbox, 'bwrap')
+    assert.equal(WslBashExecutor.Config({}).probeTimeoutMs.get(), 30000, 'wsl-bash keeps its own 3e4 default')
+    assert.equal(WslBashExecutor.Config({ sandbox: 'bwrap' }).sandbox.get(), 'bwrap')
   })
   test('#2: plugin Config derivation leaves the base LocalBashExecutor.Config pristine', () => {
     const base = LocalBashExecutor.Config({})
@@ -405,9 +427,22 @@ console.log('\n[A] unit: GitBashExecutor (internals hooks)')
     assert.equal(ex.sandboxMode, undefined, 'no mode before the async probe runs')
   })
   testAsync('resolveSandboxMode(): stance none → undefined (no sandbox advertisement)', async () => {
-    const ex = bareInstance(GitBashExecutor, { sandboxStance: 'none', config: GitBashExecutor.Config({}) })
+    const ex = bareInstance(GitBashExecutor, { config: GitBashExecutor.Config({ sandbox: 'none' }) })
     assert.equal(await ex.resolveSandboxMode(), undefined)
     assert.equal(ex.sandboxMode, undefined)
+  })
+  testAsync('resolveSandboxMode(): a live stance edit re-settles the verdict', async () => {
+    // A settings save on the Plugins page updates the volatile reference in
+    // place through the loader; the reference protocol's writer is the same
+    // write, so the test performs it directly.
+    const WRITE = Symbol.for('cosmokit.volatile.write')
+    const config = GitBashExecutor.Config({ sandbox: 'none' })
+    const ex = bareInstance(GitBashExecutor, { config })
+    assert.equal(await ex.resolveSandboxMode(), undefined)
+    config.sandbox[WRITE]('auto')
+    assert.equal(ex.sandboxStance, 'auto', 'the getter reads the live reference, not a load-time snapshot')
+    ex.internals.probeConfined = () => false
+    assert.equal(await ex.resolveSandboxMode(), undefined, 'auto with a failed probe stays unadvertised')
   })
   testAsync('resolveSandboxMode(): failed probe → undefined, and the probe is memoized', async () => {
     let calls = 0
@@ -440,8 +475,7 @@ console.log('\n[A] unit: GitBashExecutor (internals hooks)')
   testAsync('execute(): unconfined path passes plain git argv (no sandbox facts)', async () => {
     const ex = bareInstance(GitBashExecutor, {
       ctx: fakeCtx({ subprocess: fakeSubprocess() }),
-      sandboxStance: 'none',
-      config: gitConfig(),
+      config: gitConfig({ sandbox: 'none' }),
     })
     const result = await (await ex.execute(ex.resolve({ command: 'echo unconfined-ok', timeoutMs: 30000, stdoutMaxBytes: 4096, workdir: process.cwd() }))).result()
     assert.equal(result.exitCode, 0)
@@ -734,7 +768,7 @@ console.log('\n[A] unit: WslBashExecutor (internals hooks)')
     assert.equal(ex.requireBwrapUsable(), false)
   })
   test('requireBwrapUsable(): explicit bwrap + failed probe throws loud', () => {
-    const ex = bareInstance(WslBashExecutor, { sandboxStance: 'bwrap', config: WslBashExecutor.Config({ sandbox: 'bwrap' }) })
+    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ sandbox: 'bwrap' }) })
     ex.internals.probeBwrap = () => false
     assert.throws(() => ex.requireBwrapUsable(), /bwrap was not found/)
   })
@@ -793,8 +827,7 @@ console.log('\n[A] unit: WslBashExecutor (internals hooks)')
   testAsync('execute(): unconfined path passes plain argv (no sandbox facts)', async () => {
     const ex = bareInstance(WslBashExecutor, {
       ctx: fakeCtx({ subprocess: fakeSubprocess() }),
-      sandboxStance: 'none',
-      config: WslBashExecutor.Config({ wslPath: WSL_EXE, wslDistro: undefined }),
+      config: WslBashExecutor.Config({ wslPath: WSL_EXE, sandbox: 'none' }),
     })
     ex.distro = () => undefined
     const result = await (await ex.execute(ex.resolve({ command: 'echo wsl-unconfined-ok', timeoutMs: 30000, stdoutMaxBytes: 4096, workdir: process.cwd() }))).result()
@@ -1154,6 +1187,260 @@ console.log('\n[A] unit: tool descriptions carry only their dialect')
   })
   test('an unknown dialect fails loud instead of describing nothing', () => {
     assert.throws(() => shellDescription('posix'), /unknown shell dialect "posix"/)
+  })
+}
+
+console.log('\n[A] unit: runtime-editable config surface (the volatile projection)')
+{
+  // The Plugins page's row form edits exactly what dsh-settings projects from an
+  // entry's Config, and that projection (dsh-settings/lib/index.js
+  // `volatileForm`) is: a node whose own meta is volatile contributes its whole
+  // subtree, an object node recurses, anything else is ordinary configuration
+  // the page never shows. The projected set is therefore the plugin's
+  // configurable-option list, and it is pinned here so a field added to a
+  // backend without `.volatile()` cannot silently stay YAML-only.
+  test('the git_bash row exposes the tool-layer switch and every executor knob', () => {
+    assert.deepEqual(volatilePaths(gitBashTool.Config), [
+      'enableRunInBackground',
+      'gitBash.cwd', 'gitBash.timeoutMs', 'gitBash.maxTimeoutMs', 'gitBash.maxOutputBytes',
+      'gitBash.maxSpillBytes', 'gitBash.graceMs',
+      'gitBash.bashPath', 'gitBash.sandbox', 'gitBash.probeTimeoutMs', 'gitBash.requireSandbox',
+    ])
+  })
+  test('the wsl_bash row exposes the tool-layer switch and every executor knob', () => {
+    assert.deepEqual(volatilePaths(wslBashTool.Config), [
+      'enableRunInBackground',
+      'wslBash.cwd', 'wslBash.timeoutMs', 'wslBash.maxTimeoutMs', 'wslBash.maxOutputBytes',
+      'wslBash.maxSpillBytes', 'wslBash.graceMs',
+      'wslBash.wslPath', 'wslBash.wslDistro', 'wslBash.sandbox', 'wslBash.probeTimeoutMs', 'wslBash.requireSandbox',
+    ])
+  })
+  test('each sandbox stance offers exactly the values its backend accepts', () => {
+    const gitSandbox = gitBashTool.Config.dict.gitBash.dict.sandbox
+    const wslSandbox = wslBashTool.Config.dict.wslBash.dict.sandbox
+    assert.deepEqual(unionOptions(gitSandbox), ['auto', 'none'], 'git-bash accepts no bwrap stance')
+    assert.deepEqual(unionOptions(wslSandbox), ['auto', 'none', 'bwrap'])
+  })
+  test('the editable knobs are defaults, so an untouched row still resolves', () => {
+    const git = gitBashTool.Config({})
+    const wsl = wslBashTool.Config({})
+    assert.equal(git.enableRunInBackground.get(), true)
+    assert.equal(git.gitBash.probeTimeoutMs.get(), 10000)
+    assert.equal(git.gitBash.sandbox.get(), 'auto')
+    assert.equal(git.gitBash.requireSandbox.get(), false)
+    assert.equal(wsl.wslBash.probeTimeoutMs.get(), 30000)
+    assert.equal(wsl.wslBash.sandbox.get(), 'auto')
+  })
+}
+
+console.log('\n[A] unit: web client half (the Plugins page row form)')
+{
+  // The bundle's browser half gives each tool row a Configure page through the
+  // `plugins.row.config` slot and stages edits into the settings service. The
+  // module loader is stubbed to capture the registration, React is stubbed to
+  // plain element objects, and the card is a pure function of its injected
+  // store — so the whole page contract is exercised without a renderer.
+  const registrations = []
+  const previousWindow = globalThis.window
+  globalThis.window = { __ModuleLoader__: { load: (entry) => registrations.push(entry) } }
+  try {
+    await import(`${libUrl('client.js')}?audit`)
+  } finally {
+    globalThis.window = previousWindow
+  }
+
+  test('the browser half registers one module under the package name', () => {
+    assert.equal(registrations.length, 1, 'exactly one client module registration')
+    assert.equal(registrations[0].id, 'dsh-win-multi-bash')
+  })
+
+  const client = registrations[0].factory((id) => {
+    if (id === 'react') return { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }) }
+    if (id === '@deepseek-ai/dsh-client-ui-primitives')
+      return { SettingsForm: 'SettingsForm', SettingsValueField: 'SettingsValueField', Checkbox: 'Checkbox', SegmentedControl: 'SegmentedControl', Button: 'Button' }
+    throw new Error(`unexpected client require: "${id}"`)
+  })
+  const { ROWS, rowKey, planOps, RowConfigForm, RowConfigCard, en, zh } = client.__internals
+
+  test('it declares the client services the page needs', () => {
+    assert.equal(client.NS, 'settings.win-mb-bash')
+    assert.ok(Array.isArray(client.inject))
+    for (const service of ['slots', 'locale', 'configForms'])
+      assert.ok(client.inject.includes(service), `must inject ${service}`)
+    assert.equal(typeof client.apply, 'function')
+  })
+
+  test('every knob has a label and a hint in both languages', () => {
+    for (const row of ROWS) {
+      for (const knob of row.fields) {
+        const key = knob.key.split('.').pop()
+        for (const suffix of ['label', 'hint']) {
+          for (const [language, dict] of [['en', en], ['zh', zh]]) {
+            const text = dict[`${key}.${suffix}`]
+            assert.equal(typeof text, 'string', `${language} is missing ${key}.${suffix}`)
+            assert.ok(text.length > 0, `${key}.${suffix} is empty in ${language}`)
+          }
+        }
+        if (knob.kind === 'enum')
+          for (const option of knob.options)
+            for (const [language, dict] of [['en', en], ['zh', zh]])
+              assert.ok(typeof dict[`option.${option}`] === 'string', `${language} is missing option.${option}`)
+      }
+    }
+  })
+
+  test('the form lists exactly the host\'s volatile projection, in schema order', () => {
+    assert.deepEqual(ROWS.map((row) => row.rowId), ['win-mb-tool-git', 'win-mb-tool-wsl'])
+    assert.deepEqual(ROWS[0].fields.map((knob) => knob.path.join('.')), volatilePaths(gitBashTool.Config))
+    assert.deepEqual(ROWS[1].fields.map((knob) => knob.path.join('.')), volatilePaths(wslBashTool.Config))
+  })
+
+  test('the sandbox choices match the stance each backend accepts', () => {
+    const options = (rowId) => ROWS.find((row) => row.rowId === rowId).fields.find((knob) => knob.key.endsWith('sandbox')).options
+    assert.deepEqual(options('win-mb-tool-git'), unionOptions(gitBashTool.Config.dict.gitBash.dict.sandbox))
+    assert.deepEqual(options('win-mb-tool-wsl'), unionOptions(wslBashTool.Config.dict.wslBash.dict.sandbox))
+  })
+
+  /** A settings scope stub: one mutable snapshot, and the writes it received. */
+  const fakeScope = (overrides = {}) => {
+    const snapshot = {
+      status: 'ready', writable: true, revision: 1,
+      value: { enableRunInBackground: true, gitBash: { sandbox: 'auto', probeTimeoutMs: 10000 } },
+      base: { gitBash: { sandbox: 'auto' } }, user: {},
+      ...overrides,
+    }
+    const listeners = new Set()
+    const calls = []
+    let accept = true
+    return {
+      calls,
+      getSnapshot: () => snapshot,
+      subscribe: (listener) => { listeners.add(listener); return () => listeners.delete(listener) },
+      mutate: async (ops, revision) => { calls.push({ ops, revision }); return accept },
+      refuse: () => { accept = false },
+      publish: (next) => { Object.assign(snapshot, next); for (const listener of [...listeners]) listener() },
+    }
+  }
+  const gitRow = ROWS[0]
+
+  await testAsync('a staged edit becomes one revision-fenced mutate call', async () => {
+    const scope = fakeScope({ revision: 7 })
+    const form = new RowConfigForm(scope, gitRow)
+    form.edit('gitBash.bashPath', 'D:\\Git\\usr\\bin\\bash.exe')
+    form.edit('gitBash.sandbox', 'none')
+    form.edit('enableRunInBackground', false)
+    await form.save()
+    assert.deepEqual(scope.calls, [{
+      ops: [
+        // Field order is the row's own order (schema order), not staging order.
+        { op: 'set', path: ['enableRunInBackground'], value: false },
+        { op: 'set', path: ['gitBash', 'bashPath'], value: 'D:\\Git\\usr\\bin\\bash.exe' },
+        { op: 'set', path: ['gitBash', 'sandbox'], value: 'none' },
+      ],
+      revision: 7,
+    }])
+    assert.equal(form.project().dirty, false, 'an accepted save clears its drafts')
+  })
+
+  await testAsync('an emptied text control clears the override, not writes an empty string', async () => {
+    const scope = fakeScope({ user: { gitBash: { bashPath: 'C:\\pinned\\bash.exe' } } })
+    const form = new RowConfigForm(scope, gitRow)
+    form.edit('gitBash.bashPath', '')
+    await form.save()
+    assert.deepEqual(scope.calls[0].ops, [{ op: 'unset', path: ['gitBash', 'bashPath'] }])
+  })
+
+  await testAsync('a refused save keeps every draft and reports the failure', async () => {
+    const scope = fakeScope()
+    scope.refuse()
+    const form = new RowConfigForm(scope, gitRow)
+    form.edit('gitBash.probeTimeoutMs', '12345')
+    await form.save()
+    const state = form.project()
+    assert.equal(state.failed, true)
+    assert.equal(state.dirty, true, 'a save that did not land keeps its drafts')
+    assert.equal(state.fields.find((knob) => knob.key === 'gitBash.probeTimeoutMs').text, '12345')
+  })
+
+  await testAsync('an invalid number blocks the save instead of writing it', async () => {
+    const scope = fakeScope()
+    const form = new RowConfigForm(scope, gitRow)
+    form.edit('gitBash.probeTimeoutMs', 'soon')
+    assert.equal(form.project().invalid, true)
+    await form.save()
+    assert.deepEqual(scope.calls, [], 'no mutation for a draft no control accepts')
+    assert.equal(form.project().dirty, true)
+  })
+
+  test('a live settings update republished by the scope reaches the card', () => {
+    const scope = fakeScope()
+    const form = new RowConfigForm(scope, gitRow)
+    const seen = []
+    const unsubscribe = form.store.subscribe(() => seen.push(form.store.getSnapshot()))
+    scope.publish({ revision: 2, value: { enableRunInBackground: true, gitBash: { sandbox: 'none' } } })
+    unsubscribe()
+    assert.equal(seen.length, 1, 'one publish per scope change')
+    assert.equal(seen[0].fields.find((knob) => knob.key === 'gitBash.sandbox').value, 'none')
+    form.dispose()
+  })
+
+  test('the card renders the summary line, and one control per knob on its page', () => {
+    assert.equal(RowConfigCard({ view: 'summary', t: (key) => zh[key] ?? key }), zh.summary)
+    const scope = fakeScope()
+    const form = new RowConfigForm(scope, gitRow)
+    const state = form.project()
+    const tree = RowConfigCard({
+      view: 'page',
+      t: (key) => key,
+      useRowForm: (select) => select(state),
+      edit: () => {}, resetField: () => {}, save: () => {}, discard: () => {},
+    })
+    assert.equal(tree.type, 'SettingsForm')
+    assert.equal(tree.children.length, gitRow.fields.length, 'one control per knob')
+    assert.equal(tree.children[0].type, 'div', 'the tool-layer switch is a checkbox row')
+    assert.ok(tree.children.some((child) => child.type === 'SettingsValueField'))
+    const sandbox = tree.children[tree.children.length - 3]
+    assert.equal(sandbox.children[1].type, 'SegmentedControl')
+    assert.deepEqual(sandbox.children[1].props.options.map((option) => option.value), ['auto', 'none'])
+    form.dispose()
+  })
+
+  test('apply gives both rows a page while their namespaces are served', () => {
+    const localeRegistrations = []
+    const slotRegistrations = []
+    const ctx = {
+      locale: { register: (ns, dict) => localeRegistrations.push({ ns, dict }), bind: () => (key) => key },
+      configForms: {
+        get: () => fakeScope(),
+        whileServed: (names, callback) => { callback(new Set(names)); return () => {} },
+      },
+      slots: {
+        inject: (_name, register) => register(),
+        register: (options, component) => slotRegistrations.push({ options, component }),
+      },
+      effect: (callback) => callback(),
+    }
+    client.apply(ctx)
+    assert.deepEqual(localeRegistrations.map((entry) => entry.ns), [client.NS])
+    assert.ok(localeRegistrations[0].dict.en && localeRegistrations[0].dict.zh)
+    assert.deepEqual(slotRegistrations.map((entry) => entry.options.key), [
+      rowKey('win-mb-tool-git'), rowKey('win-mb-tool-wsl'),
+    ])
+    for (const entry of slotRegistrations) {
+      assert.equal(entry.options.name, 'plugins.row.config')
+      assert.equal(entry.options.locale, client.NS)
+      assert.equal(entry.component, RowConfigCard)
+      assert.equal(typeof entry.options.inject().hooks.rowForm.getSnapshot, 'function')
+    }
+  })
+
+  test('the slot key is the package name and the row id the patch declares', () => {
+    const patch = readFileSync(join(PLUGIN, 'cordis.patch.yml'), 'utf8')
+    const rowIds = [...patch.matchAll(/- id: (win-mb-[a-z-]+)/g)].map((match) => match[1])
+    for (const rowId of ROWS.map((row) => row.rowId))
+      assert.ok(rowIds.includes(rowId), `cordis.patch.yml must declare the row id "${rowId}"`)
+    assert.equal(rowKey('win-mb-tool-git'), 'dsh-win-multi-bash#win-mb-tool-git')
+    assert.deepEqual(planOps([], new Map()), [], 'no drafts, no writes')
   })
 }
 
@@ -1532,6 +1819,62 @@ console.log('\n[B] boot integration: shell prompt section state matrix (one copy
     } finally {
       if (ctx) await ctx.fiber.dispose()
     }
+  }
+}
+
+console.log('\n[B] boot integration: dsh-settings projection of the two rows (read-only)')
+{
+  // The Plugins page edits whatever `settings` projects for an entry id, so the
+  // claim "these options are editable in the panel" is exactly "settings
+  // describes these two entry ids with these live values". Read-only: this test
+  // never mutates the document.
+  let ctx
+  try {
+    ctx = await bootFixture(`${SHELL_PROMPT_ONLY_ROWS}
+- id: win-mb-tool-git
+  name: 'dsh-win-multi-bash/tool-git-bash'
+
+- id: win-mb-tool-wsl
+  name: 'dsh-win-multi-bash/tool-wsl-bash'
+
+- id: settings
+  name: '@deepseek-ai/dsh-settings'
+`, 'settings-rows.yml')
+    if (ctx.settings === undefined) {
+      console.log('  … skipping: this composition provides no configEditor/profileContext, so dsh-settings never activates')
+      console.log('    (the schema contract it projects is pinned by the unit section above)')
+    } else {
+      const forms = new Map(ctx.settings.describe({ redactSecrets: true }).map((form) => [form.ns, form]))
+      await runTests(ctx, [
+        ['both tool rows are addressable settings namespaces', async () => {
+          for (const ns of ['win-mb-tool-git', 'win-mb-tool-wsl'])
+            assert.ok(forms.has(ns), `no settings form for "${ns}"; described: ${[...forms.keys()].join(', ')}`)
+        }],
+        ['the git_bash form reports the knob values the row is running with', async () => {
+          const form = forms.get('win-mb-tool-git')
+          assert.deepEqual(Object.keys(form.value).sort(), ['enableRunInBackground', 'gitBash'])
+          assert.equal(form.value.enableRunInBackground, true)
+          assert.equal(form.value.gitBash.sandbox, 'auto')
+          assert.equal(form.value.gitBash.probeTimeoutMs, 10000)
+          assert.equal(form.value.gitBash.requireSandbox, false)
+        }],
+        ['the wsl_bash form reports its own partition only', async () => {
+          const form = forms.get('win-mb-tool-wsl')
+          assert.deepEqual(Object.keys(form.value).sort(), ['enableRunInBackground', 'wslBash'])
+          assert.equal(form.value.wslBash.probeTimeoutMs, 30000)
+          assert.equal(form.value.wslBash.sandbox, 'auto')
+        }],
+        ['nothing outside the volatile projection is editable', async () => {
+          for (const ns of ['win-mb-tool-git', 'win-mb-tool-wsl']) {
+            const form = forms.get(ns)
+            assert.equal(typeof form.revision, 'number', `${ns} must carry the revision a save fences with`)
+            assert.equal(form.user === undefined || Object.keys(form.user).length === 0, true, `${ns} starts unoverridden`)
+          }
+        }],
+      ])
+    }
+  } finally {
+    if (ctx) await ctx.fiber.dispose()
   }
 }
 

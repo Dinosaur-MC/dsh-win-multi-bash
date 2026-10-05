@@ -84,6 +84,22 @@ So when a command prints an MSYS path (e.g. `/d/WorkSpace/foo`), convert it to i
 
 **One section for the family, not one per tool.** The `tool:win-mb-bash` section — registered by the `win-mb-shell-prompt` row, owned by neither tool — carries that shared guidance: check the `[exit code: N]` marker on every result and chain dependent steps with `&&` or `set -o pipefail`, because `;` never stops on failure and `cmd | tail` returns the status of `tail`, not of `cmd`. That is guidance about *composing* a multi-step command rather than about one call's arguments, so it belongs to the prompt instead of the per-call schema; the runtime's own tail truncation is also why a call never needs to bound output with a pipe. Prompt sections live in one global layer keyed by name, so two rows registering the same name throw while two names carrying the same text is duplication — on 0.3.1 the two descriptions were 1299 and 2164 characters with 1117 of them byte-identical, and the exit-status paragraph was assembled twice. The section's text is therefore resolved at every assembly from the tools actually mounted (`ctx.tools.get`), so `git_bash` and `wsl_bash` stay independently switchable: either alone, both, or neither each render exactly one correct copy, and a composition with neither renders no shell guidance at all. Its order is the midpoint of dsh's `TOOL_BASH` / `TOOL_PWSH` section orders, read from `ctx.systemPrompt.getSectionOrder`. The escalation contract and the background sentence are included only while a mounted tool actually advertises `sandbox_permissions` / `run_in_background`. The section never reads facts out of another row's description, so it stays self-sufficient whether or not dsh's `tool-pwsh` is in the composition; the sentences pwsh's own description shares with it are the residue a third-party row cannot edit away.
 
+## Runtime configuration (the Plugins page)
+
+Both tool rows carry their own configuration, and every knob is declared `.volatile()` — which is what makes it addressable by the runtime's settings service. The Web **Plugins** page therefore edits it: open **Plugins** in the sidebar, open the `dsh-win-multi-bash` bundle, and each row has a **Configure** page. The browser half (`lib/client.js`, declared as `dsh.client` + the `./client` export) registers that page into the page's `plugins.row.config` slot, keyed `dsh-win-multi-bash#<row id>`; a save goes to the profile's Cordis patch through `settings`/`ctx.configForms` — the same place a hand edit lands, with no HTTP route, no second settings file, and no YAML editing.
+
+| Row | Options (in page order) |
+|---|---|
+| `git_bash` | Background jobs (`enableRunInBackground`); `cwd`, `timeoutMs`, `maxTimeoutMs`, `maxOutputBytes`, `maxSpillBytes`, `graceMs`; `bashPath`; sandbox stance (`auto` / `none`); `probeTimeoutMs`; `requireSandbox` |
+| `wsl_bash` | The same set under `wslBash`, plus `wslPath` and `wslDistro`, and the stance list adds `bwrap` |
+
+That list is exactly the volatile projection of each row's `Config` schema — the audit pins both sides (`volatilePaths` of the host configs against the browser half's field table), so a knob added to a backend without `.volatile()` cannot silently stay YAML-only, and the page cannot offer a field the Host would refuse.
+
+- **Live reads.** Volatile fields are live references, and the executors read them through `.get()` at use time. A path, distro, stance, timeout, or hardening change applies to the next command without reloading the row.
+- **Two knobs need the row's next load**, because they shape the tool's *schema* rather than one call: `enableRunInBackground` (the advertised `run_in_background` argument) and the escalation surface (`sandbox_permissions`, advertised at load from the probe verdict).
+- **Staged, not live typing.** The page stages drafts and writes only on **Save**, fenced by the revision it read; a save the Host refuses keeps the drafts. Emptying a path or a distro stages a clear, so the override drops and the built-in probe resolves again.
+- The page exists while the Host serves that row's namespace (`whileServed`), so a row that is switched off shows no Configure control.
+
 ## Path conversion (MSYS auto-rewriting)
 
 Git Bash rewrites leading-slash POSIX paths into Windows paths (e.g. `<Git root>\root`) whenever a native Windows program is called — standard MSYS behavior, not a plugin defect. Calling `wsl.exe` (or any native exe) with POSIX paths from inside `git_bash` therefore fails:

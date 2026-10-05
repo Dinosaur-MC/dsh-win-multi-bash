@@ -26,6 +26,7 @@
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
+    "./client": "./lib/client.js",
     "./tool-git-bash": "./lib/tool-bash/types/git-bash.js",
     "./tool-wsl-bash": "./lib/tool-bash/types/wsl-bash.js",
     "./tool-shell-prompt": "./lib/tool-bash/shell-prompt.js",
@@ -46,6 +47,15 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-primitives",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
+      ]
     }
   },
   "peerDependencies": {
