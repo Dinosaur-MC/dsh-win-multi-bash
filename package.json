@@ -28,6 +28,7 @@
     ".": "./lib/index.js",
     "./tool-git-bash": "./lib/tool-bash/types/git-bash.js",
     "./tool-wsl-bash": "./lib/tool-bash/types/wsl-bash.js",
+    "./tool-shell-prompt": "./lib/tool-bash/shell-prompt.js",
     "./package.json": "./package.json"
   },
   "files": [

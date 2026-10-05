@@ -1,3 +1,23 @@
+# Unreleased
+
+## Improvements
+
+- **The shared shell guidance is stated once, not once per tool.** The two descriptions were 1299 and 2164 characters with 1117 of them byte-identical, and each tool instance registered the same exit-status paragraph, so the assembled prompt carried it twice. Each description now keeps only its dialect facts (289 and 143 characters) and one section — `tool:win-mb-bash`, owned by the new `win-mb-shell-prompt` row — carries what the family shares: a fresh shell per call plus the `workdir` rule, `[exit code: N]` markers with the `&&` / `set -o pipefail` gating rule, `$DSH_*` facts, the sandbox denial marker, truncation, the delete/move target check, the `${VAR:?}` guard, background jobs, and the escalation contract. Measured in this host's composition (both tools mounted): the plugin's prompt payload drops from **3933 to 2693 characters per turn**.
+- **The section follows the composition instead of assuming it.** Its text is resolved at every assembly from the tools actually mounted (`ctx.tools.get`), so `git_bash` and `wsl_bash` stay independently switchable — either alone, both, or neither each render exactly one correct copy, and with neither mounted the section renders no text at all. The escalation contract and the background sentence appear only while a mounted tool advertises `sandbox_permissions` / `run_in_background`. The text never reads another row's description, so it is byte-identical whether or not dsh's `tool-pwsh` is in the composition; the facts pwsh's own description still repeats are the residue a third-party row cannot edit away — copies of those facts drop from three to two rather than to one.
+- **The section moved next to the shell tool sections.** It was registered at a hardcoded `order: 105`, which sorted it ahead of every other section, including the policy sections; it now takes the midpoint of dsh's `TOOL_BASH` (1000) and `TOOL_PWSH` (1010) placements, read from `ctx.systemPrompt.getSectionOrder`.
+
+## Compatibility
+
+- **The shipped patch now inserts three rows, not two.** A profile that consumes this package as a bundle (`dsh.profile.bundles`, the npm/install.ps1 path) picks the new `win-mb-shell-prompt` row up with the next composition load. A profile whose rows were hand-wired — including the managed block `install.ps1` writes — must add `win-mb-shell-prompt` (`dsh-win-multi-bash/tool-shell-prompt`) beside the two tool rows, or re-run `install.ps1` (its block is replaced by marker, so the migration is automatic). Without that row the two tools keep working; they only lose the shared prompt section, which is why the row ships as part of the wiring.
+- The tool rows no longer inject `systemPrompt` (they register no section of their own), so a composition without that service can still load them.
+
+## Verification
+
+Verified on dsh **0.2.0-rc.2**.
+
+- `smoke/audit.test.mjs`: **192 assertions, 0 failures** (the tree before this change reports 140). 52 are new: 12 unit assertions (each shared fact stated exactly once, no shared sentence left in any tool description, registry-derived order and its fallbacks, the prompt row's shape) and a 40-assertion boot matrix over five states — both tools / `git_bash` only / `wsl_bash` only / neither / both beside dsh's own `tool-pwsh` — asserting one registered section, its placement between `TOOL_BASH` and `TOOL_PWSH` markers, a text that is exactly a function of the mounted family tools, and an assembled prompt that repeats no block verbatim. The duplicate-block guard fails on the previous code.
+- `npm test` (`smoke/run.ps1`): `git_bash`, `wsl_bash` and the base bundle's own `pwsh` seat each executed a real command (`git-bash-ok` / `wsl-ok` / `pwsh-ok`) with `shellSeatPresent: true`, in both the schema-default and pinned-`bashPath` variants.
+
 # dsh-win-multi-bash v0.3.1
 
 ## Bug fixes

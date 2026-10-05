@@ -51,7 +51,13 @@ const { processJob, processOutcome, processSources } =
   await import(libUrl('tool-bash', 'types', 'background.js'))
 const gitBashTool = await import(libUrl('tool-bash', 'types', 'git-bash.js'))
 const wslBashTool = await import(libUrl('tool-bash', 'types', 'wsl-bash.js'))
-const { SHELL_EXIT_STATUS_SECTION, shellDescription, toNativeWorkdir } = await import(libUrl('tool-bash', 'types', 'factory.js'))
+const { shellDescription, toNativeWorkdir } = await import(libUrl('tool-bash', 'types', 'factory.js'))
+const {
+  SHELL_EXIT_STATUS_SECTION, SHELL_FAMILY_SECTION_NAME, SHELL_FAMILY_TOOL_NAMES,
+  SHELL_BACKGROUND_SECTION, SHELL_ESCALATION_SECTION,
+  shellFamilySectionText, shellFamilySectionOrder,
+} = await import(libUrl('tool-bash', 'types', 'shell-family.js'))
+const shellPromptRow = await import(libUrl('tool-bash', 'shell-prompt.js'))
 const { LocalBashExecutor } = await import('@deepseek-ai/dsh-bash-local')
 
 let passed = 0
@@ -348,11 +354,22 @@ console.log('\n[A] unit: config schemas')
       assert.equal(typeof t.apply, 'function')
       assert.ok(t.Config)
       // The owned executor's own requirements must be injected by the tool.
-      for (const s of ['tools', 'systemPrompt', 'shellEnv', 'subprocess', 'sandbox', 'sandboxPolicy']) {
+      for (const s of ['tools', 'shellEnv', 'subprocess', 'sandbox', 'sandboxPolicy']) {
         assert.ok(t.inject.includes(s), `${t.name} must inject ${s}`)
       }
       assert.ok(!t.inject.includes('shell'), `${t.name} must NOT contend for the ctx.shell seat`)
+      // The family's shared prompt section is owned by the separate
+      // tool-shell-prompt row, so a tool row registers no section and needs no
+      // systemPrompt: two tool rows sharing one section name would throw, and
+      // one section each would be the duplication this design removes.
+      assert.ok(!t.inject.includes('systemPrompt'), `${t.name} must not register a prompt section`)
     }
+  })
+  test('the shell-prompt row declares the name/inject/apply shape cordis needs', () => {
+    assert.equal(typeof shellPromptRow.name, 'string')
+    assert.equal(typeof shellPromptRow.apply, 'function')
+    assert.ok(!('Config' in shellPromptRow), 'the prompt row owns no tool and no config')
+    for (const s of ['systemPrompt', 'tools']) assert.ok(shellPromptRow.inject.includes(s), `prompt row must inject ${s}`)
   })
   test('#2: git-bash Config is independent of wsl-bash (no .set() cross-pollution)', () => {
     assert.equal(GitBashExecutor.Config({}).probeTimeoutMs, 10000, 'git-bash keeps its own 1e4 default')
@@ -968,6 +985,9 @@ async function runTests(ctx, tests) {
 // now carries its OWN backend config: there is no shared selector row, and no
 // `backends`/`default` keys — the shell seam has no routing field to feed.
 const PLUGIN_ROWS = (bashPath) => `
+- id: win-mb-shell-prompt
+  name: 'dsh-win-multi-bash/tool-shell-prompt'
+
 - id: win-mb-tool-git
   name: 'dsh-win-multi-bash/tool-git-bash'
   config:
@@ -977,6 +997,32 @@ const PLUGIN_ROWS = (bashPath) => `
 - id: win-mb-tool-wsl
   name: 'dsh-win-multi-bash/tool-wsl-bash'
 `
+
+/** The plugin rows minus one tool: the independent-switch shapes. */
+const SHELL_PROMPT_ONLY_ROWS = `
+- id: win-mb-shell-prompt
+  name: 'dsh-win-multi-bash/tool-shell-prompt'
+`
+
+const GIT_ONLY_ROWS = (bashPath) => `${SHELL_PROMPT_ONLY_ROWS}
+- id: win-mb-tool-git
+  name: 'dsh-win-multi-bash/tool-git-bash'
+  config:
+    gitBash:
+      bashPath: '${bashPath}'
+`
+
+const WSL_ONLY_ROWS = `${SHELL_PROMPT_ONLY_ROWS}
+- id: win-mb-tool-wsl
+  name: 'dsh-win-multi-bash/tool-wsl-bash'
+`
+
+/** The assembled prompt of a booted fixture: its sections and the rendered text. */
+async function assembledPrompt(ctx) {
+  const { renderPrompt } = await import('@deepseek-ai/dsh-system-prompt')
+  const assembly = await ctx.systemPrompt.assemble({})
+  return { assembly, prompt: renderPrompt(assembly) }
+}
 
 /** Execute a tool and return the joined text of its rendered content. */
 async function execTool(ctx, name, args) {
@@ -1031,11 +1077,11 @@ console.log('\n[A] unit: factory workdir drive-form normalization')
   })
 }
 
-console.log('\n[A] unit: shell prompt section (exit status + gating)')
+console.log('\n[A] unit: shared shell prompt section (one copy, gated facts)')
 {
-  // Registered per tool via ctx.systemPrompt.section as `tool:<name>`. The
-  // section guards a composition trap, not one call's arguments, so it must
-  // keep both halves: the exit-marker instruction and the gating rule.
+  // One section carries everything the shell family shares, so it must hold
+  // both halves of the composition trap — the exit-marker instruction and the
+  // gating rule — and it must not repeat a fact inside itself.
   test('prompt section keeps the [exit code: N] marker instruction', () => {
     assert.match(SHELL_EXIT_STATUS_SECTION, /\[exit code: N\] marker/)
   })
@@ -1043,6 +1089,92 @@ console.log('\n[A] unit: shell prompt section (exit status + gating)')
     assert.match(SHELL_EXIT_STATUS_SECTION, /Chain dependent steps with `&&` or `set -o pipefail`/)
     assert.match(SHELL_EXIT_STATUS_SECTION, /`;` never stops on failure/)
     assert.match(SHELL_EXIT_STATUS_SECTION, /`cmd \| tail` returns the status of `tail`/)
+  })
+  test('family text states each shared fact exactly once', () => {
+    const text = shellFamilySectionText({ background: true, escalation: true })
+    const sentences = text.split(/(?<=\.)\s+/).map((s) => s.trim()).filter((s) => s.length > 15)
+    const seen = new Map()
+    for (const s of sentences) seen.set(s, (seen.get(s) ?? 0) + 1)
+    const repeated = [...seen.entries()].filter(([, n]) => n > 1).map(([s]) => s)
+    assert.deepEqual(repeated, [], `family text repeats itself: ${repeated.join(' | ')}`)
+    // Every shared fact the tool descriptions used to carry is still delivered.
+    for (const fact of [
+      /fresh shell/,
+      /pass `workdir` instead of using `cd`/,
+      /\[exit code: N\] marker/,
+      /\$DSH_\*` variables/,
+      /\[sandbox: file access denied under <mode> mode\]/,
+      /truncated to its tail/,
+      /never run it against a computed path you have not checked/,
+      /\$\{VAR:\?\}/,
+      /run_in_background/,
+      /retry the exact same command once with `sandbox_permissions`/,
+    ]) assert.match(text, fact)
+  })
+  test('family text drops the facts this composition does not advertise', () => {
+    const bare = shellFamilySectionText({ background: false, escalation: false })
+    assert.ok(!bare.includes(SHELL_BACKGROUND_SECTION), 'no background guidance without the parameter')
+    assert.ok(!bare.includes(SHELL_ESCALATION_SECTION), 'no escalation contract without the parameter')
+    assert.ok(!bare.includes('run_in_background'), 'the parameter is not named either')
+    assert.ok(!bare.includes('sandbox_permissions'), 'the parameter is not named either')
+    const onlyEscalation = shellFamilySectionText({ background: false, escalation: true })
+    assert.ok(onlyEscalation.includes(SHELL_ESCALATION_SECTION))
+    assert.ok(!onlyEscalation.includes(SHELL_BACKGROUND_SECTION))
+  })
+}
+
+console.log('\n[A] unit: tool descriptions carry only their dialect')
+{
+  const git = shellDescription('msys')
+  const wsl = shellDescription('wsl')
+  test('git_bash description states the MSYS facts and its dialect note', () => {
+    assert.match(git, /^Execute a Git Bash \(MSYS2\) command \(bash -c\) and return its stdout\/stderr\./)
+    assert.match(git, /Paths use MSYS form \(`\/d\/WorkSpace` or `C:\\\.\.\.`\)/)
+    assert.match(git, /read environment variables with \$VAR/)
+    assert.match(git, /MSYS paths work inside Git Bash only/)
+  })
+  test('wsl_bash description states the WSL facts', () => {
+    assert.match(wsl, /^Execute a WSL Linux command \(bash -c\) and return its stdout\/stderr\./)
+    assert.match(wsl, /Paths use Linux paths \(`\/mnt\/c\/\.\.\.`\)/)
+  })
+  test('no shared boilerplate survives in a tool description', () => {
+    const SHARED = [
+      'fresh shell', 'persists between calls', '[exit code: N]', '$DSH_*', '[sandbox: file access denied',
+      'truncated to its tail', 'Before any delete or move', '${VAR:?}', 'run_in_background',
+      'sandbox_permissions', 'Attempting a command the sandbox may deny',
+    ]
+    for (const [name, description] of [['git_bash', git], ['wsl_bash', wsl]])
+      for (const phrase of SHARED)
+        assert.ok(!description.includes(phrase), `${name} description still repeats shared text: ${phrase}`)
+  })
+  test('the two descriptions share no sentence — the family section owns every common fact', () => {
+    const sentences = (s) => s.split(/(?<=\.)\s+/).map((x) => x.trim()).filter((x) => x.length > 15)
+    const shared = sentences(git).filter((s) => wsl.includes(s))
+    assert.deepEqual(shared, [], `descriptions still overlap: ${shared.join(' | ')}`)
+  })
+  test('an unknown dialect fails loud instead of describing nothing', () => {
+    assert.throws(() => shellDescription('posix'), /unknown shell dialect "posix"/)
+  })
+}
+
+console.log('\n[A] unit: family section placement (between TOOL_BASH and TOOL_PWSH)')
+{
+  const registry = { getSectionOrder: (name) => ({ TOOL_BASH: 1000, TOOL_PWSH: 1010 })[name] }
+  test('order resolves to the registry midpoint', () => {
+    assert.equal(shellFamilySectionOrder(registry), 1005)
+    assert.ok(shellFamilySectionOrder(registry) > registry.getSectionOrder('TOOL_BASH'))
+    assert.ok(shellFamilySectionOrder(registry) < registry.getSectionOrder('TOOL_PWSH'))
+  })
+  test('a registry that moved the seats still keeps the section between them', () => {
+    const moved = { getSectionOrder: (name) => ({ TOOL_BASH: 2000, TOOL_PWSH: 2040 })[name] }
+    assert.equal(shellFamilySectionOrder(moved), 2020)
+  })
+  test('a registry missing a seat still yields a finite order', () => {
+    for (const broken of [{ getSectionOrder: () => undefined }, { getSectionOrder: (n) => (n === 'TOOL_BASH' ? 1000 : undefined) }])
+      assert.ok(Number.isFinite(shellFamilySectionOrder(broken)))
+  })
+  test('the section name is not per-tool', () => {
+    for (const toolName of SHELL_FAMILY_TOOL_NAMES) assert.ok(!SHELL_FAMILY_SECTION_NAME.includes(toolName))
   })
 }
 
@@ -1308,6 +1440,98 @@ console.log('\n[B] boot integration: REAL cordis.patch.yml applied as overlay pa
     ])
   } finally {
     if (ctx) await ctx.fiber.dispose()
+  }
+}
+
+console.log('\n[B] boot integration: shell prompt section state matrix (one copy, any subset)')
+{
+  // git_bash and wsl_bash are independently switchable, and the shared section
+  // must track that exactly: one copy with both tools, one with either, and no
+  // text at all with neither. Every state also pins that the section never
+  // repeats a fact in itself, and that the whole assembled prompt has no two
+  // identical blocks (the shape the old per-tool registration produced).
+  const STATES = [
+    ['both tools', () => PLUGIN_ROWS(GIT_BASH), ['git_bash', 'wsl_bash'], true, false],
+    ['git_bash only', () => GIT_ONLY_ROWS(GIT_BASH), ['git_bash'], true, false],
+    ['wsl_bash only', () => WSL_ONLY_ROWS, ['wsl_bash'], false, false],
+    ['no tool', () => SHELL_PROMPT_ONLY_ROWS, [], false, false],
+    // dsh's own pwsh tool alongside ours: it registers its own section and
+    // repeats a few of these facts in its own description, and the family
+    // section must be unaffected by its presence.
+    ['both tools + dsh tool-pwsh', () => `${PLUGIN_ROWS(GIT_BASH)}
+- id: tool-pwsh
+  name: '@deepseek-ai/dsh-tool-pwsh'
+`, ['git_bash', 'wsl_bash'], true, true],
+  ]
+  for (const [label, rows, expectedTools, needsGit, expectPwsh] of STATES) {
+    if (needsGit && !HAS_GIT_BASH) {
+      console.log(`  … skipping ${label}: no Git Bash probed on this host`)
+      continue
+    }
+    let ctx
+    try {
+      ctx = await bootFixture(rows(), `prompt-state-${label.replace(/[^a-z0-9]+/gi, '-')}.yml`)
+      // Markers make the placement claim end-to-end: the section must land
+      // between the two seats dsh allocates to shell tools.
+      ctx.systemPrompt.section({ name: 'audit:order-bash', order: ctx.systemPrompt.getSectionOrder('TOOL_BASH'), text: 'audit bash marker' })
+      ctx.systemPrompt.section({ name: 'audit:order-pwsh', order: ctx.systemPrompt.getSectionOrder('TOOL_PWSH'), text: 'audit pwsh marker' })
+      const { assembly, prompt } = await assembledPrompt(ctx)
+      const schemas = ctx.tools.schemas()
+      const mounted = schemas.filter((s) => SHELL_FAMILY_TOOL_NAMES.includes(s.name))
+      const family = assembly.sections.filter((s) => s.name === SHELL_FAMILY_SECTION_NAME)
+      const familyText = family[0]?.text ?? ''
+      const advertises = (parameter) => mounted.some((s) => s.parameters?.properties?.[parameter] !== undefined)
+      const index = (name) => assembly.sections.findIndex((s) => s.name === name)
+
+      await runTests(ctx, [
+        [`${label}: the mounted tools are exactly ${expectedTools.join(' + ') || '(none)'}`, async () => {
+          assert.deepEqual(mounted.map((s) => s.name).sort(), [...expectedTools].sort())
+        }],
+        [`${label}: exactly one family section is registered`, async () => {
+          assert.equal(family.length, 1, `expected one ${SHELL_FAMILY_SECTION_NAME} section, got ${family.length}`)
+        }],
+        [`${label}: the section sorts between TOOL_BASH and TOOL_PWSH`, async () => {
+          assert.ok(index('audit:order-bash') < index(SHELL_FAMILY_SECTION_NAME), 'family section must follow TOOL_BASH')
+          assert.ok(index(SHELL_FAMILY_SECTION_NAME) < index('audit:order-pwsh'), 'family section must precede TOOL_PWSH')
+        }],
+        [`${label}: the shared guidance appears exactly ${expectedTools.length > 0 ? 'once' : 'zero times'} in the prompt`, async () => {
+          assert.equal(prompt.split(SHELL_EXIT_STATUS_SECTION).length - 1, expectedTools.length > 0 ? 1 : 0)
+          if (expectedTools.length === 0) assert.ok(!prompt.includes('truncated to its tail'), 'no orphan shell guidance')
+        }],
+        [`${label}: gated facts match what the mounted tools advertise`, async () => {
+          assert.equal(familyText.includes(SHELL_BACKGROUND_SECTION), advertises('run_in_background'), 'background guidance must follow the parameter')
+          assert.equal(familyText.includes(SHELL_ESCALATION_SECTION), advertises('sandbox_permissions'), 'escalation contract must follow the parameter')
+        }],
+        [`${label}: the section text is exactly a function of the family tools mounted`, async () => {
+          // No other row's tool, description or section may contribute a word
+          // here — that is what keeps the same text correct with and without
+          // dsh's own pwsh tool.
+          const expected = mounted.length === 0 ? '' : shellFamilySectionText({
+            background: advertises('run_in_background'),
+            escalation: advertises('sandbox_permissions'),
+          })
+          assert.equal(familyText, expected)
+          if (expectPwsh) assert.ok(schemas.some((s) => s.name === 'pwsh'), 'this state must mount dsh\'s pwsh tool')
+        }],
+        [`${label}: the assembled prompt repeats no block verbatim`, async () => {
+          const blocks = prompt.split(/\n\s*\n/).map((b) => b.trim()).filter((b) => b.length > 0)
+          const seen = new Set(); const repeated = []
+          for (const block of blocks) { if (seen.has(block)) repeated.push(block.slice(0, 60)); seen.add(block) }
+          assert.deepEqual(repeated, [], `duplicate prompt blocks: ${repeated.join(' | ')}`)
+        }],
+        [`${label}: the tool descriptions share no sentence`, async () => {
+          const sentences = (s) => s.split(/(?<=\.)\s+/).map((x) => x.trim()).filter((x) => x.length > 15)
+          for (const a of mounted)
+            for (const b of mounted) {
+              if (a.name >= b.name) continue
+              const shared = sentences(a.description).filter((s) => b.description.includes(s))
+              assert.deepEqual(shared, [], `${a.name} and ${b.name} still share: ${shared.join(' | ')}`)
+            }
+        }],
+      ])
+    } finally {
+      if (ctx) await ctx.fiber.dispose()
+    }
   }
 }
 

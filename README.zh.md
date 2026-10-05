@@ -70,7 +70,7 @@ wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"   # 验
 
 ## 工具提示词（面向模型的描述）
 
-`git_bash` / `wsl_bash` 的工具描述刻意保持精简，与官方 `tool-pwsh` 同构：每次调用全新 shell、方言的路径/环境变量写法、`[exit code: N]` 标记、`$DSH_*` 环境事实、沙箱行为、输出截断、删除/移动前的目标路径校验、未设变量的 `${VAR:?}` 兜底、后台任务与升级契约。更长的方言说明（MSYS 路径改写、WSL base64 载荷）放在本文档而不是模型可见的描述里。
+`git_bash` / `wsl_bash` 的工具描述刻意保持最小：只写各自方言自身的内容——shell 与调用形式、方言的路径与环境变量写法、（`git_bash` 还带）MSYS 路径注记。两者共有的内容由 `win-mb-shell-prompt` 行注册的**唯一**一段 `tool:win-mb-bash` 提示词承载：每次调用全新 shell 与 `workdir` 规则、`[exit code: N]` 标记及 `&&` / `set -o pipefail` 串接规则、`$DSH_*` 环境事实、沙箱行为、输出截断、删除/移动前的目标路径校验、未设变量的 `${VAR:?}` 兜底、后台任务与升级契约。更长的方言说明（MSYS 路径改写、WSL base64 载荷）放在本文档而不是模型可见的描述里。
 
 这两个工具都用 `bash -c`，因此上述安全提示采用 `tool-bash` 的 bash 版措辞而非 `tool-pwsh` 的：bash 里 `$HOME` 是可赋值的普通变量，pwsh 的「不要给自动变量赋值」那句在此会误导；bash 对计算路径的兜底就是上面的 `${VAR:?}` 写法——它让未设变量直接报错，而不是静默展开成空串。
 
@@ -82,7 +82,7 @@ wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"   # 验
 
 **`workdir` 接受原生、MSYS 与 WSL 挂载三种写法。** 模型在被告知方言路径是 MSYS／WSL 形式后，自然会用同样的形式写 `workdir`；解析器因此把单字母盘符形式（`/c/...`）与 WSL 挂载形式（`/mnt/c/...`）在交给 `spawn` 之前转成原生 `C:\...`，而 MSYS 的 POSIX 根（`/etc`、`/usr`、`/tmp`）与发行版侧路径（如 `/mnt/data`）保持原样，相对路径仍相对会话工作区解析。在此转换之前，MSYS 形式的 `workdir` 会以 `spawn <shell> ENOENT` 失败——一个「找不到 shell」的假象，实际是 cwd 不可用。
 
-工具行还会注册一段系统提示词小节（`tool:<name>`）：每次结果都要核对 `[exit code: N]` 标记，且依赖前一步的后续命令要用 `&&` 或 `set -o pipefail` 串接——`;` 不会因失败中止，而 `cmd | tail` 返回的是 `tail` 的状态而非 `cmd` 的。这属于「如何组合多步命令」的跨调用指导，因此放在提示词里而不是单次调用的 schema 里；它也让运行时自带的截尾能力成为「不必用管道限制输出」的理由。
+**整个家族只注册一段提示词小节，而不是每个工具一段。** 该小节（`tool:win-mb-bash`，由 `win-mb-shell-prompt` 行注册，不属于任何一个工具）承载上述共有指导：每次结果都要核对 `[exit code: N]` 标记，且依赖前一步的后续命令要用 `&&` 或 `set -o pipefail` 串接——`;` 不会因失败中止，而 `cmd | tail` 返回的是 `tail` 的状态而非 `cmd` 的。这属于「如何组合多步命令」的跨调用指导，因此放在提示词里而不是单次调用的 schema 里；它也让运行时自带的截尾能力成为「不必用管道限制输出」的理由。提示词小节存放在**按名字索引的单一全局层**里：两个行注册同一个名字会直接抛错，而两个名字装同样的文本就是重复——0.3.1 上两段描述分别为 1299 与 2164 字符、其中 1117 字符逐字节相同，退出码那段还被装配了两次。因此小节的文本在**每次装配时**按实际挂载的工具重新解析（`ctx.tools.get`）：`git_bash` 与 `wsl_bash` 保持可独立开关，只挂其一、两者都挂、或都不挂，各自都只渲染出恰好一份正确文本（都不挂时不渲染任何 shell 指导）。其排序取 dsh `TOOL_BASH` / `TOOL_PWSH` 两个段位的中值（读自 `ctx.systemPrompt.getSectionOrder`）。升级契约段与后台任务句只在实际挂载的工具确实声明了 `sandbox_permissions` / `run_in_background` 时才出现。该小节从不从别的行的描述里取事实，因此 dsh 的 `tool-pwsh` 在或不在组合里它都自足；pwsh 自身描述与它重合的句子，是第三方行无法删掉的残留。
 
 ## 路径转换（MSYS 自动改写）
 

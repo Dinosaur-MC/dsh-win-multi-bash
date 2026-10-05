@@ -1,24 +1,37 @@
 # dsh-win-multi-bash — self-contained Windows multi-bash wiring.
 #
 # This patch is the whole plugin: it inserts the plugin's own rows. Every
-# inserted row loads code from THIS package (exports ./tool-git-bash,
-# ./tool-wsl-bash) — nothing depends on runtime packages beyond the published
-# @deepseek-ai base packages (dsh-bash-local, dsh-sandbox, dsh-tools,
-# dsh-shell, dsh-llm, ...).
+# inserted row loads code from THIS package (exports ./tool-shell-prompt,
+# ./tool-git-bash, ./tool-wsl-bash) — nothing depends on runtime packages
+# beyond the published @deepseek-ai base packages (dsh-bash-local, dsh-sandbox,
+# dsh-tools, dsh-shell, dsh-llm, ...).
 #
 # ── What the rows do ─────────────────────────────────────────────────────────
+#   win-mb-shell-prompt
+#                       — registers the ONE prompt section the two bash tools
+#                         share (`tool:win-mb-bash`, order = midpoint of dsh's
+#                         TOOL_BASH/TOOL_PWSH). Its text is resolved per
+#                         assembly from the tools actually mounted, so it says
+#                         nothing when neither tool is enabled and never
+#                         assumes the other tool — or pwsh — is present.
+#                         Shared guidance lives here once instead of once per
+#                         tool description; each tool description keeps only
+#                         its own dialect facts.
 #   win-mb-tool-git     — registers the model-facing `git_bash` tool
 #                         (MSYS dialect) into the host tools registry: every
 #                         session sees it regardless of its agent preset. The
 #                         tool owns its own GitBashExecutor; its model-facing
-#                         description mirrors the official tool-pwsh skeleton
-#                         (concise) and reminds the model that MSYS paths are
-#                         valid only inside Git Bash — dsh's file tools on
-#                         Windows take native C:\... paths.
+#                         description carries only the MSYS facts and reminds
+#                         the model that MSYS paths are valid only inside Git
+#                         Bash — dsh's file tools on Windows take native
+#                         C:\... paths.
 #   win-mb-tool-wsl     — the `wsl_bash` tool, owning its own WslBashExecutor;
-#                         its description mirrors tool-pwsh's concise skeleton.
+#                         its description carries only the WSL facts.
 #
-# Both rows are win32-only; POSIX keeps the base bundle's own bash wiring.
+# Both tool rows and the prompt row are win32-only; POSIX keeps the base
+# bundle's own bash wiring. The prompt row owns no tool: it is required for the
+# shared shell guidance, and the tool rows stay independently switchable
+# without it (a composition that drops it loses the shared section only).
 #
 # ── Why nothing here touches the ctx.shell seat ──────────────────────────────
 # dsh 0.1.7 removed the shell seam's routing field (`ShellExecRequest.shell`),
@@ -36,6 +49,10 @@
 # itself rather than by us.
 
 - insert:
+    - id: win-mb-shell-prompt
+      name: 'dsh-win-multi-bash/tool-shell-prompt'
+      disabled: !!js process.platform !== 'win32'
+
     - id: win-mb-tool-git
       name: 'dsh-win-multi-bash/tool-git-bash'
       disabled: !!js process.platform !== 'win32'
