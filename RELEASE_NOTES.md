@@ -14,7 +14,6 @@
 - The tool rows no longer inject `systemPrompt` (they register no section of their own), so a composition without that service can still load them.
 - **Volatile fields resolve to live references**: reading a resolved `GitBashExecutor.Config(...)` / `WslBashExecutor.Config(...)` field programmatically now needs `.get()`. Hand-written YAML is unchanged and still valid.
 - New in the package: the `./client` export with `dsh.client` (a Web Host serves the browser half under `/plugins`; a non-Web host is unaffected), `install.ps1` / `uninstall.ps1` in `files`, and `.gitattributes` pinning LF. The tarball is 22 files; `smoke/` and this file are not shipped.
-- `./tool-shell-prompt` is gone with its module. That row existed only between 0.3.1 and 0.4.0 and was never in a published version; a profile that still lists it reports one inactive entry and is otherwise unaffected.
 
 ## Verification
 
