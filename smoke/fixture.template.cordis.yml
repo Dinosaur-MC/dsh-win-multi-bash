@@ -48,9 +48,6 @@
 - id: win-mb-plugin
   name: 'dsh-win-multi-bash'
 
-- id: win-mb-shell-prompt
-  name: 'dsh-win-multi-bash/tool-shell-prompt'
-
 - id: win-mb-tool-git
   name: 'dsh-win-multi-bash/tool-git-bash'
   config:

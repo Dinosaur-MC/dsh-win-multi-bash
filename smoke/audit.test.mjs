@@ -381,18 +381,47 @@ console.log('\n[A] unit: config schemas')
         assert.ok(t.inject.includes(s), `${t.name} must inject ${s}`)
       }
       assert.ok(!t.inject.includes('shell'), `${t.name} must NOT contend for the ctx.shell seat`)
-      // The family's shared prompt section is owned by the separate
-      // tool-shell-prompt row, so a tool row registers no section and needs no
-      // systemPrompt: two tool rows sharing one section name would throw, and
-      // one section each would be the duplication this design removes.
+      // The family's shared prompt section is owned by the package row (the
+      // plugin's core row), so a tool row registers no section and needs no
+      // systemPrompt: two rows sharing one section name would throw, and one
+      // section each would be the duplication this design removes.
       assert.ok(!t.inject.includes('systemPrompt'), `${t.name} must not register a prompt section`)
     }
   })
-  test('the shell-prompt row declares the name/inject/apply shape cordis needs', () => {
+  test('the core row (package main) declares the name/inject/apply shape cordis needs', () => {
+    assert.equal(typeof packageRow.name, 'string')
+    assert.equal(packageRow.name, 'dsh-win-multi-bash', 'the plugin name is the bare package specifier')
+    assert.equal(typeof packageRow.apply, 'function')
+    assert.ok(!('Config' in packageRow), 'the core row owns no tool and no config of its own')
+    for (const s of ['systemPrompt', 'tools']) assert.ok(packageRow.inject.includes(s), `the core row must inject ${s}`)
+  })
+  test('the obsolete shell-prompt row is now a migration shim', () => {
     assert.equal(typeof shellPromptRow.name, 'string')
     assert.equal(typeof shellPromptRow.apply, 'function')
-    assert.ok(!('Config' in shellPromptRow), 'the prompt row owns no tool and no config')
-    for (const s of ['systemPrompt', 'tools']) assert.ok(shellPromptRow.inject.includes(s), `prompt row must inject ${s}`)
+    assert.ok(!('Config' in shellPromptRow), 'the shim owns no tool and no config')
+    for (const s of ['systemPrompt', 'tools']) assert.ok(shellPromptRow.inject.includes(s), `the shim must inject ${s}`)
+    const section = (coreComposed) => {
+      const sections = []
+      const warnings = []
+      const rows = [{ options: { name: 'dsh-win-multi-bash' }, disabled: coreComposed !== true }]
+      shellPromptRow.apply({
+        get: (service) => (service !== 'loader' ? undefined : coreComposed === undefined ? undefined : { entries: () => rows }),
+        logger: { warn: (text) => warnings.push(text) },
+        systemPrompt: { getSectionOrder: () => 1005, section: (value) => sections.push(value) },
+        tools: { get: () => undefined },
+      })
+      return { sections, warnings }
+    }
+    // The modern wiring owns the section on the package row: this row must not
+    // register a second one (the same section name twice throws), but it does
+    // say how to drop it.
+    const modern = section(true)
+    assert.equal(modern.sections.length, 0, 'no second registration while the core row is composed')
+    assert.equal(modern.warnings.length, 1)
+    assert.ok(modern.warnings[0].includes(SHELL_FAMILY_ROW_SPECIFIER), 'the warning names the new owner')
+    // The old wiring (no package row at all) still gets the section once.
+    assert.equal(section(false).sections.length, 1, 'the legacy composition keeps its section')
+    assert.equal(section(undefined).sections.length, 0, 'an unreadable loader keeps the shim inert')
   })
   test('#2: git-bash Config is independent of wsl-bash (no .set() cross-pollution)', () => {
     assert.equal(GitBashExecutor.Config({}).probeTimeoutMs.get(), 10000, 'git-bash keeps its own 1e4 default')
@@ -1022,9 +1051,6 @@ const PLUGIN_ROWS = (bashPath) => `
 - id: win-mb-plugin
   name: 'dsh-win-multi-bash'
 
-- id: win-mb-shell-prompt
-  name: 'dsh-win-multi-bash/tool-shell-prompt'
-
 - id: win-mb-tool-git
   name: 'dsh-win-multi-bash/tool-git-bash'
   config:
@@ -1035,13 +1061,16 @@ const PLUGIN_ROWS = (bashPath) => `
   name: 'dsh-win-multi-bash/tool-wsl-bash'
 `
 
-/** The plugin rows minus one tool: the independent-switch shapes. */
-const SHELL_PROMPT_ONLY_ROWS = `
-- id: win-mb-shell-prompt
-  name: 'dsh-win-multi-bash/tool-shell-prompt'
+/** The core row alone: the shape with no tool mounted (it owns the shared section). */
+const CORE_ROW_ONLY = `
+- id: win-mb-plugin
+  name: 'dsh-win-multi-bash'
 `
 
-const GIT_ONLY_ROWS = (bashPath) => `${SHELL_PROMPT_ONLY_ROWS}
+/** The plugin rows minus one tool: the independent-switch shapes. */
+const SHELL_PROMPT_ONLY_ROWS = CORE_ROW_ONLY
+
+const GIT_ONLY_ROWS = (bashPath) => `${CORE_ROW_ONLY}
 - id: win-mb-tool-git
   name: 'dsh-win-multi-bash/tool-git-bash'
   config:
@@ -1049,7 +1078,7 @@ const GIT_ONLY_ROWS = (bashPath) => `${SHELL_PROMPT_ONLY_ROWS}
       bashPath: '${bashPath}'
 `
 
-const WSL_ONLY_ROWS = `${SHELL_PROMPT_ONLY_ROWS}
+const WSL_ONLY_ROWS = `${CORE_ROW_ONLY}
 - id: win-mb-tool-wsl
   name: 'dsh-win-multi-bash/tool-wsl-bash'
 `
@@ -1427,14 +1456,58 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     client.apply(ctx)
     assert.deepEqual(localeRegistrations.map((entry) => entry.ns), [client.NS])
     assert.ok(localeRegistrations[0].dict.en && localeRegistrations[0].dict.zh)
-    assert.deepEqual(slotRegistrations.map((entry) => entry.options.key), [
+    const pages = slotRegistrations.filter((entry) => entry.options.name === 'plugins.row.config')
+    assert.deepEqual(pages.map((entry) => entry.options.key), [
       rowKey('win-mb-tool-git'), rowKey('win-mb-tool-wsl'),
     ])
-    for (const entry of slotRegistrations) {
-      assert.equal(entry.options.name, 'plugins.row.config')
+    for (const entry of pages) {
       assert.equal(entry.options.locale, client.NS)
       assert.equal(entry.component, RowConfigCard)
       assert.equal(typeof entry.options.inject().hooks.rowForm.getSnapshot, 'function')
+    }
+    // The bundle page also gets the core-row label and note, on their own slots.
+    const detail = slotRegistrations.filter((entry) => entry.options.name !== 'plugins.row.config')
+    assert.deepEqual(detail.map((entry) => entry.options.name), ['plugins.detail.badge', 'plugins.detail.section'])
+    for (const entry of detail) {
+      assert.equal(entry.options.locale, client.NS)
+      assert.equal(entry.options.id, 'dsh-win-multi-bash:core')
+    }
+  })
+
+  test('the detail label and note speak only for this bundle and its core row', () => {
+    const slotRegistrations = []
+    client.apply({
+      locale: { register: () => {}, bind: () => (key) => key },
+      configForms: { get: () => fakeScope(), whileServed: (names, callback) => { callback(new Set(names)); return () => {} } },
+      slots: { inject: (_name, register) => register(), register: (options, component) => slotRegistrations.push({ options, component }) },
+      effect: (callback) => callback(),
+    })
+    const component = (name) => slotRegistrations.find((entry) => entry.options.name === name).component
+    const badge = component('plugins.detail.badge')
+    const note = component('plugins.detail.section')
+    const props = (subject) => ({ subject, t: (key) => `t:${key}` })
+    const self = { name: 'dsh-win-multi-bash', installed: true, enabled: true }
+    const bundle = props({ kind: 'bundle', pkg: self })
+    const coreRow = props({ kind: 'row', pkg: self, row: { rowId: 'win-mb-plugin', moduleName: 'dsh-win-multi-bash', enabled: true } })
+    const toolRow = props({ kind: 'row', pkg: self, row: { rowId: 'win-mb-tool-git', moduleName: 'dsh-win-multi-bash/tool-git-bash', enabled: true } })
+    const foreignBundle = props({ kind: 'bundle', pkg: { name: 'dsh-free-search', installed: true, enabled: true } })
+    const foreignItem = props({ kind: 'item', id: 'dsh-tool-jobs' })
+    for (const rendered of [badge, note]) {
+      assert.ok(rendered(bundle) !== null, 'the bundle page carries the label')
+      assert.ok(rendered(coreRow) !== null, 'so does the core row\'s own page')
+      assert.equal(rendered(toolRow), null, 'a tool row has nothing to say here')
+      assert.equal(rendered(foreignBundle), null, 'another package renders nothing')
+      assert.equal(rendered(foreignItem), null, 'an official plugin entry renders nothing')
+      assert.equal(rendered({}), null, 'a subject-less render renders nothing')
+    }
+    assert.equal(badge(bundle).children[0], 't:coreBadge')
+    assert.equal(note(bundle).children[0].children[0], 't:coreNote')
+    // Both pages are the bundle speaking about itself: the copy is localized.
+    for (const [language, dict] of [['en', en], ['zh', zh]]) {
+      for (const key of ['coreBadge', 'coreNote']) {
+        assert.equal(typeof dict[key], 'string', `${language} is missing ${key}`)
+        assert.ok(dict[key].length > 0, `${key} is empty in ${language}`)
+      }
     }
   })
 
@@ -1463,13 +1536,14 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     }
     const patch = readFileSync(join(PLUGIN, 'cordis.patch.yml'), 'utf8')
     const rows = [...patch.matchAll(/- id: (win-mb-[a-z-]+)\n\s+name: '([^']+)'/g)].map((match) => ({ id: match[1], name: match[2] }))
-    assert.ok(rows.length >= 4, `expected the runtime rows plus the package row, got ${rows.length}`)
+    assert.deepEqual(rows.map((row) => row.id).sort(), ['win-mb-plugin', 'win-mb-tool-git', 'win-mb-tool-wsl'], 'the core row plus one row per tool')
     const carriers = rows.filter((row) => exactPackageSpecifier(row.name) === 'dsh-win-multi-bash')
     assert.equal(carriers.length, 1, 'exactly one row must name the bare package specifier')
 
-    // What that row loads must be a Loader-shaped plugin: the documented empty
-    // host half of a browser-only companion.
-    assert.equal(typeof packageRow.apply, 'function', 'the package main must hold the empty apply')
+    // What that row loads must be a Loader-shaped plugin, and it is the row that
+    // owns the family section now (the separate prompt row was merged into it).
+    assert.equal(typeof packageRow.apply, 'function', 'the package main must hold the core row apply')
+    assert.equal(carriers[0].name, SHELL_FAMILY_ROW_SPECIFIER, 'the core row is the section owner the tools look for')
 
     // And the declaration the scan reads next must be complete.
     const manifest = JSON.parse(readFileSync(join(PLUGIN, 'package.json'), 'utf8'))
@@ -1788,16 +1862,15 @@ console.log('\n[B] boot integration: REAL cordis.patch.yml applied as overlay pa
         assert.ok(!/disabled:\s*true/.test(raw), 'no unconditional `disabled: true` row remains')
         assert.ok(!/shell-select/.test(raw), 'no selector row remains')
       }],
-      ['the shipped patch composes the package row that carries the browser half', async () => {
+      ['the shipped patch composes the core row and only the two tool rows', async () => {
         // `loader.entries()` is a cosmokit collection, not an Array: iterate it.
         const rows = []
         for (const entry of ctx.loader.entries()) rows.push({ id: entry.options.id, name: entry.options.name, enabled: !entry.disabled })
         const composed = rows.map((row) => `${String(row.id)}|${String(row.name)}|${String(row.enabled)}`).join(', ')
-        const carrier = rows.find((row) => row.name === 'dsh-win-multi-bash')
-        assert.ok(carrier !== undefined, `the bare package row must be composed; composed rows: ${composed}`)
-        assert.equal(carrier.enabled, true, 'and it must be enabled')
-        for (const name of ['dsh-win-multi-bash/tool-shell-prompt', 'dsh-win-multi-bash/tool-git-bash', 'dsh-win-multi-bash/tool-wsl-bash'])
-          assert.ok(rows.some((row) => row.name === name), `${name} must be composed too; composed rows: ${composed}`)
+        const own = rows.filter((row) => String(row.name).startsWith('dsh-win-multi-bash'))
+        assert.deepEqual(own.map((row) => row.name).sort(), ['dsh-win-multi-bash', 'dsh-win-multi-bash/tool-git-bash', 'dsh-win-multi-bash/tool-wsl-bash'], `the core row merged the old prompt row away; composed rows: ${composed}`)
+        const core = own.find((row) => row.name === 'dsh-win-multi-bash')
+        assert.equal(core.enabled, true, 'the core row must be enabled')
       }],
     ])
   } finally {

@@ -2,33 +2,41 @@
 #
 # This patch is the whole plugin: it inserts the plugin's own rows. Every
 # inserted row loads code from THIS package (exports ., ./client,
-# ./tool-shell-prompt, ./tool-git-bash, ./tool-wsl-bash) — nothing depends on
-# runtime packages beyond the published @deepseek-ai base packages
-# (dsh-bash-local, dsh-sandbox, dsh-tools, dsh-shell, dsh-llm, ...).
+# ./tool-git-bash, ./tool-wsl-bash) — nothing depends on runtime packages
+# beyond the published @deepseek-ai base packages (dsh-bash-local, dsh-sandbox,
+# dsh-tools, dsh-shell, dsh-llm, ...).
 #
 # ── What the rows do ─────────────────────────────────────────────────────────
-#   win-mb-plugin       — the package row itself: `name` is the BARE package
-#                         specifier and the module is the package main, whose
-#                         `apply` is empty. It carries no behavior; it exists
-#                         because the Web client discovers a browser half by
-#                         resolving a row's package name to its package.json
-#                         (dsh-client-modules: locatePkgJson →
-#                         exactPackageSpecifier, which answers `undefined` for a
-#                         subpath) and reading `dsh.client` + the `./client`
-#                         export there. The three rows below are subpaths, so
-#                         without this row `lib/client.js` is never served and
-#                         the tool rows show no Configure page on the Plugins
-#                         page.
-#   win-mb-shell-prompt
-#                       — registers the ONE prompt section the two bash tools
-#                         share (`tool:win-mb-bash`, order = midpoint of dsh's
-#                         TOOL_BASH/TOOL_PWSH). Its text is resolved per
-#                         assembly from the tools actually mounted, so it says
-#                         nothing when neither tool is enabled and never
-#                         assumes the other tool — or pwsh — is present.
-#                         Shared guidance lives here once instead of once per
-#                         tool description; each tool description keeps only
-#                         its own dialect facts.
+#   win-mb-plugin       — the package row: the plugin's core row. `name` is the
+#                         BARE package specifier and the module is the package
+#                         main, which does two things.
+#                         (1) It carries the browser half. The Web client
+#                             discovers one by resolving a row's package name to
+#                             its package.json (dsh-client-modules:
+#                             locatePkgJson → exactPackageSpecifier, which
+#                             answers `undefined` for a subpath) and reading
+#                             `dsh.client` + the `./client` export there. The
+#                             tool rows are subpaths, so without this row
+#                             `lib/client.js` is never served and the tool rows
+#                             show no Configure page on the Plugins page.
+#                         (2) It owns the ONE prompt section the two bash tools
+#                             share (`tool:win-mb-bash`, order = midpoint of
+#                             dsh's TOOL_BASH/TOOL_PWSH). Its text is resolved
+#                             per assembly from the tools actually mounted, so
+#                             it says nothing when neither tool is enabled and
+#                             never assumes the other tool — or pwsh — is
+#                             present. Shared guidance lives here once instead
+#                             of once per tool description; each tool
+#                             description keeps only its own dialect facts.
+#                         This is the one row that must not be switched off:
+#                         there is no supported way to mark a third-party row
+#                         read-only (dsh's plugin manager locks only rows from
+#                         its own protected-module list, its own row, and rows
+#                         it cannot address), so instead the composition is
+#                         built so that nothing can half-break: switch it off
+#                         and the tools keep working — their descriptions fall
+#                         back to carrying the shared guidance themselves — and
+#                         only the Plugins-page configuration disappears.
 #   win-mb-tool-git     — registers the model-facing `git_bash` tool
 #                         (MSYS dialect) into the host tools registry: every
 #                         session sees it regardless of its agent preset. The
@@ -40,11 +48,10 @@
 #   win-mb-tool-wsl     — the `wsl_bash` tool, owning its own WslBashExecutor;
 #                         its description carries only the WSL facts.
 #
-# All four rows are win32-only; POSIX keeps the base bundle's own bash wiring.
-# The package row and the prompt row own no tool, so the tool rows stay
-# independently switchable without them: dropping the prompt row loses the
-# shared section only, dropping the package row loses the Plugins-page
-# configuration only.
+# All three rows are win32-only; POSIX keeps the base bundle's own bash wiring.
+# The tool rows are independent of each other and of the core row — the section
+# follows whichever subset is mounted, and the core row's absence degrades to
+# the fallback described above rather than to a broken prompt.
 #
 # ── Why nothing here touches the ctx.shell seat ──────────────────────────────
 # dsh 0.1.7 removed the shell seam's routing field (`ShellExecRequest.shell`),
@@ -62,14 +69,13 @@
 # itself rather than by us.
 
 - insert:
-    # Bare specifier on purpose: this is the row that lets the Web client find
-    # this package's `dsh.client` declaration (see the header note).
+    # The core row. Bare specifier on purpose: this is the row that lets the Web
+    # client find this package's `dsh.client` declaration, and the row that owns
+    # the shared prompt section (see the header note). Keep it enabled — with it
+    # off the tools still run and still carry the shared guidance themselves, but
+    # the Plugins page loses its Configure pages.
     - id: win-mb-plugin
       name: 'dsh-win-multi-bash'
-      disabled: !!js process.platform !== 'win32'
-
-    - id: win-mb-shell-prompt
-      name: 'dsh-win-multi-bash/tool-shell-prompt'
       disabled: !!js process.platform !== 'win32'
 
     - id: win-mb-tool-git
