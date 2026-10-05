@@ -54,8 +54,8 @@ const wslBashTool = await import(libUrl('tool-bash', 'types', 'wsl-bash.js'))
 const { shellDescription, toNativeWorkdir } = await import(libUrl('tool-bash', 'types', 'factory.js'))
 const {
   SHELL_EXIT_STATUS_SECTION, SHELL_FAMILY_SECTION_NAME, SHELL_FAMILY_TOOL_NAMES,
-  SHELL_BACKGROUND_SECTION, SHELL_ESCALATION_SECTION,
-  shellFamilySectionText, shellFamilySectionOrder,
+  SHELL_BACKGROUND_SECTION, SHELL_ESCALATION_SECTION, SHELL_FAMILY_ROW_SPECIFIER,
+  shellFamilySectionText, shellFamilySectionOrder, composeToolDescription,
 } = await import(libUrl('tool-bash', 'types', 'shell-family.js'))
 const shellPromptRow = await import(libUrl('tool-bash', 'shell-prompt.js'))
 const packageRow = await import(libUrl('index.js'))
@@ -1502,6 +1502,33 @@ console.log('\n[A] unit: family section placement (between TOOL_BASH and TOOL_PW
   })
 }
 
+console.log('\n[A] unit: a subset without the prompt row keeps the guidance (composed fallback)')
+{
+  // The tool descriptions were slimmed on the assumption that the family section
+  // states the shared facts, so a composition that drops the owning row would
+  // silently lose them. composeToolDescription puts them back into the tool's own
+  // description instead, and the tool row warns when that happens.
+  const own = shellDescription('msys')
+  const shared = shellFamilySectionText({ background: true, escalation: false })
+  test('with the owning row composed, the description stays dialect-only', () => {
+    assert.equal(composeToolDescription({ own, familyPresent: true, background: true, escalation: false }), own)
+  })
+  test('without it, the description carries the shared facts itself', () => {
+    const fallback = composeToolDescription({ own, familyPresent: false, background: true, escalation: false })
+    assert.ok(fallback.startsWith(own), 'the dialect facts stay first')
+    assert.ok(fallback.includes(shared), 'and the shared text follows')
+    assert.ok(!fallback.includes(SHELL_ESCALATION_SECTION), 'the fallback follows what THIS tool advertises')
+  })
+  test('an unknown owner state is treated as composed, never as a reason to duplicate', () => {
+    // `familyRowComposed` answers undefined for an unreadable loader; the wrapper
+    // keeps the slim text, because the default composition does have the row.
+    assert.equal(composeToolDescription({ own, familyPresent: undefined, background: true, escalation: true }), own)
+  })
+  test('the owning-row specifier is the one the patch declares', () => {
+    assert.ok(readFileSync(join(PLUGIN, 'cordis.patch.yml'), 'utf8').includes(`name: '${SHELL_FAMILY_ROW_SPECIFIER}'`))
+  })
+}
+
 console.log('\n[B] boot integration: default fixture (pinned via probed bash)')
 {
   if (!HAS_GIT_BASH) {
@@ -1923,6 +1950,47 @@ console.log('\n[B] boot integration: dsh-settings projection of the two rows (re
     }
   } finally {
     if (ctx) await ctx.fiber.dispose()
+  }
+}
+
+console.log('\n[B] boot integration: a subset without the prompt row keeps the guidance in the tools')
+{
+  // The combination the row switches allow and that used to lose information
+  // silently: a tool row stays on while the row owning the shared section is off.
+  // The tool's own description then carries the shared facts, the prompt still
+  // states them exactly once, and the tool row warns at load.
+  if (!HAS_GIT_BASH) {
+    console.log('  … skipping: no Git Bash probed on this host')
+  } else {
+    let ctx
+    try {
+      ctx = await bootFixture(`
+- id: win-mb-tool-git
+  name: 'dsh-win-multi-bash/tool-git-bash'
+  config:
+    gitBash:
+      bashPath: '${GIT_BASH}'
+`, 'no-prompt-row.yml')
+      const { assembly, prompt } = await assembledPrompt(ctx)
+      const git = ctx.tools.schemas().find((schema) => schema.name === 'git_bash')
+      await runTests(ctx, [
+        ['the tool description carries the shared facts itself', async () => {
+          assert.ok(git.description.includes(SHELL_EXIT_STATUS_SECTION), 'exit-status guidance')
+          assert.ok(git.description.includes('fresh shell'), 'fresh-call guidance')
+          assert.ok(git.description.includes('truncated to its tail'), 'truncation guidance')
+          assert.ok(git.description.includes('never run it against a computed path you have not checked'), 'path safety')
+        }],
+        ['and the whole payload states it exactly once', async () => {
+          // Tool descriptions are not prompt sections, so the count that matters
+          // spans both: the slim section plus whatever the schemas carry.
+          const corpus = [prompt, ...ctx.tools.schemas().filter((schema) => SHELL_FAMILY_TOOL_NAMES.includes(schema.name)).map((schema) => schema.description)].join('\n')
+          assert.equal(corpus.split(SHELL_EXIT_STATUS_SECTION).length - 1, 1)
+          assert.equal(assembly.sections.filter((section) => section.name === SHELL_FAMILY_SECTION_NAME).length, 0, 'no section without its owning row')
+        }],
+      ])
+    } finally {
+      if (ctx) await ctx.fiber.dispose()
+    }
   }
 }
 
