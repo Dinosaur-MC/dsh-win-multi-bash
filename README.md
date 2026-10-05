@@ -39,7 +39,7 @@ The three backends do **not** share the same file-sandbox capability:
 > **`requireSandbox`: refuse unconfined runs when the probe fails (optional hardening).** Both backends support `requireSandbox: true` (default `false`, keeping the existing degrade-and-run behavior). When enabled, a failed probe (windows-acl unusable for git-bash / bwrap missing for wsl-bash) means: `danger-full-access` runs as usual (an unconfined run is equivalent to an explicit full-access grant), while `read-only` / `workspace-write` calls are **refused** with an error naming the fix and the escalation path. The tool layer also advertises the sandbox and opens the `sandbox_permissions` argument, so the model can take the approval-based escalation. Example:
 
 > ```yaml
-> # the win-mb-shell-prompt / win-mb-tool-git / win-mb-tool-wsl rows in cordis.patch.yml:
+> # the win-mb-plugin (core row) / win-mb-tool-git / win-mb-tool-wsl rows in cordis.patch.yml:
 > # each tool row carries only its own backend's partition
 > - id: win-mb-tool-git
 >   name: 'dsh-win-multi-bash/tool-git-bash'
@@ -70,7 +70,7 @@ wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"   # ver
 
 ## Tool prompts (model-facing descriptions)
 
-Each tool description is deliberately small: it states only what its own dialect owns — the shell and invocation, the dialect's path and environment-variable syntax, and (for `git_bash`) the MSYS note. Everything the family shares is stated once, by the single `tool:win-mb-bash` prompt section owned by the `win-mb-shell-prompt` row: a fresh shell per call plus the `workdir` rule, `[exit code: N]` markers with the `&&` / `set -o pipefail` gating rule, `$DSH_*` environment facts, sandbox behavior, output truncation, delete/move target verification, the unset-variable `${VAR:?}` guard, background jobs, and the escalation contract. The longer dialect notes (MSYS path rewriting, WSL base64 payloads) live in this README rather than in the model-facing text.
+Each tool description is deliberately small: it states only what its own dialect owns — the shell and invocation, the dialect's path and environment-variable syntax, and (for `git_bash`) the MSYS note. Everything the family shares is stated once, by the single `tool:win-mb-bash` prompt section owned by the plugin's core row (the package row, `win-mb-plugin`): a fresh shell per call plus the `workdir` rule, `[exit code: N]` markers with the `&&` / `set -o pipefail` gating rule, `$DSH_*` environment facts, sandbox behavior, output truncation, delete/move target verification, the unset-variable `${VAR:?}` guard, background jobs, and the escalation contract. The longer dialect notes (MSYS path rewriting, WSL base64 payloads) live in this README rather than in the model-facing text.
 
 Both tools run `bash -c`, so that safety guidance is worded as in `tool-bash`, not as in `tool-pwsh`: `$HOME` is an ordinary assignable variable in bash, so pwsh's "do not assign to automatic variables" sentence would be wrong here — the bash guard for a computed path is the `${VAR:?}` form above, which makes an unset variable fail instead of silently expanding to an empty string.
 
@@ -92,7 +92,7 @@ So when a command prints an MSYS path (e.g. `/d/WorkSpace/foo`), convert it to i
 | on | **both off** | No family tool is mounted, so the section resolves to empty text and the rendered prompt contains no shell guidance and no shell section at all. The two Configure pages disappear with their rows. |
 | **off** | any subset | The Web client has no package row to find `dsh.client` on, so it serves no browser half and the Plugins page shows no **Configure** control. The tools keep working: with the section gone, each tool description carries the shared guidance itself (the fallback, which also logs a warning). |
 
-The core row cannot be marked read-only: `dsh`'s plugin manager locks only the rows from its own protected-module list, its own row, and rows its profile patch cannot address (`readOnlyReason: "management-required" | "unaddressable"`) — there is no manifest flag a third-party bundle can set. The composition is therefore built so that switching the core row off cannot half-break anything: the tool rows are the ones a user actually toggles, and the third row above is the only consequence. The old separate prompt row is gone; a profile that still declares `win-mb-shell-prompt` keeps working (that module is now a migration shim that registers nothing while the core row is composed) and logs the one step to drop it.
+The core row cannot be marked read-only: `dsh`'s plugin manager locks only the rows from its own protected-module list, its own row, and rows its profile patch cannot address (`readOnlyReason: "management-required" | "unaddressable"`) — there is no manifest flag a third-party bundle can set. The composition is therefore built so that switching the core row off cannot half-break anything: the tool rows are the ones a user actually toggles, and the third row above is the only consequence. Two rows became three: 0.3.0 and 0.3.1 shipped **only** `win-mb-tool-git` and `win-mb-tool-wsl`, so a hand-wired profile that is not migrated still resolves and loads both tools and behaves the same; the missing core row only means the shared guidance falls back into each tool description (above) and that the Plugins-page Configure control is absent — which 0.3.1 did not have either. Re-run `install.ps1` (or add the `win-mb-plugin` row) to get the core row. The separate `win-mb-shell-prompt` row that existed briefly in the development commits between 0.3.1 and 0.4.0 is simply gone — no published version ever declared it, so 0.4.0 ships no module behind that name. A profile that still carries it boots with one inactive entry (the module no longer resolves) and is otherwise unaffected: both tools load, and with no section owner composed each description carries the shared guidance itself.
 
 Two further caveats. A row switched off *at runtime* takes effect immediately for the section (it is resolved per assembly), but a tool row that was already loaded keeps the description it registered: the fallback therefore appears only after that tool row reloads, or after a restart. And a warning issued at startup goes through cordis's logger, which the boot collector keeps for its failure report but discards on a successful boot at the default log level — so the fallback text, not the log line, is what actually guarantees the model keeps the guidance.
 
@@ -162,7 +162,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -ProfileName <name>
 powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 ```
 
-The script links the package into `<profile>/node_modules/` (a junction), maintains the package-local `node_modules/@deepseek-ai` junction the bundled code needs, and writes a managed block into the profile's `cordis.patch.yml` — `dsh web` hot-reloads that file, so the feature goes live without a restart. The script is idempotent and auto-detects Git Bash installs outside the default probe paths by reading `HKLM:\SOFTWARE\GitForWindows` and pinning `gitBash.bashPath`.
+The script links the package into `<profile>/node_modules/` (a junction), maintains the package-local `node_modules/@deepseek-ai` junction the bundled code needs, and writes a managed block into the profile's `cordis.patch.yml` — `dsh web` hot-reloads that file, so the feature goes live without a restart. The script is idempotent and auto-detects Git Bash installs outside the default probe paths by reading `HKLM:\SOFTWARE\GitForWindows` and pinning `gitBash.bashPath`. Both scripts ship inside the published package too, so a registry install can run them straight from `node_modules/dsh-win-multi-bash/`.
 
 ### Path B: bundle install (portable, requires restart)
 
@@ -210,10 +210,11 @@ Runs the full audit suite instead: pure-unit coverage of the vendor helpers, exe
 
 ```
 dsh-win-multi-bash/
-├── package.json            # dsh.bundle manifest; exports ./tool-git-bash ./tool-wsl-bash
+├── package.json            # dsh.bundle + dsh.client manifest; exports . ./client ./tool-git-bash ./tool-wsl-bash
 ├── cordis.patch.yml        # the composition wiring (documented inline)
 ├── install.ps1             # Path A hot plug (junctions + managed block + Git Bash detection)
 ├── uninstall.ps1           # Path A hot unplug
+├── .gitattributes          # LF-only for every text file, binaries exempt
 ├── LICENSE / THIRD_PARTY_NOTICES
 ├── lib/                    # bundled implementation (plain ESM JS, no build step)
 └── smoke/                  # smoke test (not published)

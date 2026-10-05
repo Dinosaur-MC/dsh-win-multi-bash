@@ -1,0 +1,12 @@
+# Every text file is committed and checked out with LF, so a Windows checkout
+# cannot turn this plugin's YAML, JS or PowerShell into CRLF. Binaries are
+# exempt so no 0x0D inside them is ever treated as a line ending.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.webp binary
+*.gif binary
+*.zstd binary
+*.zip binary

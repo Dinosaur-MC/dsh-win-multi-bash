@@ -1,6 +1,6 @@
 {
   "name": "dsh-win-multi-bash",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "author": "Dinosaur_MC",
   "repository": {
     "type": "git",
@@ -29,12 +29,13 @@
     "./client": "./lib/client.js",
     "./tool-git-bash": "./lib/tool-bash/types/git-bash.js",
     "./tool-wsl-bash": "./lib/tool-bash/types/wsl-bash.js",
-    "./tool-shell-prompt": "./lib/tool-bash/shell-prompt.js",
     "./package.json": "./package.json"
   },
   "files": [
     "lib/**/*.js",
     "cordis.patch.yml",
+    "install.ps1",
+    "uninstall.ps1",
     "README.md",
     "README.zh.md",
     "README.i18n.yaml",

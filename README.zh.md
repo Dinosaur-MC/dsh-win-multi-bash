@@ -70,7 +70,7 @@ wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"   # 验
 
 ## 工具提示词（面向模型的描述）
 
-`git_bash` / `wsl_bash` 的工具描述刻意保持最小：只写各自方言自身的内容——shell 与调用形式、方言的路径与环境变量写法、（`git_bash` 还带）MSYS 路径注记。两者共有的内容由 `win-mb-shell-prompt` 行注册的**唯一**一段 `tool:win-mb-bash` 提示词承载：每次调用全新 shell 与 `workdir` 规则、`[exit code: N]` 标记及 `&&` / `set -o pipefail` 串接规则、`$DSH_*` 环境事实、沙箱行为、输出截断、删除/移动前的目标路径校验、未设变量的 `${VAR:?}` 兜底、后台任务与升级契约。更长的方言说明（MSYS 路径改写、WSL base64 载荷）放在本文档而不是模型可见的描述里。
+`git_bash` / `wsl_bash` 的工具描述刻意保持最小：只写各自方言自身的内容——shell 与调用形式、方言的路径与环境变量写法、（`git_bash` 还带）MSYS 路径注记。两者共有的内容由插件核心行（包行 `win-mb-plugin`）拥有的**唯一**一段 `tool:win-mb-bash` 提示词承载：每次调用全新 shell 与 `workdir` 规则、`[exit code: N]` 标记及 `&&` / `set -o pipefail` 串接规则、`$DSH_*` 环境事实、沙箱行为、输出截断、删除/移动前的目标路径校验、未设变量的 `${VAR:?}` 兜底、后台任务与升级契约。更长的方言说明（MSYS 路径改写、WSL base64 载荷）放在本文档而不是模型可见的描述里。
 
 这两个工具都用 `bash -c`，因此上述安全提示采用 `tool-bash` 的 bash 版措辞而非 `tool-pwsh` 的：bash 里 `$HOME` 是可赋值的普通变量，pwsh 的「不要给自动变量赋值」那句在此会误导；bash 对计算路径的兜底就是上面的 `${VAR:?}` 写法——它让未设变量直接报错，而不是静默展开成空串。
 
@@ -92,7 +92,7 @@ wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"   # 验
 | 开 | **都关** | 没有家族工具被挂载，小节解析为空文本，渲染出的提示词里既没有那段指导、也没有这一节。两个配置页随各自的行走。 |
 | **关** | 任意子集 | Web 端没有包行可解析 `dsh.client`，于是不下发浏览器半边，面板上没有 **配置** 入口。工具照旧可用：小节不在了，共有指导改由每个工具自己的描述承载（兜底，同时记一条警告）。 |
 
-**核心行无法被标成只读**：dsh 的插件管理只锁三类行——它自己的"受保护模块"名单里的行、它自己那一行、以及它的 profile patch 无法唯一定位的行（`readOnlyReason: "management-required" | "unaddressable"`）；第三方组合包没有任何清单字段可以声明"本行只读"。因此这里的做法是让"关掉核心行"不可能造成半坏状态：用户真正要开关的是两个工具行，而上面第三行就是关掉核心行后的全部后果。原先独立的提示行已并入核心行；仍声明 `win-mb-shell-prompt` 的旧接线不会被破坏——那个模块现在是迁移垫片，在核心行已组合时不注册任何东西，并提示那一步怎么删。
+**核心行无法被标成只读**：dsh 的插件管理只锁三类行——它自己的"受保护模块"名单里的行、它自己那一行、以及它的 profile patch 无法唯一定位的行（`readOnlyReason: "management-required" | "unaddressable"`）；第三方组合包没有任何清单字段可以声明"本行只读"。因此这里的做法是让"关掉核心行"不可能造成半坏状态：用户真正要开关的是两个工具行，而上面第三行就是关掉核心行后的全部后果。两行变三行：0.3.0 / 0.3.1 **只**交付过 `win-mb-tool-git` 与 `win-mb-tool-wsl`，因此未迁移的手工接线 profile 仍然能解析并加载这两个工具、行为不变；缺的只是核心行——共有指导会回落到各自描述里（见上），并且面板上没有 **配置** 入口（0.3.1 本来也没有）。重跑 `install.ps1`（或补上 `win-mb-plugin` 行）即可拿到核心行。0.3.1 与 0.4.0 之间的开发提交里短暂存在过的独立 `win-mb-shell-prompt` 行**已直接删除**——任何已发布版本都不曾声明它，0.4.0 也不再为该名字提供模块。若你的 profile 仍带着它，启动时会报一个"未激活条目"（模块无法解析），此外不受影响：两个工具照常加载，且因为没有小节拥有者，各自描述会自带那段共有指导。
 
 两点注意：**运行时**关掉某行对小节立即生效（每次装配都重新解析），但已加载的工具行仍保留它注册时的描述，因此"关掉核心行→兜底接管"要等该工具行重载或重启才发生。另外，启动期经 cordis logger 发出的警告，会被 app-boot 的收集器留着用于失败报告、但在成功启动且默认日志级别下丢弃——所以**真正保证模型不丢指导的是兜底文本，而不是那条日志**。
 
@@ -162,7 +162,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -ProfileName <name>
 powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 ```
 
-脚本把包链接进 `<profile>/node_modules/`（junction），维护包内 `node_modules/@deepseek-ai` junction（打包代码解析基础包所需），并把 managed 接线块写入 profile 的 `cordis.patch.yml`——`dsh web` 热重载该文件，**立即生效，无需重启**。脚本幂等，并会自动检测默认探测路径之外的 Git Bash（读取 `HKLM:\SOFTWARE\GitForWindows` 写入 `gitBash.bashPath`）。
+脚本把包链接进 `<profile>/node_modules/`（junction），维护包内 `node_modules/@deepseek-ai` junction（打包代码解析基础包所需），并把 managed 接线块写入 profile 的 `cordis.patch.yml`——`dsh web` 热重载该文件，**立即生效，无需重启**。脚本幂等，并会自动检测默认探测路径之外的 Git Bash（读取 `HKLM:\SOFTWARE\GitForWindows` 写入 `gitBash.bashPath`）。两个脚本也随 npm 包一起发布，因此从 registry 安装的用户可以直接在 `node_modules/dsh-win-multi-bash/` 下运行。
 
 ### 方式 B：bundle 安装（便携，需重启）
 
@@ -210,10 +210,11 @@ powershell -ExecutionPolicy Bypass -File .\smoke\audit.ps1
 
 ```
 dsh-win-multi-bash/
-├── package.json            # dsh.bundle 清单；exports 暴露 ./tool-git-bash ./tool-wsl-bash
+├── package.json            # dsh.bundle + dsh.client 清单；exports 暴露 . ./client ./tool-git-bash ./tool-wsl-bash
 ├── cordis.patch.yml        # 组合接线（即文档）
 ├── install.ps1             # 方式 A 热插（junction + managed 块 + Git Bash 检测）
 ├── uninstall.ps1           # 方式 A 热拔
+├── .gitattributes          # 所有文本文件 LF，二进制例外
 ├── LICENSE / THIRD_PARTY_NOTICES
 ├── lib/                    # 打包实现（纯 ESM JS，无构建步骤）
 └── smoke/                  # 冒烟测试（不随包发布）

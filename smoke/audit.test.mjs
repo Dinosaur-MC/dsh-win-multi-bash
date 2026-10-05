@@ -29,7 +29,8 @@
 
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync, rmSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -57,7 +58,6 @@ const {
   SHELL_BACKGROUND_SECTION, SHELL_ESCALATION_SECTION, SHELL_FAMILY_ROW_SPECIFIER,
   shellFamilySectionText, shellFamilySectionOrder, composeToolDescription,
 } = await import(libUrl('tool-bash', 'types', 'shell-family.js'))
-const shellPromptRow = await import(libUrl('tool-bash', 'shell-prompt.js'))
 const packageRow = await import(libUrl('index.js'))
 const { LocalBashExecutor } = await import('@deepseek-ai/dsh-bash-local')
 
@@ -395,33 +395,18 @@ console.log('\n[A] unit: config schemas')
     assert.ok(!('Config' in packageRow), 'the core row owns no tool and no config of its own')
     for (const s of ['systemPrompt', 'tools']) assert.ok(packageRow.inject.includes(s), `the core row must inject ${s}`)
   })
-  test('the obsolete shell-prompt row is now a migration shim', () => {
-    assert.equal(typeof shellPromptRow.name, 'string')
-    assert.equal(typeof shellPromptRow.apply, 'function')
-    assert.ok(!('Config' in shellPromptRow), 'the shim owns no tool and no config')
-    for (const s of ['systemPrompt', 'tools']) assert.ok(shellPromptRow.inject.includes(s), `the shim must inject ${s}`)
-    const section = (coreComposed) => {
-      const sections = []
-      const warnings = []
-      const rows = [{ options: { name: 'dsh-win-multi-bash' }, disabled: coreComposed !== true }]
-      shellPromptRow.apply({
-        get: (service) => (service !== 'loader' ? undefined : coreComposed === undefined ? undefined : { entries: () => rows }),
-        logger: { warn: (text) => warnings.push(text) },
-        systemPrompt: { getSectionOrder: () => 1005, section: (value) => sections.push(value) },
-        tools: { get: () => undefined },
-      })
-      return { sections, warnings }
-    }
-    // The modern wiring owns the section on the package row: this row must not
-    // register a second one (the same section name twice throws), but it does
-    // say how to drop it.
-    const modern = section(true)
-    assert.equal(modern.sections.length, 0, 'no second registration while the core row is composed')
-    assert.equal(modern.warnings.length, 1)
-    assert.ok(modern.warnings[0].includes(SHELL_FAMILY_ROW_SPECIFIER), 'the warning names the new owner')
-    // The old wiring (no package row at all) still gets the section once.
-    assert.equal(section(false).sections.length, 1, 'the legacy composition keeps its section')
-    assert.equal(section(undefined).sections.length, 0, 'an unreadable loader keeps the shim inert')
+  test('the development-only shell-prompt row is deleted, not shimmed', () => {
+    // The row never appeared in a published version (0.3.0 / 0.3.1 declared the
+    // two tool rows only), so 0.4.0 carries no module and no export for it. A
+    // development-era profile that still lists the row reports one inactive entry
+    // and is otherwise unaffected — the tools fall back to carrying the shared
+    // guidance themselves, which the "no prompt row" boot state above proves.
+    const root = join(__dirname, '..')
+    const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+    assert.ok(!Object.keys(manifest.exports).some((key) => key.includes('shell-prompt')), 'the export must be gone')
+    assert.equal(existsSync(join(root, 'lib', 'tool-bash', 'shell-prompt.js')), false, 'the module must be gone')
+    const patch = readFileSync(join(root, 'cordis.patch.yml'), 'utf8')
+    assert.ok(!patch.includes('shell-prompt'), 'the wiring must not declare that row')
   })
   test('#2: git-bash Config is independent of wsl-bash (no .set() cross-pollution)', () => {
     assert.equal(GitBashExecutor.Config({}).probeTimeoutMs.get(), 10000, 'git-bash keeps its own 1e4 default')
@@ -2157,6 +2142,55 @@ console.log('\n[B] boot integration: misconfiguration matrices')
 for (const p of writtenFixtures) rmSync(p, { force: true })
 
 // ── summary ──────────────────────────────────────────────────────────────────
+console.log('\n[A] unit: repository records (bilingual pair, LF discipline, published shape)')
+{
+  // The records a release depends on are data, not prose; pin them so a silent
+  // drift (README edited without re-recording, a CRLF checkout, a script dropped
+  // from the tarball) fails the gate instead of shipping.
+  const gitBlobHash = (path) => {
+    const bytes = readFileSync(path)
+    return createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex')
+  }
+  const manifest = JSON.parse(readFileSync(join(PLUGIN, 'package.json'), 'utf8'))
+
+  test('the bilingual record matches both README sides', () => {
+    const record = readFileSync(join(PLUGIN, 'README.i18n.yaml'), 'utf8')
+    for (const side of ['README.md', 'README.zh.md']) {
+      const recorded = new RegExp(`^${side.replace('.', '\\.')}: ([0-9a-f]{40})$`, 'm').exec(record)
+      assert.ok(recorded !== null, `README.i18n.yaml must record ${side}`)
+      assert.equal(recorded[1], gitBlobHash(join(PLUGIN, side)), `${side} changed without re-recording its hash`)
+    }
+  })
+
+  test('.gitattributes pins LF for every text file', () => {
+    const attributes = readFileSync(join(PLUGIN, '.gitattributes'), 'utf8')
+    assert.ok(/^\* text=auto eol=lf$/m.test(attributes), 'every text file must be normalized to LF')
+    for (const binary of ['*.png', '*.ico'])
+      assert.ok(attributes.includes(`${binary} binary`), `${binary} must stay binary`)
+  })
+
+  test('no shipped file carries a CR byte', () => {
+    const shipped = ['cordis.patch.yml', 'install.ps1', 'uninstall.ps1', 'package.json', 'README.md', 'README.zh.md']
+    const walk = (dir) => readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
+      entry.isDirectory() ? walk(join(dir, entry.name)) : [join(dir, entry.name)])
+    shipped.push(...walk(join(PLUGIN, 'lib')))
+    for (const path of shipped) {
+      const bytes = readFileSync(path)
+      const firstCr = bytes.indexOf(0x0d)
+      assert.equal(firstCr, -1, `${path.replace(PLUGIN, '')} carries a CR byte at ${firstCr}`)
+    }
+  })
+
+  test('the published file list ships both install paths and no test evidence', () => {
+    for (const required of ['install.ps1', 'uninstall.ps1', 'cordis.patch.yml'])
+      assert.ok(manifest.files.includes(required), `package.json files must ship ${required}`)
+    assert.ok(manifest.files.includes('lib/**/*.js'), 'the bundled implementation must ship')
+    assert.ok(existsSync(join(PLUGIN, 'lib/client.js')), 'the browser half must exist for that glob to cover it')
+    for (const excluded of ['smoke', '.temp', 'RELEASE_NOTES.md'])
+      assert.ok(!manifest.files.some((entry) => entry.startsWith(excluded)), `the tarball must not ship ${excluded}`)
+  })
+}
+
 console.log(`\n==== audit summary: ${passed} passed, ${failed} failed ====`)
 if (failed > 0) {
   console.log('\nFailures:')
