@@ -1556,6 +1556,31 @@ console.log('\n[A] unit: family section placement (between TOOL_BASH and TOOL_PW
     for (const broken of [{ getSectionOrder: () => undefined }, { getSectionOrder: (n) => (n === 'TOOL_BASH' ? 1000 : undefined) }])
       assert.ok(Number.isFinite(shellFamilySectionOrder(broken)))
   })
+  test('a registry without getSectionOrder still yields a finite order', () => {
+    for (const absent of [{}, { getSectionOrder: undefined }, null, undefined])
+      assert.ok(Number.isFinite(shellFamilySectionOrder(absent)), `order must stay finite for ${String(absent)}`)
+  })
+  test('a getSectionOrder that throws still yields a finite order', () => {
+    assert.equal(shellFamilySectionOrder({ getSectionOrder: () => { throw new Error('unknown section name') } }), 1005)
+  })
+  test('the core row still registers its section when the registry is intact', () => {
+    const seen = []
+    const registry = { section: (entry) => seen.push(entry), getSectionOrder: (name) => ({ TOOL_BASH: 1000, TOOL_PWSH: 1010 })[name] }
+    packageRow.apply({ systemPrompt: registry })
+    assert.equal(seen.length, 1, 'an intact registry must still get the section')
+    assert.equal(seen[0].name, SHELL_FAMILY_SECTION_NAME)
+    assert.equal(seen[0].order, 1005)
+  })
+  test('the core row survives a registry whose shape moved', () => {
+    // Boot-time regressions: this row also carries the browser half, so an
+    // unguarded dsh-internal call here takes the whole row (and the boot) down.
+    for (const moved of [
+      { section: () => {} },
+      { section: () => {}, getSectionOrder: () => { throw new Error('unknown section name') } },
+      { getSectionOrder: () => 1005 },
+    ])
+      assert.doesNotThrow(() => packageRow.apply({ systemPrompt: moved }), `apply must survive ${Object.keys(moved).join('+') || 'an empty registry'}`)
+  })
   test('the section name is not per-tool', () => {
     for (const toolName of SHELL_FAMILY_TOOL_NAMES) assert.ok(!SHELL_FAMILY_SECTION_NAME.includes(toolName))
   })
