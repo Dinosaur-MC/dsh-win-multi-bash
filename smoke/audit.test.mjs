@@ -2019,6 +2019,48 @@ console.log('\n[B] boot integration: promote-on-timeout (shipped default, SERIAL
   }
 }
 
+console.log('\n[B] boot integration: no job registry — config decides the schema, the call fails loud')
+{
+  if (!HAS_GIT_BASH) {
+    console.log('  … skipping no-registry fixture: no Git Bash probed on this host')
+  } else {
+    let ctx
+    try {
+      // Deterministic reproduction of the regression this section guards: with
+      // the registry disabled, an apply-time `ctx.get('jobs')` read is false on
+      // every run, so the old latch dropped `run_in_background` from the schema
+      // and silently turned promotion off (first seen as a 1-in-N flake under
+      // load, because with the registry present the read races its mount).
+      const patchPath = join(FIXTURE_DIR, 'no-jobs.patch.yml')
+      writeFileSync(patchPath, '- id: tasks\n  disabled: true\n\n- id: tool-jobs\n  disabled: true\n')
+      writtenFixtures.push(patchPath)
+      ctx = await bootFixture(PLUGIN_ROWS(GIT_BASH), 'no-jobs.yml', loadOverlayPatches('dsh-wmb-audit', patchPath))
+      await runTests(ctx, [
+        ['without a registry the schema still advertises run_in_background', async () => {
+          for (const name of ['git_bash', 'wsl_bash']) {
+            const schema = ctx.tools.schemas().find((candidate) => candidate.name === name)
+            assert.ok(
+              schema.parameters.properties.run_in_background !== undefined,
+              `${name}: the parameter follows enableRunInBackground, never a service read at apply time`,
+            )
+          }
+        }],
+        ['without a registry a timed-out foreground call is killed, as before promotion existed', async () => {
+          const text = await execTool(ctx, 'git_bash', { command: 'while :; do :; done', timeoutMs: 800 })
+          assert.match(text, /\[timed out after 800ms\]/)
+        }],
+        ['without a registry the background parameter still fails loudly', async () => {
+          const result = await execToolResult(ctx, 'git_bash', { command: 'echo no-registry', run_in_background: true })
+          assert.equal(result.isError, true)
+          assert.match(`${result.text}${String(result.error)}`, /background jobs unavailable/)
+        }],
+      ])
+    } finally {
+      if (ctx) await ctx.fiber.dispose()
+    }
+  }
+}
+
 console.log('\n[B] boot integration: no-pin fixture (auto git-path resolution, never WSL)')
 {
   // No `gitBash.bashPath`: resolution must find the real MSYS Git Bash by
