@@ -92,7 +92,7 @@ So when a command prints an MSYS path (e.g. `/d/WorkSpace/foo`), convert it to i
 | on | **both off** | No family tool is mounted, so the section resolves to empty text and the rendered prompt contains no shell guidance and no shell section at all. The two Configure pages disappear with their rows. |
 | **off** | any subset | The Web client has no package row to find `dsh.client` on, so it serves no browser half and the Plugins page shows no **Configure** control. The tools keep working: with the section gone, each tool description carries the shared guidance itself (the fallback, which also logs a warning). |
 
-The core row cannot be marked read-only: `dsh`'s plugin manager locks only the rows from its own protected-module list, its own row, and rows its profile patch cannot address (`readOnlyReason: "management-required" | "unaddressable"`) — there is no manifest flag a third-party bundle can set. The composition is therefore built so that switching the core row off cannot half-break anything: the tool rows are the ones a user actually toggles, and the third row above is the only consequence. Two rows became three: 0.3.0 and 0.3.1 shipped **only** `win-mb-tool-git` and `win-mb-tool-wsl`, so a hand-wired profile that is not migrated still resolves and loads both tools and behaves the same; the missing core row only means the shared guidance falls back into each tool description (above) and that the Plugins-page Configure control is absent — which 0.3.1 did not have either. Re-run `install.ps1` (or add the `win-mb-plugin` row) to get the core row. The separate `win-mb-shell-prompt` row that existed briefly in the development commits between 0.3.1 and 0.4.0 is simply gone — no published version ever declared it, so 0.4.0 ships no module behind that name. A profile that still carries it boots with one inactive entry (the module no longer resolves) and is otherwise unaffected: both tools load, and with no section owner composed each description carries the shared guidance itself.
+The core row cannot be marked read-only: `dsh`'s plugin manager locks only the rows from its own protected-module list, its own row, and rows its profile patch cannot address (`readOnlyReason: "management-required" | "unaddressable"`) — there is no manifest flag a third-party bundle can set. The composition is therefore built so that switching the core row off cannot half-break anything: the tool rows are the ones a user actually toggles, and the third row above is the only consequence. Two rows became three: 0.3.0 and 0.3.1 shipped **only** `win-mb-tool-git` and `win-mb-tool-wsl`, so a hand-wired profile that is not migrated still resolves and loads both tools and behaves the same; the missing core row only means the shared guidance falls back into each tool description (above) and that the Plugins-page Configure control is absent — which 0.3.1 did not have either. Re-run `dsh plugin --profile web add dsh-win-multi-bash`, or add the `win-mb-plugin` row to the profile's `cordis.patch.yml` by hand, to get the core row. The separate `win-mb-shell-prompt` row that existed briefly in the development commits between 0.3.1 and 0.4.0 is simply gone — no published version ever declared it, so 0.4.0 ships no module behind that name. A profile that still carries it boots with one inactive entry (the module no longer resolves) and is otherwise unaffected: both tools load, and with no section owner composed each description carries the shared guidance itself.
 
 Two further caveats. A row switched off *at runtime* takes effect immediately for the section (it is resolved per assembly), but a tool row that was already loaded keeps the description it registered: the fallback therefore appears only after that tool row reloads, or after a restart. And a warning issued at startup goes through cordis's logger, which the boot collector keeps for its failure report but discards on a successful boot at the default log level — so the fallback text, not the log line, is what actually guarantees the model keeps the guidance.
 
@@ -111,6 +111,7 @@ That list is exactly the volatile projection of each row's `Config` schema — t
 
 - **Live reads.** Volatile fields are live references, and the executors read them through `.get()` at use time. A path, distro, stance, timeout, or hardening change applies to the next command without reloading the row.
 - **Two knobs need the row's next load**, because they shape the tool's *schema* rather than one call: `enableRunInBackground` (the advertised `run_in_background` argument) and the escalation surface (`sandbox_permissions`, advertised at load from the probe verdict).
+- **One behaviour switch is deliberately not on the page.** `promoteOnTimeout` (default on) keeps a foreground command that reaches its timeout running as a background job — visible and killable through the job tools — instead of killing it, matching dsh's own bash tool. It is non-volatile because it is a deployment stance rather than a live knob: set it in the row's YAML and it applies on the row's next load. With `enableRunInBackground: false`, or with no job registry composed, a timeout kills the command exactly as before.
 - **Staged, not live typing.** The page stages drafts and writes only on **Save**, fenced by the revision it read; a save the Host refuses keeps the drafts. Emptying a path or a distro stages a clear, so the override drops and the built-in probe resolves again.
 - The page exists while the Host serves that row's namespace (`whileServed`), so a row that is switched off shows no Configure control.
 
@@ -147,35 +148,22 @@ Because no row of this plugin registers as `ctx.shell`, the patch inserts only i
 - A dsh profile with the published `@deepseek-ai` base packages (every standard deployment).
 - Git Bash and/or WSL on the machine (a missing backend only errors at first use; pwsh is unaffected).
 
-## Plug and unplug
+## Install and remove
 
-Two mutually exclusive paths insert the same rows. Never use both at once — the loader rejects duplicate entry ids.
-
-### Path A: hot plug (recommended, no restart)
-
-```powershell
-# Install
-powershell -ExecutionPolicy Bypass -File .\install.ps1            # default profile: web
-powershell -ExecutionPolicy Bypass -File .\install.ps1 -ProfileName <name>
-
-# Uninstall
-powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
-```
-
-The script links the package into `<profile>/node_modules/` (a junction), maintains the package-local `node_modules/@deepseek-ai` junction the bundled code needs, and writes a managed block into the profile's `cordis.patch.yml` — `dsh web` hot-reloads that file, so the feature goes live without a restart. The script is idempotent and auto-detects Git Bash installs outside the default probe paths by reading `HKLM:\SOFTWARE\GitForWindows` and pinning `gitBash.bashPath`. Both scripts ship inside the published package too, so a registry install can run them straight from `node_modules/dsh-win-multi-bash/`.
-
-### Path B: bundle install (portable, requires restart)
+There is one install path: `dsh plugin`, a pnpm forwarder. It installs the package into the profile, and the bundle layer applies the package's own `cordis.patch.yml` (declared by `dsh.bundle.patch`), which inserts the three rows. No script links anything by hand.
 
 ```powershell
 # Install (pick one)
 dsh plugin --profile web add dsh-win-multi-bash                    # npm published package (recommended)
 dsh plugin --profile web add github:@Dinosaur-MC/dsh-win-multi-bash   # GitHub repository source
 
-# Uninstall
+# Remove
 dsh plugin --profile web remove dsh-win-multi-bash
 ```
 
-Requires `pnpm` (dsh plugin is a pnpm forwarder); the bundle layer is assembled at boot, so **restart `dsh web`** for it to take effect. Works on any profile, including freshly initialized ones.
+Requires `pnpm`; the bundle layer is assembled at boot, so **restart `dsh web`** for a change to take effect. Works on any profile, including freshly initialized ones.
+
+The manual equivalent is the profile's `cordis.patch.yml`: the `insert:` rows this package's own `cordis.patch.yml` declares (that file is the composition wiring, documented inline) can be written into the profile patch by hand. Do not do both — a hand-written block next to a bundle install makes the loader reject the duplicate entry ids.
 
 ## Verification
 
@@ -195,10 +183,10 @@ Runs the full audit suite instead: pure-unit coverage of the vendor helpers, exe
 
 | Symptom | Fix |
 | --- | --- |
-| New sessions lack `git_bash` / `wsl_bash` | Check the managed block exists in the profile patch, the profile `node_modules/dsh-win-multi-bash` junction exists, and the package-local `node_modules/@deepseek-ai` junction exists (re-run install.ps1); confirm the running `dsh web` hot-reloads the profile patch |
-| Boot fails with `duplicate loader entry id` | Both plug paths are active; remove one of them |
-| Boot fails with `Cannot find package '@deepseek-ai/...'` | The package-local `node_modules/@deepseek-ai` junction is missing (re-run install.ps1), or the profile runtime lacks the base packages |
-| `git_bash` reports bash not found (or spawns the WSL `WindowsApps\bash.exe` alias with `spawn ... ENOENT`) | Git Bash is outside the probe paths, or a stale WSL app-execution alias shadows resolution: delete `%LOCALAPPDATA%\Microsoft\WindowsApps\bash.exe` (Settings → Apps → Advanced app settings → App execution aliases), re-run install.ps1 (registry auto-detect), or set `gitBash.bashPath` manually |
+| New sessions lack `git_bash` / `wsl_bash` | Check the three rows are in the profile's `cordis.patch.yml` and that the profile resolves `dsh-win-multi-bash` (`dsh plugin --profile web list`); the bundle layer is assembled at boot, so restart the running `dsh web` |
+| Boot fails with `duplicate loader entry id` | The rows are present twice — a hand-written block in the profile patch next to the bundle install; remove one of them |
+| Boot fails with `Cannot find package '@deepseek-ai/...'` | The profile runtime lacks the base packages (every standard deployment has them); reinstall with `dsh plugin --profile web add dsh-win-multi-bash` |
+| `git_bash` reports bash not found (or spawns the WSL `WindowsApps\bash.exe` alias with `spawn ... ENOENT`) | Git Bash is outside the probe paths, or a stale WSL app-execution alias shadows resolution: delete `%LOCALAPPDATA%\Microsoft\WindowsApps\bash.exe` (Settings → Apps → Advanced app settings → App execution aliases), or set `gitBash.bashPath` manually |
 | `wsl_bash` errors | Check `wsl.exe --status` for a default distro; set `wslBash.wslDistro` to name one |
 | `wsl_bash` fails with `bwrap was not found` | `sandbox: bwrap` is set but bubblewrap is missing inside the distro: install it per “Sandbox behavior → Enabling the bwrap sandbox for `wsl_bash`” (`sudo apt-get install -y bubblewrap`) and restart `dsh web`, or use `sandbox: auto` / `none` |
 | `wsl_bash` sandbox reports a runner failure on bwrap | The bwrap workspace root is the Linux side of a Windows drive path (`/mnt/<drive>/...`): a UNC workspace root fails loud, and a distro with a custom automount root (wsl.conf `automount.root`) needs a matching configuration |
@@ -212,8 +200,6 @@ Runs the full audit suite instead: pure-unit coverage of the vendor helpers, exe
 dsh-win-multi-bash/
 ├── package.json            # dsh.bundle + dsh.client manifest; exports . ./client ./tool-git-bash ./tool-wsl-bash
 ├── cordis.patch.yml        # the composition wiring (documented inline)
-├── install.ps1             # Path A hot plug (junctions + managed block + Git Bash detection)
-├── uninstall.ps1           # Path A hot unplug
 ├── .gitattributes          # LF-only for every text file, binaries exempt
 ├── LICENSE / THIRD_PARTY_NOTICES
 ├── lib/                    # bundled implementation (plain ESM JS, no build step)

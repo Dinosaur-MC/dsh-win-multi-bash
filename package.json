@@ -34,8 +34,6 @@
   "files": [
     "lib/**/*.js",
     "cordis.patch.yml",
-    "install.ps1",
-    "uninstall.ps1",
     "README.md",
     "README.zh.md",
     "README.i18n.yaml",
@@ -54,7 +52,6 @@
       "inject": [
         "@deepseek-ai/dsh-client-locale",
         "@deepseek-ai/dsh-client-ui-settings",
-        "@deepseek-ai/dsh-client-ui-primitives",
         "@deepseek-ai/dsh-client-ui-plugin-manager"
       ]
     }

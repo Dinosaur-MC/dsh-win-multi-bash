@@ -92,7 +92,7 @@ wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"   # 验
 | 开 | **都关** | 没有家族工具被挂载，小节解析为空文本，渲染出的提示词里既没有那段指导、也没有这一节。两个配置页随各自的行走。 |
 | **关** | 任意子集 | Web 端没有包行可解析 `dsh.client`，于是不下发浏览器半边，面板上没有 **配置** 入口。工具照旧可用：小节不在了，共有指导改由每个工具自己的描述承载（兜底，同时记一条警告）。 |
 
-**核心行无法被标成只读**：dsh 的插件管理只锁三类行——它自己的"受保护模块"名单里的行、它自己那一行、以及它的 profile patch 无法唯一定位的行（`readOnlyReason: "management-required" | "unaddressable"`）；第三方组合包没有任何清单字段可以声明"本行只读"。因此这里的做法是让"关掉核心行"不可能造成半坏状态：用户真正要开关的是两个工具行，而上面第三行就是关掉核心行后的全部后果。两行变三行：0.3.0 / 0.3.1 **只**交付过 `win-mb-tool-git` 与 `win-mb-tool-wsl`，因此未迁移的手工接线 profile 仍然能解析并加载这两个工具、行为不变；缺的只是核心行——共有指导会回落到各自描述里（见上），并且面板上没有 **配置** 入口（0.3.1 本来也没有）。重跑 `install.ps1`（或补上 `win-mb-plugin` 行）即可拿到核心行。0.3.1 与 0.4.0 之间的开发提交里短暂存在过的独立 `win-mb-shell-prompt` 行**已直接删除**——任何已发布版本都不曾声明它，0.4.0 也不再为该名字提供模块。若你的 profile 仍带着它，启动时会报一个"未激活条目"（模块无法解析），此外不受影响：两个工具照常加载，且因为没有小节拥有者，各自描述会自带那段共有指导。
+**核心行无法被标成只读**：dsh 的插件管理只锁三类行——它自己的"受保护模块"名单里的行、它自己那一行、以及它的 profile patch 无法唯一定位的行（`readOnlyReason: "management-required" | "unaddressable"`）；第三方组合包没有任何清单字段可以声明"本行只读"。因此这里的做法是让"关掉核心行"不可能造成半坏状态：用户真正要开关的是两个工具行，而上面第三行就是关掉核心行后的全部后果。两行变三行：0.3.0 / 0.3.1 **只**交付过 `win-mb-tool-git` 与 `win-mb-tool-wsl`，因此未迁移的手工接线 profile 仍然能解析并加载这两个工具、行为不变；缺的只是核心行——共有指导会回落到各自描述里（见上），并且面板上没有 **配置** 入口（0.3.1 本来也没有）。重跑 `dsh plugin --profile web add dsh-win-multi-bash`，或手工把 `win-mb-plugin` 行补进 profile 的 `cordis.patch.yml`，即可拿到核心行。0.3.1 与 0.4.0 之间的开发提交里短暂存在过的独立 `win-mb-shell-prompt` 行**已直接删除**——任何已发布版本都不曾声明它，0.4.0 也不再为该名字提供模块。若你的 profile 仍带着它，启动时会报一个"未激活条目"（模块无法解析），此外不受影响：两个工具照常加载，且因为没有小节拥有者，各自描述会自带那段共有指导。
 
 两点注意：**运行时**关掉某行对小节立即生效（每次装配都重新解析），但已加载的工具行仍保留它注册时的描述，因此"关掉核心行→兜底接管"要等该工具行重载或重启才发生。另外，启动期经 cordis logger 发出的警告，会被 app-boot 的收集器留着用于失败报告、但在成功启动且默认日志级别下丢弃——所以**真正保证模型不丢指导的是兜底文本，而不是那条日志**。
 
@@ -111,6 +111,7 @@ wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"   # 验
 
 - **活引用**：volatile 字段是活引用，执行器在使用时通过 `.get()` 读取。路径、发行版、沙箱立场、超时与强化开关的改动对下一条命令即生效，无需重载该行。
 - **两项需要该行下次加载**（因为它们塑造的是工具 **schema** 而不是单次调用）：`enableRunInBackground`（对外广告的 `run_in_background` 参数）与升级面（`sandbox_permissions`，加载时按探针结论广告）。
+- **另有一个行为开关刻意不上页面。** `promoteOnTimeout`（默认开）让到达超时的前台命令继续作为后台任务运行——在任务工具里可见、可 kill——而不是把它杀掉，与 dsh 自带 bash 工具一致。它是非 volatile 的，因为它属于部署立场而非活旋钮：写在行的 YAML 里，在该行下次加载时生效。若 `enableRunInBackground: false`，或组合里没有 job registry，超时仍与以前一样直接杀掉命令。
 - **暂存而非即输即写**：页面暂存草稿，仅 **保存** 时写入，并以读取时的 revision 做栅栏；Host 拒绝的保存会保留草稿。清空路径或发行版会提交一次 clear，撤销覆盖并让内置探测重新生效。
 - 该页仅在 Host 服务该行命名空间时存在（`whileServed`），因此被关掉的行不会显示配置入口。
 
@@ -147,24 +148,9 @@ lib/
 - dsh profile 含已发布的 `@deepseek-ai` 基础包（任何标准部署都有）。
 - 主机上有 Git Bash 和/或 WSL（缺失的后端仅首次使用时报错，不影响 pwsh）。
 
-## 插拔方式（二选一，互斥！）
+## 安装与卸载
 
-两种方式插入同一组行。**同时使用**会报 `duplicate loader entry id`，不要混用。
-
-### 方式 A：热插（推荐，无需重启）
-
-```powershell
-# 安装
-powershell -ExecutionPolicy Bypass -File .\install.ps1            # 默认 profile: web
-powershell -ExecutionPolicy Bypass -File .\install.ps1 -ProfileName <name>
-
-# 卸载
-powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
-```
-
-脚本把包链接进 `<profile>/node_modules/`（junction），维护包内 `node_modules/@deepseek-ai` junction（打包代码解析基础包所需），并把 managed 接线块写入 profile 的 `cordis.patch.yml`——`dsh web` 热重载该文件，**立即生效，无需重启**。脚本幂等，并会自动检测默认探测路径之外的 Git Bash（读取 `HKLM:\SOFTWARE\GitForWindows` 写入 `gitBash.bashPath`）。两个脚本也随 npm 包一起发布，因此从 registry 安装的用户可以直接在 `node_modules/dsh-win-multi-bash/` 下运行。
-
-### 方式 B：bundle 安装（便携，需重启）
+安装只有一条路径：`dsh plugin`（pnpm 转发器）。它把包装进 profile，bundle 层再应用本包自己的 `cordis.patch.yml`（由 `dsh.bundle.patch` 声明），由后者插入这三行——没有任何脚本去手工接线。
 
 ```powershell
 # 安装（二选一）
@@ -175,7 +161,9 @@ dsh plugin --profile web add github:@Dinosaur-MC/dsh-win-multi-bash   # GitHub �
 dsh plugin --profile web remove dsh-win-multi-bash
 ```
 
-依赖 `pnpm`（dsh plugin 是 pnpm 转发器）；bundle 层在启动时装配，**需要重启 dsh web** 生效。适用于任意 profile（首次使用会自动初始化）。
+依赖 `pnpm`；bundle 层在启动时装配，改动**需要重启 `dsh web`** 才生效。适用于任意 profile（首次使用会自动初始化）。
+
+手工等价物是 profile 的 `cordis.patch.yml`：本包 `cordis.patch.yml` 里声明的 `insert:` 行（该文件即组合接线，行内自带文档）可以手工写进 profile patch。不要两者同时做——手工块与 bundle 安装并存会让 loader 报重复 entry id。
 
 ## 验证
 
@@ -195,10 +183,10 @@ powershell -ExecutionPolicy Bypass -File .\smoke\audit.ps1
 
 | 现象 | 处理 |
 | --- | --- |
-| 新会话看不到 `git_bash` / `wsl_bash` | 检查 profile patch 里 managed 块存在、profile `node_modules/dsh-win-multi-bash` junction 存在、包内 `node_modules/@deepseek-ai` junction 存在（重跑 install.ps1）；确认运行中 `dsh web` 热重载生效 |
-| 引导失败 `duplicate loader entry id` | 两种插拔方式混用了；先卸载其中一种 |
-| 引导失败 `Cannot find package '@deepseek-ai/...'` | 包内 `node_modules/@deepseek-ai` junction 缺失（重跑 install.ps1），或 profile 运行时基础包不完整 |
-| `git_bash` 执行报找不到 bash（或去 spawn WSL 的 `WindowsApps\bash.exe` 别名并报 `spawn ... ENOENT`） | Git Bash 不在探测路径，或失效的 WSL 应用执行别名遮蔽了解析：删除 `%LOCALAPPDATA%\Microsoft\WindowsApps\bash.exe`（设置 → 应用 → 高级应用设置 → 应用执行别名），重跑 install.ps1（注册表自动检测），或手动设置 `gitBash.bashPath` |
+| 新会话看不到 `git_bash` / `wsl_bash` | 检查 profile 的 `cordis.patch.yml` 里有这三行、且 profile 能解析到 `dsh-win-multi-bash`（`dsh plugin --profile web list`）；bundle 层在启动时装配，需重启运行中的 `dsh web` |
+| 引导失败 `duplicate loader entry id` | 这些行出现了两次——profile patch 里的手工块与 bundle 安装并存；删掉其中一个 |
+| 引导失败 `Cannot find package '@deepseek-ai/...'` | profile 运行时缺少基础包（任何标准部署都有）；用 `dsh plugin --profile web add dsh-win-multi-bash` 重装 |
+| `git_bash` 执行报找不到 bash（或去 spawn WSL 的 `WindowsApps\bash.exe` 别名并报 `spawn ... ENOENT`） | Git Bash 不在探测路径，或失效的 WSL 应用执行别名遮蔽了解析：删除 `%LOCALAPPDATA%\Microsoft\WindowsApps\bash.exe`（设置 → 应用 → 高级应用设置 → 应用执行别名），或手动设置 `gitBash.bashPath` |
 | `wsl_bash` 执行报错 | `wsl.exe --status` 是否有默认发行版；可在 `wslBash.wslDistro` 指定发行版名 |
 | `wsl_bash` 报 `bwrap was not found` | 已配置 `sandbox: bwrap` 但发行版内没有 bubblewrap：按上方「沙箱行为 → 为 `wsl_bash` 启用 bwrap 沙箱」安装（`sudo apt-get install -y bubblewrap`）并重启 `dsh web`，或改用 `sandbox: auto` / `none` |
 | `wsl_bash` 沙箱报 bwrap runner 失败 | bwrap 的工作区根取 Windows 盘符路径的 Linux 侧（`/mnt/<盘符>/...`）：UNC 工作区根会响亮报错；发行版自定义了 automount 根（wsl.conf `automount.root`）时需要相应配置 |
@@ -212,8 +200,6 @@ powershell -ExecutionPolicy Bypass -File .\smoke\audit.ps1
 dsh-win-multi-bash/
 ├── package.json            # dsh.bundle + dsh.client 清单；exports 暴露 . ./client ./tool-git-bash ./tool-wsl-bash
 ├── cordis.patch.yml        # 组合接线（即文档）
-├── install.ps1             # 方式 A 热插（junction + managed 块 + Git Bash 检测）
-├── uninstall.ps1           # 方式 A 热拔
 ├── .gitattributes          # 所有文本文件 LF，二进制例外
 ├── LICENSE / THIRD_PARTY_NOTICES
 ├── lib/                    # 打包实现（纯 ESM JS，无构建步骤）
