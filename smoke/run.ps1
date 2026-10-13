@@ -97,7 +97,18 @@ try {
     Ensure-Junction $linkPlugin $pluginRoot
     Ensure-Junction $linkScope $runtimeScope
 
+    # dsh 0.2.1-alpha.2 introduced @deepseek-ai/dsh-working-directory and made its
+    # own tool-pwsh inject `workingDirectory`. That service comes from the
+    # working-directory row, which injects the `fs` service the fs-sandbox row
+    # provides, so mirror that minimal chain only when the runtime ships the
+    # package — one fixture stays valid on every supported dsh version.
+    $alpha2Rows = ''
+    if (Test-Path (Join-Path $runtimeScope 'dsh-working-directory')) {
+        $alpha2Rows = "- id: fs-sandbox`n  name: '@deepseek-ai/dsh-fs-sandbox'`n`n- id: working-directory`n  name: '@deepseek-ai/dsh-working-directory'`n"
+    }
+
     $tpl = [System.IO.File]::ReadAllText((Join-Path $smoke 'fixture.template.cordis.yml'))
+    $tpl = $tpl.Replace('__ALPHA2_SERVICE_ROWS__', $alpha2Rows)
     $default = $tpl.Replace('__BASH_PATH__', '')
     [System.IO.File]::WriteAllText((Join-Path $smoke 'fixture.default.cordis.yml'), $default, [System.Text.UTF8Encoding]::new($false))
 
