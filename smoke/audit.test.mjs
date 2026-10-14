@@ -30,7 +30,7 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -48,12 +48,16 @@ const { GitBashExecutor, candidateBashPaths, candidateExists, gitCandidatesUnder
   await import(libUrl('bash-git', 'index.js'))
 const { WslBashExecutor } = await import(libUrl('bash-wsl', 'index.js'))
 const { ownExecutor } = await import(libUrl('tool-bash', 'types', 'backend.js'))
-const { processJob, processOutcome, processSources } =
+const { processJob, processOutcome, processSources, ringDelta } =
   await import(libUrl('tool-bash', 'types', 'background.js'))
+const { renderJobRead, renderPromoted, renderResult } =
+  await import(libUrl('tool-bash', 'types', 'render.js'))
 const gitBashTool = await import(libUrl('tool-bash', 'types', 'git-bash.js'))
 const wslBashTool = await import(libUrl('tool-bash', 'types', 'wsl-bash.js'))
-const { shellDescription, toNativeWorkdir } = await import(libUrl('tool-bash', 'types', 'factory.js'))
+const { resolveSessionWorkdir, shellDescription, toNativeWorkdir, validateShellArgs } =
+  await import(libUrl('tool-bash', 'types', 'factory.js'))
 const {
+  SHELL_ARGUMENT_ORDER_SECTION,
   SHELL_EXIT_STATUS_SECTION, SHELL_FAMILY_SECTION_NAME, SHELL_FAMILY_TOOL_NAMES,
   SHELL_BACKGROUND_SECTION, SHELL_ESCALATION_SECTION, SHELL_FAMILY_ROW_SPECIFIER,
   shellFamilySectionText, shellFamilySectionOrder, composeToolDescription,
@@ -565,13 +569,35 @@ console.log('\n[A] unit: GitBashExecutor (internals hooks)')
       (error) => /refusing to run unconfined/.test(String(error?.message)),
     )
   })
-  test('the git confinement probe awaits an async child, never spawnSync', () => {
-    // The probe runs inside the tool row's `apply` (via resolveSandboxMode): a
-    // synchronous child there stalls the whole host event loop for up to
-    // probeTimeoutMs, which is a boot-time freeze for every other plugin.
-    const source = readFileSync(join(__dirname, '..', 'lib/bash-git/index.js'), 'utf8')
-    assert.ok(!/spawnSync\(runner/.test(source), 'the confinement probe must not use spawnSync')
-    assert.ok(/spawn\(runner, confined\.argv\.slice\(1\)/.test(source), 'the probe must await the async runner')
+  testAsync('the git confinement probe awaits its child instead of freezing the event loop', async () => {
+    // Behaviour, not spelling (Q2-G2-3): this probe runs inside the tool row's
+    // `apply` (via resolveSandboxMode), so the invariant is "the loop keeps
+    // advancing while it runs" — a source regex would still pass for
+    // `execFileSync`, for a renamed helper, or with one space moved.
+    const ex = bareInstance(GitBashExecutor, {
+      ctx: fakeCtx({
+        sandboxPolicy: { resolve: () => ({ mode: 'read-only', workspaceRoot: process.cwd() }), defaultMode: 'read-only' },
+        // A REAL child that outlives many event-loop turns, so an awaiting probe
+        // and a blocking one are unambiguously distinguishable.
+        sandbox: {
+          confine: async () => ({
+            argv: [process.execPath, '-e', 'setTimeout(() => {}, 400)'],
+            denialSignatures: [], runnerFailureRules: [], enforcement: 'full',
+          }),
+        },
+      }),
+      config: gitConfig({ bashPath: process.execPath, probeTimeoutMs: 4000 }),
+    })
+    const ticks = []
+    const timer = setInterval(() => ticks.push(1), 25)
+    let mode
+    try {
+      mode = await ex.resolveSandboxMode()
+    } finally {
+      clearInterval(timer)
+    }
+    assert.equal(mode, 'read-only', 'the probe verdict still settles on the policy default')
+    assert.ok(ticks.length > 0, `a synchronous probe freezes the host event loop (ticks=${ticks.length})`)
   })
   testAsync('execute(): danger-full-access bypasses confinement with honest facts', async () => {
     const ex = bareInstance(GitBashExecutor, {
@@ -984,6 +1010,143 @@ console.log('\n[A] unit: backend ownership + background-job adapters')
   })
 }
 
+console.log('\n[A] unit: job reads carry their loss/sandbox notices; the exported seams are pinned')
+{
+  // S1: a promoted foreground call takes exactly ONE consuming read, and that
+  // read advances the model's cursor to the ring's total. When it is lossy, the
+  // notice asserted here is the model's last chance to learn that output was
+  // dropped and where the retained copy lives — no later `job_output` can
+  // report it. Deleting the notice must therefore fail the gate, not just look
+  // different.
+  test('renderJobRead: a lossy read names the drop and the spill files', () => {
+    assert.equal(
+      renderJobRead('out\n', true, ['C:\\tmp\\out.log', 'C:\\tmp\\err.log']),
+      'out\n[some output was dropped from memory; full output: C:\\tmp\\out.log, C:\\tmp\\err.log]',
+    )
+    assert.equal(
+      renderJobRead('out\n', true, []),
+      'out\n[some output was dropped from memory; full output: (unavailable)]',
+    )
+  })
+  test('renderJobRead: newline discipline and the complete-read case', () => {
+    assert.equal(renderJobRead('out\n', false, ['ignored.log']), 'out\n', 'a complete read is untouched')
+    assert.equal(renderJobRead('out', true, []), 'out\n[some output was dropped from memory; full output: (unavailable)]')
+    assert.equal(renderJobRead('', false, []), '')
+    assert.equal(renderJobRead('', true, []), '[some output was dropped from memory; full output: (unavailable)]')
+  })
+  test('renderJobRead: sandbox facts ride along, with the hint only when escalation is advertised', () => {
+    const denied = renderJobRead('x\n', false, [], { mode: 'read-only', denied: true }, ['workspace-write'])
+    assert.match(denied, /\[sandbox: file access denied under read-only mode\]/)
+    assert.match(denied, /\[sandbox: escalation available — retry this exact command once with sandbox_permissions/)
+    const bare = renderJobRead('x\n', false, [], { mode: 'read-only', denied: true }, [])
+    assert.match(bare, /file access denied under read-only mode/)
+    assert.ok(!bare.includes('sandbox_permissions'), 'no escalation is offered without the parameter')
+    assert.match(
+      renderJobRead('x\n', false, [], { mode: 'workspace-write', denied: false, runnerFailed: true }, ['workspace-write']),
+      /\[sandbox: the sandbox runner itself failed under workspace-write mode — the command did not run; this is a sandbox problem, not a command failure\]/,
+    )
+  })
+  // S1's transport half: the read's own `lossy`/spill facts must reach the
+  // renderer. `ringDelta` is the text half; the call site is pinned end-to-end
+  // by the tiny-ring fixture below.
+  test('ringDelta: stdout in order, then one [stderr] section', () => {
+    assert.equal(ringDelta([{ channel: 'stdout', text: 'a\n' }, { channel: 'stderr', text: 'w\n' }]), 'a\n[stderr]\nw\n')
+    assert.equal(ringDelta([{ channel: 'stdout', text: 'a' }, { channel: 'stderr', text: 'w' }]), 'a\n[stderr]\nw')
+    assert.equal(ringDelta([{ channel: 'stderr', text: 'w' }]), '[stderr]\nw')
+    assert.equal(ringDelta([]), '')
+  })
+  // G5: a promoted foreground command's terminal detail is decided here, so a
+  // sandbox denial must not read as an ordinary nonzero exit.
+  test('processOutcome: sandbox facts join the job detail', () => {
+    assert.deepEqual(processOutcome({ status: 'completed', exitCode: 3, signal: null }),
+      { status: 'completed', detail: 'exit code: 3' })
+    assert.deepEqual(processOutcome({ status: 'killed', exitCode: null, signal: 'SIGTERM' }),
+      { status: 'killed', detail: 'signal: SIGTERM' })
+    const denied = processOutcome(
+      { status: 'completed', exitCode: 1, signal: null, sandbox: { mode: 'read-only', denied: true } },
+      ['workspace-write'],
+    )
+    assert.equal(denied.status, 'completed')
+    assert.match(denied.detail, /^exit code: 1; \[sandbox: file access denied under read-only mode\] \[sandbox: escalation available/)
+    const runner = processOutcome(
+      { status: 'completed', exitCode: 1, signal: null, sandbox: { mode: 'read-only', denied: false, runnerFailed: true } },
+      [],
+    )
+    assert.match(runner.detail, /; \[sandbox: the sandbox runner itself failed under read-only mode/)
+  })
+  // G4: the stopped marker's position is contract — after the timeout marker,
+  // before the signal/exit marker dsh's own parser anchors on.
+  test('renderResult: [stopped: …] sits after [timed out …] and before [killed by signal …]', () => {
+    const text = renderResult({
+      stdout: { text: 'x\n', truncated: false },
+      stderr: { text: '', truncated: false },
+      timedOut: true,
+      timeoutMs: 800,
+      stopped: 'cancelled by the user',
+      signal: 'SIGTERM',
+      exitCode: null,
+    }, [])
+    const positions = ['[timed out after 800ms]', '[stopped: cancelled by the user]', '[killed by signal: SIGTERM]']
+      .map((marker) => text.indexOf(marker))
+    assert.ok(positions.every((at) => at >= 0), `every marker must be present: ${text}`)
+    assert.deepEqual(positions, [...positions].sort((a, b) => a - b), `marker order is contract: ${text}`)
+  })
+  test('renderPromoted: wording and body newline discipline are dsh\'s', () => {
+    const tail = 'The command keeps running in the background. You will be notified when it finishes; '
+      + 'read newer output with job_output, stop it with job_kill.'
+    assert.equal(renderPromoted({ jobId: 'git_bash-7', timeoutMs: 800, output: 'line-1\n' }),
+      `line-1\n[still running after 800ms; moved to background job git_bash-7]\n${tail}`)
+    assert.equal(renderPromoted({ jobId: 'j', timeoutMs: 5, output: 'no-newline' }),
+      `no-newline\n[still running after 5ms; moved to background job j]\n${tail}`)
+    assert.equal(renderPromoted({ jobId: 'j', timeoutMs: 5, output: '' }),
+      `[still running after 5ms; moved to background job j]\n${tail}`)
+  })
+  // T2: these two exports exist so the semantics can be pinned directly; this
+  // is that pin (the doc comment claims it).
+  test('validateShellArgs: exactly the two alpha.2 tolerances, and the negatives around them', () => {
+    const base = { command: 'echo x', description: 'audit' }
+    assert.doesNotThrow(() => validateShellArgs({ ...base, sandbox_permissions: 'read-only' }, 'read-only'))
+    assert.doesNotThrow(() => validateShellArgs({ ...base, justification: '' }, 'read-only'))
+    assert.doesNotThrow(() => validateShellArgs({ ...base, sandbox_permissions: 'read-only', justification: '' }, 'read-only'))
+    assert.throws(() => validateShellArgs({ ...base, sandbox_permissions: 'workspace-write' }, 'read-only'), /justification/)
+    assert.throws(() => validateShellArgs({ ...base, justification: 'because' }, 'read-only'), /only valid together with/)
+    assert.throws(() => validateShellArgs({ ...base, sandbox_permissions: 'workspace-write', justification: '   ' }, 'read-only'), /non-empty sentence/)
+    assert.throws(() => validateShellArgs({ ...base, command: ' \t ' }, 'read-only'), /non-empty string/)
+    assert.throws(() => validateShellArgs({ ...base, description: '' }, 'read-only'), /non-empty string/)
+    assert.throws(() => validateShellArgs({ ...base, timeoutMs: -1 }, 'read-only'), /positive number/)
+  })
+  testAsync('resolveSessionWorkdir: the mutable directory wins, and the legacy reading is byte-identical without it', async () => {
+    const directory = join(__dirname, '..')
+    const other = join(__dirname)
+    /** The same canonicalization `resolveSessionWorkdir` applies (dsh-sandbox `canonicalPath`). */
+    const canonicalLike = (path) => { try { return realpathSync.native(path) } catch { return path } }
+    const signal = new AbortController().signal
+    const agent = { id: 'audit-agent', session: { header: { cwd: directory } } }
+    const exec = { agent, signal }
+    // rc.2 / alpha.1 shape: no service, so the previous reading stands.
+    assert.equal(await resolveSessionWorkdir({ get: () => undefined }, exec, 'P:\\root'), 'P:\\root')
+    assert.equal(await resolveSessionWorkdir({ get: () => undefined }, exec, undefined), canonicalLike(directory))
+    assert.equal(await resolveSessionWorkdir({ get: () => undefined }, { signal }, 'P:\\root'), 'P:\\root')
+    // alpha.2 shape: the service answers, and it outranks the policy root.
+    const calls = []
+    const ctx = {
+      get: (name) => name === 'workingDirectory'
+        ? { ensure: async (a, s) => { calls.push([a, s]); return other } }
+        : undefined,
+    }
+    assert.equal(await resolveSessionWorkdir(ctx, exec, 'P:\\root'), canonicalLike(other))
+    assert.deepEqual(calls, [[agent, signal]], 'ensure takes exactly (agent, signal)')
+  })
+  // T3: the ordering sentence and the schema order it describes are one fact.
+  test('the ordering sentence lives in the family section exactly once', () => {
+    assert.equal(SHELL_ARGUMENT_ORDER_SECTION, 'Provide `description` before `command` in the arguments.')
+    assert.equal(shellFamilySectionText({ background: true, escalation: true }).split(SHELL_ARGUMENT_ORDER_SECTION).length - 1, 1)
+    assert.equal(shellFamilySectionText({ background: false, escalation: false }).split(SHELL_ARGUMENT_ORDER_SECTION).length - 1, 1)
+    for (const dialect of ['msys', 'wsl'])
+      assert.ok(!shellDescription(dialect).includes('Provide `description` before `command`'), `${dialect} must not repeat it`)
+  })
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // B) Boot integration
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1376,6 +1539,36 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.deepEqual(ROWS[1].fields.map((knob) => knob.path.join('.')), volatilePaths(wslBashTool.Config))
   })
 
+  test('a non-volatile tool knob changes behaviour, not the editable surface (Q1-G1)', () => {
+    // `promoteOnTimeout` is deliberately plain (dsh declares it plain too), so it
+    // must not appear in the Plugins form. This is the invariant the (skipped)
+    // dsh-settings section used to be the only evidence for; here it runs on the
+    // schema the form is actually built from, on every runtime.
+    for (const [rowId, tool, partition] of [
+      ['win-mb-tool-git', gitBashTool, 'gitBash'],
+      ['win-mb-tool-wsl', wslBashTool, 'wslBash'],
+    ]) {
+      assert.deepEqual(Object.keys(tool.Config.dict), ['enableRunInBackground', 'promoteOnTimeout', partition])
+      assert.equal(tool.Config.dict.promoteOnTimeout.meta?.volatile, undefined, 'promoteOnTimeout must stay plain')
+      const paths = volatilePaths(tool.Config)
+      assert.ok(!paths.includes('promoteOnTimeout'), `${rowId}: promoteOnTimeout must not be projected`)
+      assert.deepEqual(ROWS.find((row) => row.rowId === rowId).fields.map((knob) => knob.path.join('.')), paths)
+    }
+  })
+
+  test('every user-visible SettingsForm label exists in both languages (Q2-G3)', () => {
+    // The knob labels are covered above; these are the form-level strings whose
+    // fallback is `en[key] ?? key` (lib/client.js textOf), i.e. a missing
+    // translation renders the raw key at the user.
+    const FORM_KEYS = ['unavailable', 'readOnly', 'saveFailed', 'save', 'saving', 'invalidNumber', 'overridden', 'reset']
+    for (const key of FORM_KEYS)
+      for (const [language, dict] of [['en', en], ['zh', zh]])
+        assert.ok(typeof dict[key] === 'string' && dict[key].length > 0, `${language} is missing "${key}"`)
+    // And the two dictionaries stay in lockstep: a key added on one side only is
+    // the same defect, one edit away.
+    assert.deepEqual(Object.keys(en).sort(), Object.keys(zh).sort(), 'en/zh must carry the same key set')
+  })
+
   test('the sandbox choices match the stance each backend accepts', () => {
     const options = (rowId) => ROWS.find((row) => row.rowId === rowId).fields.find((knob) => knob.key.endsWith('sandbox')).options
     assert.deepEqual(options('win-mb-tool-git'), unionOptions(gitBashTool.Config.dict.gitBash.dict.sandbox))
@@ -1571,7 +1764,15 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     const rowIds = [...patch.matchAll(/- id: (win-mb-[a-z-]+)/g)].map((match) => match[1])
     for (const rowId of ROWS.map((row) => row.rowId))
       assert.ok(rowIds.includes(rowId), `cordis.patch.yml must declare the row id "${rowId}"`)
-    assert.equal(rowKey('win-mb-tool-git'), 'dsh-win-multi-bash#win-mb-tool-git')
+    // Q2-G2-2: the expectation used to be a second hard-coded copy of the very
+    // string lib/client.js builds, so renaming the package would have left this
+    // green while every slot key silently stopped matching. The manifest is the
+    // one authority; the key format (`<bundle>#<rowId>`) is the platform's.
+    const { PACKAGE_NAME } = client.__internals
+    const manifestName = JSON.parse(readFileSync(join(PLUGIN, 'package.json'), 'utf8')).name
+    assert.equal(PACKAGE_NAME, manifestName, 'the browser half must key off the manifest name')
+    for (const rowId of ROWS.map((row) => row.rowId))
+      assert.equal(rowKey(rowId), `${manifestName}#${rowId}`)
     assert.deepEqual(planOps([], new Map()), [], 'no drafts, no writes')
   })
 
@@ -1663,6 +1864,11 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
       assert.equal(head.children.length, 1, 'exactly one style tag')
       assert.equal(head.children[0].dataset.plugin, PACKAGE_NAME, 'data-plugin is the reclaim key')
       assert.equal(head.children[0].dataset.pluginCss, STYLE_ID, 'data-plugin-css is the platform injector name')
+      // Q2-G2-1: comparing the attribute with the constant that wrote it has no
+      // discriminating power (`dsh-win-multi-bash` or `x.js` would both pass).
+      // The platform's own injector rule is `${id}/${basename(fileId)}`
+      // (packages/client/tsdown.client.ts:46), so pin the SHAPE here.
+      assert.match(STYLE_ID, /^dsh-win-multi-bash\/client\.js$/, 'the style id follows the platform injector rule')
       const noop = installStyles()
       assert.equal(head.children.length, 1, 'a second install adds nothing')
       noop()
@@ -1685,6 +1891,104 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
       useRowForm: (select) => { hookCalls += 1; return select(state) },
     }), zh.summary)
     assert.equal(hookCalls, 1, 'a summary render must run the hook, or a reused instance breaks hook order')
+    form.dispose()
+  })
+
+  // ── client half · task-12 remediation guards (landed from client-fix2.md §4) ──
+  // Verbatim text: the author executed exactly these bodies against four
+  // mutation bodies (control 5/0; each guard red under its own mutation).
+
+  // Q2-G2-2 客户端侧：slot key 只有一份拼写（行为相同，故只能查源码）
+  test('the slot key has one spelling: PACKAGE_NAME, not a second literal', () => {
+    const source = readFileSync(join(PLUGIN, 'lib', 'client.js'), 'utf8')
+    assert.equal(rowKey('win-mb-tool-git'), `${client.__internals.PACKAGE_NAME}#win-mb-tool-git`)
+    assert.ok(!source.includes('dsh-win-multi-bash#'), 'the key must be built as `${PACKAGE_NAME}#${rowId}`')
+  })
+
+  await testAsync('a save already crossing the wire is not re-entered (Q2-G1)', async () => {
+    // The second save would carry the baseline the first one already spent; the
+    // Host refuses that stale fence and the refusal would raise a failure banner
+    // over drafts the first save cleared — nothing left for the user to correct.
+    const { RowConfigForm, ROWS } = client.__internals
+    let revision = 7
+    const waiters = []
+    const calls = []
+    const scope = {
+      calls,
+      getSnapshot: () => ({
+        status: 'ready', writable: true, revision,
+        value: { enableRunInBackground: true, gitBash: { sandbox: 'auto', probeTimeoutMs: 10000 } },
+        base: { gitBash: { sandbox: 'auto' } }, user: {},
+      }),
+      subscribe: () => () => {},
+      // The Host fence is strict equality (packages/settings/settings/src/index.ts:393-394).
+      mutate: async (ops, expectedRevision) => {
+        const accepted = expectedRevision === undefined || expectedRevision === revision
+        calls.push({ ops, expectedRevision, accepted })
+        await new Promise((settle) => { waiters.push(settle) })
+        if (accepted) revision += 1
+        return accepted
+      },
+    }
+    const form = new RowConfigForm(scope, ROWS[0])
+    form.edit('gitBash.probeTimeoutMs', '12345')
+    const first = form.save()
+    const second = form.save() // re-entrant, while the first is in flight
+    for (const settle of waiters.splice(0)) settle()
+    await first
+    await second
+    assert.equal(calls.length, 1, 'the re-entrant save must not reach mutate')
+    assert.equal(form.project().failed, false, 'and it must not raise the failure banner')
+    assert.equal(form.project().dirty, false, 'the accepted save cleared its drafts')
+    form.dispose()
+  })
+
+  test('the stylesheet installer survives a host with no head (Q2-A1)', () => {
+    // `installStyles` runs inside `ctx.effect`: a throw here takes both Configure
+    // pages, the core-row badge and the note down with it.
+    const { installStyles } = client.__internals
+    const head = { children: [], appendChild(node) { head.children.push(node) } }
+    const documentStub = { // deliberately no `head`
+      createElement(tag) {
+        const node = { tag, dataset: {}, textContent: '', remove() { const at = head.children.indexOf(node); if (at >= 0) head.children.splice(at, 1) } }
+        return node
+      },
+      querySelector: () => null, // unreachable while the installer bails out on a head-less host
+    }
+    const had = globalThis.document
+    globalThis.document = documentStub
+    try {
+      assert.equal(typeof installStyles(), 'function', 'the installer still answers with a disposer')
+      assert.equal(head.children.length, 0, 'and appends nothing')
+      const slotRegistrations = []
+      assert.doesNotThrow(() => client.apply({
+        locale: { register: () => () => {}, bind: () => (key) => key },
+        configForms: { get: () => fakeScope(), whileServed: (names, callback) => { callback(new Set(names)); return () => {} } },
+        slots: { inject: (_name, register) => register(), register: (options, component) => { slotRegistrations.push({ options, component }); return () => {} } },
+        effect: (callback) => callback(),
+      }), 'apply must not throw on a head-less host')
+      const pages = slotRegistrations.filter((entry) => entry.options.name === 'plugins.row.config')
+      assert.deepEqual(pages.map((entry) => entry.options.key), [
+        rowKey('win-mb-tool-git'), rowKey('win-mb-tool-wsl'),
+      ], 'both Configure pages still registered')
+    } finally {
+      if (had === undefined) delete globalThis.document
+      else globalThis.document = had
+    }
+  })
+
+  await testAsync('an unknown key stages nothing, in edit and resetField alike (Q2-A2)', async () => {
+    // The phantom draft is inert on the public surface (planOps ignores it and
+    // `dirty` stays false), so this guard has to read the staged map.
+    const { RowConfigForm, ROWS } = client.__internals
+    const scope = fakeScope()
+    const form = new RowConfigForm(scope, ROWS[0])
+    form.edit('gitBash.nonexistent', 'x')
+    form.resetField('gitBash.nonexistent') // before the fix this latched a phantom draft + baseline
+    assert.equal(form.staged.size, 0, 'no draft for a key no control renders')
+    assert.equal(form.baseline, undefined, 'and no baseline is latched for it')
+    await form.save()
+    assert.deepEqual(scope.calls, [], 'a save with only phantom drafts writes nothing')
     form.dispose()
   })
 
@@ -1809,6 +2113,20 @@ console.log('\n[B] boot integration: default fixture (pinned via probed bash)')
       ['boot: tools registered (git_bash, wsl_bash + job tools)', async () => {
         const names = ctx.tools.schemas().map((t) => t.name)
         for (const n of ['git_bash', 'wsl_bash', 'job_output', 'job_kill']) assert.ok(names.includes(n), `missing ${n}`)
+      }],
+      ['boot: both shell tools declare `description` before `command` (the family section\'s ordering sentence)', async () => {
+        // T3: the prompt sentence `Provide description before command…` is only
+        // true while the schemas actually declare that order (the SDK projects
+        // `properties` in declaration order), so the two are pinned together.
+        for (const name of ['git_bash', 'wsl_bash']) {
+          const schema = ctx.tools.schemas().find((candidate) => candidate.name === name)
+          assert.deepEqual(Object.keys(schema.parameters.properties).slice(0, 2), ['description', 'command'], name)
+          assert.deepEqual(schema.parameters.required.slice(0, 2), ['description', 'command'], name)
+        }
+      }],
+      ['boot: the assembled prompt carries the ordering sentence exactly once', async () => {
+        const { prompt } = await assembledPrompt(ctx)
+        assert.equal(prompt.split(SHELL_ARGUMENT_ORDER_SECTION).length - 1, 1)
       }],
       ['seat: ctx.shell is still provided by the base pwsh-sandbox row', async () => {
         // The regression guard. Pre-migration our rows owned this seat; when
@@ -2012,6 +2330,77 @@ console.log('\n[B] boot integration: promote-on-timeout (shipped default, SERIAL
           assert.match(read, /running|no new output/i)
           await execTool(ctx, 'job_kill', { job_id: jobId })
         }],
+        ['git_bash: an outside job_kill during the wait is reported as [stopped: …] (G4)', async () => {
+          // The point of registering the foreground call as a job: it is
+          // killable while the call still waits, and the model is told the kill
+          // was not its command failing. dsh has the same end-to-end test
+          // (tool-bash/tests/background.spec.ts:260-269).
+          const pending = ctx.tools.execute({
+            signal: new AbortController().signal,
+            callId: ToolCallId(`audit-stopped-${Math.random().toString(36).slice(2)}`),
+            name: 'git_bash',
+            arguments: { description: 'audit stopped marker', command: 'echo started; sleep 5', timeoutMs: 30000 },
+          })
+          let jobId
+          for (let attempt = 0; attempt < 100 && jobId === undefined; attempt += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 50))
+            jobId = ctx.jobs.list(undefined).find((job) => job.status === 'running' && job.label === 'echo started; sleep 5')?.id
+          }
+          assert.ok(jobId !== undefined, 'a foreground command must be a visible job while it waits')
+          await execTool(ctx, 'job_kill', { job_id: jobId, reason: 'audit stop' })
+          const result = await pending
+          const text = (result.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('')
+          assert.equal(result.value.kind, 'foreground')
+          assert.equal(result.value.stopped, 'audit stop', 'the outside kill reason travels into the value')
+          assert.match(text, /\[stopped: audit stop\]/)
+        }],
+      ])
+    } finally {
+      if (ctx) await ctx.fiber.dispose()
+    }
+  }
+}
+
+console.log('\n[B] boot integration: a promoted call whose read lost output reports it (S1)')
+{
+  if (!HAS_GIT_BASH) {
+    console.log('  … skipping lossy-promote fixture: no Git Bash probed on this host')
+  } else {
+    let ctx
+    try {
+      // The real registry with a deliberately tiny ring: the promoted call's one
+      // consuming read then falls behind whatever the command already printed, so
+      // `lossy` is true deterministically (dsh-jobs-local `retainBytes`). This is
+      // the shape that used to hand the model a truncated prefix with no notice
+      // and no pointer to the retained output.
+      const patchPath = join(FIXTURE_DIR, 'tiny-ring.patch.yml')
+      writeFileSync(patchPath, '- id: tasks\n  config:\n    retainBytes: 32\n')
+      writtenFixtures.push(patchPath)
+      ctx = await bootFixture(PLUGIN_ROWS(GIT_BASH), 'tiny-ring.yml', loadOverlayPatches('dsh-wmb-audit', patchPath))
+      await runTests(ctx, [
+        ['a lossy promoting read names the dropped output (and its spill pointer if any)', async () => {
+          const command = 'i=0; while [ $i -lt 40 ]; do echo line-$i; i=$((i+1)); done; sleep 5'
+          const result = await execToolResult(ctx, 'git_bash', { command, timeoutMs: 1200 })
+          assert.ok(!result.isError, `unexpected error: ${String(result.error)}`)
+          assert.match(result.text, /\[still running after 1200ms; moved to background job [^\]]+\]/, result.text)
+          assert.match(
+            result.text,
+            /\[some output was dropped from memory; full output: [^\]]+\]/,
+            'the promoted result must report the evicted bytes: ' + result.text,
+          )
+          const jobId = /moved to background job ([^\]]+)\]/.exec(result.text)?.[1]
+          await execTool(ctx, 'job_kill', { job_id: jobId, reason: 'audit cleanup' })
+        }],
+        ['a complete promoting read adds no notice', async () => {
+          // Same tiny ring, but the command prints nothing before the deadline:
+          // no bytes were evicted, so no notice may appear.
+          const result = await execToolResult(ctx, 'git_bash', { command: 'sleep 5', timeoutMs: 1200 })
+          assert.ok(!result.isError, `unexpected error: ${String(result.error)}`)
+          assert.match(result.text, /\[still running after 1200ms; moved to background job [^\]]+\]/)
+          assert.ok(!result.text.includes('dropped from memory'), `no loss notice expected: ${result.text}`)
+          const jobId = /moved to background job ([^\]]+)\]/.exec(result.text)?.[1]
+          await execTool(ctx, 'job_kill', { job_id: jobId, reason: 'audit cleanup' })
+        }],
       ])
     } finally {
       if (ctx) await ctx.fiber.dispose()
@@ -2156,27 +2545,41 @@ console.log('\n[B] boot integration: shell prompt section state matrix (one copy
   // text at all with neither. Every state also pins that the section never
   // repeats a fact in itself, and that the whole assembled prompt has no two
   // identical blocks (the shape the old per-tool registration produced).
+  // The no-registry state needs its own overlay: `tasks`/`tool-jobs` off. It
+  // exists because the parameter and its guidance follow CONFIG now (task-13 /
+  // commit 5fbc8ce), so a composition without a registry still advertises
+  // `run_in_background` and still carries the background paragraph — while the
+  // call itself fails loud. dsh's own tool drops both in that shape; README.md /
+  // README.zh.md "与基座差异" records the tradeoff, and this state pins it.
+  const NO_JOBS_PATCH_PATH = join(FIXTURE_DIR, 'prompt-state-no-jobs.patch.yml')
+  writeFileSync(NO_JOBS_PATCH_PATH, '- id: tasks\n  disabled: true\n\n- id: tool-jobs\n  disabled: true\n')
+  writtenFixtures.push(NO_JOBS_PATCH_PATH)
+  const NO_JOBS_PATCHES = loadOverlayPatches('dsh-wmb-audit', NO_JOBS_PATCH_PATH)
+
   const STATES = [
-    ['both tools', () => PLUGIN_ROWS(GIT_BASH), ['git_bash', 'wsl_bash'], true, false],
-    ['git_bash only', () => GIT_ONLY_ROWS(GIT_BASH), ['git_bash'], true, false],
-    ['wsl_bash only', () => WSL_ONLY_ROWS, ['wsl_bash'], false, false],
-    ['no tool', () => SHELL_PROMPT_ONLY_ROWS, [], false, false],
+    ['both tools', () => PLUGIN_ROWS(GIT_BASH), ['git_bash', 'wsl_bash'], true, false, true, undefined],
+    ['git_bash only', () => GIT_ONLY_ROWS(GIT_BASH), ['git_bash'], true, false, true, undefined],
+    ['wsl_bash only', () => WSL_ONLY_ROWS, ['wsl_bash'], false, false, true, undefined],
+    ['no tool', () => SHELL_PROMPT_ONLY_ROWS, [], false, false, false, undefined],
     // dsh's own pwsh tool alongside ours: it registers its own section and
     // repeats a few of these facts in its own description, and the family
     // section must be unaffected by its presence.
     ['both tools + dsh tool-pwsh', () => `${PLUGIN_ROWS(GIT_BASH)}
 - id: tool-pwsh
   name: '@deepseek-ai/dsh-tool-pwsh'
-`, ['git_bash', 'wsl_bash'], true, true],
+`, ['git_bash', 'wsl_bash'], true, true, true, undefined],
+    // No job registry composed at all: the shipped default still advertises and
+    // still guides, because `background` follows `enableRunInBackground` alone.
+    ['both tools, no job registry', () => PLUGIN_ROWS(GIT_BASH), ['git_bash', 'wsl_bash'], true, false, true, NO_JOBS_PATCHES],
   ]
-  for (const [label, rows, expectedTools, needsGit, expectPwsh] of STATES) {
+  for (const [label, rows, expectedTools, needsGit, expectPwsh, expectBackground, patches] of STATES) {
     if (needsGit && !HAS_GIT_BASH) {
       console.log(`  … skipping ${label}: no Git Bash probed on this host`)
       continue
     }
     let ctx
     try {
-      ctx = await bootFixture(rows(), `prompt-state-${label.replace(/[^a-z0-9]+/gi, '-')}.yml`)
+      ctx = await bootFixture(rows(), `prompt-state-${label.replace(/[^a-z0-9]+/gi, '-')}.yml`, patches)
       // Markers make the placement claim end-to-end: the section must land
       // between the two seats dsh allocates to shell tools.
       ctx.systemPrompt.section({ name: 'audit:order-bash', order: ctx.systemPrompt.getSectionOrder('TOOL_BASH'), text: 'audit bash marker' })
@@ -2207,6 +2610,15 @@ console.log('\n[B] boot integration: shell prompt section state matrix (one copy
         [`${label}: gated facts match what the mounted tools advertise`, async () => {
           assert.equal(familyText.includes(SHELL_BACKGROUND_SECTION), advertises('run_in_background'), 'background guidance must follow the parameter')
           assert.equal(familyText.includes(SHELL_ESCALATION_SECTION), advertises('sandbox_permissions'), 'escalation contract must follow the parameter')
+        }],
+        [`${label}: the background paragraph tracks the parameter, exactly`, async () => {
+          // A hard expectation from the state table, not an equality between two
+          // readings taken at runtime (the old form passed even when the
+          // parameter was silently missing).
+          assert.equal(advertises('run_in_background'), expectBackground, `${label}: expected the parameter to be ${expectBackground ? 'advertised' : 'absent'}`)
+          assert.equal(familyText.includes(SHELL_BACKGROUND_SECTION), expectBackground)
+          if (label === 'both tools, no job registry')
+            assert.equal(ctx.get('jobs'), undefined, 'this state must compose no job registry')
         }],
         [`${label}: the section text is exactly a function of the family tools mounted`, async () => {
           // No other row's tool, description or section may contribute a word
@@ -2247,6 +2659,16 @@ console.log('\n[B] boot integration: dsh-settings projection of the two rows (re
   // claim "these options are editable in the panel" is exactly "settings
   // describes these two entry ids with these live values". Read-only: this test
   // never mutates the document.
+  //
+  // KNOWN-SKIPPED ON EVERY RUNTIME SO FAR (Q1-G1): this fixture mounts
+  // `@deepseek-ai/dsh-settings`, which injects configEditor/profileContext and
+  // therefore never activates here — the run prints
+  // `settings … pending (waiting for services: configEditor, profileContext)`
+  // and the block below is skipped. It is kept as an integration probe for a
+  // runtime that does compose those services, NOT as part of the gate; the
+  // invariant it argues for (a non-volatile knob never becomes editable) is
+  // asserted unconditionally in the unit section above
+  // (`a non-volatile tool knob changes behaviour, not the editable surface`).
   let ctx
   try {
     ctx = await bootFixture(`${SHELL_PROMPT_ONLY_ROWS}
@@ -2274,13 +2696,13 @@ console.log('\n[B] boot integration: dsh-settings projection of the two rows (re
           assert.deepEqual(Object.keys(form.value).sort(), ['enableRunInBackground', 'gitBash'])
           assert.equal(form.value.enableRunInBackground, true)
           assert.equal(form.value.gitBash.sandbox, 'auto')
-          assert.equal(form.value.gitBash.probeTimeoutMs, 10000)
+          assert.equal(form.value.gitBash.probeTimeoutMs, 4000)
           assert.equal(form.value.gitBash.requireSandbox, false)
         }],
         ['the wsl_bash form reports its own partition only', async () => {
           const form = forms.get('win-mb-tool-wsl')
           assert.deepEqual(Object.keys(form.value).sort(), ['enableRunInBackground', 'wslBash'])
-          assert.equal(form.value.wslBash.probeTimeoutMs, 30000)
+          assert.equal(form.value.wslBash.probeTimeoutMs, 8000)
           assert.equal(form.value.wslBash.sandbox, 'auto')
         }],
         ['nothing outside the volatile projection is editable', async () => {
