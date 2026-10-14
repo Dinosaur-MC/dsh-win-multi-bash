@@ -1,3 +1,40 @@
+# dsh-win-multi-bash v0.5.0
+
+## Improvements
+
+- **A foreground timeout keeps the command running as a background job.** A foreground call that outlives `timeoutMs` is promoted instead of killed, the result says so, and reading it names any dropped output together with its spill file — dsh's own shell tools behave the same way. A new `promoteOnTimeout` knob (default on, deliberately not on the Plugins page) turns promotion off; with `enableRunInBackground: false`, a timeout still kills the command exactly as before. **Act only if you relied on timeouts killing the command.**
+- **Foreground commands are registered as jobs from the start.** They appear in the task tools and can be killed with `job_kill`; a kill from outside the call is reported as `[stopped: …]` rather than as a command failure, so the model does not retry it.
+- **The sandbox result now says what actually happened.** A run that was not wrapped by a sandbox reports `sandbox.unconfined: true`; when the reason is a failed `sandbox: auto` probe, every result carries a short note and the first one per row load carries the full explanation with both ways out. An explicit `sandbox: none` carries the fact without any note, and `danger-full-access` carries neither.
+- **`denied` is optional and never guessed.** It is `true` when a failed confined run's output matches the backend's denial dialect, `false` on success, and **absent** when nothing matched — with a note pointing at stderr instead of a claim nobody observed. Each row also learns its host's dialect once, from a deliberately-denied harmless write outside the workspace root (the backend's own signatures are kept as the union).
+- **The Windows sandbox boundary is documented from measurement.** The ACL backend's grant follows the object rather than the path, reads stay unconfined, and dsh rates that backend `partial`. On a host whose runner cannot start MSYS bash at all, `git_bash` reports on every call that it ran unconfined; `requireSandbox: true` is the fail-closed alternative there (it refuses every command rather than degrading).
+- **`run_in_background` follows the configuration, not the job registry.** With no job registry composed the parameter is still advertised and the call fails loudly naming the missing packages; previously the parameter silently disappeared from the schema depending on load order.
+
+## Bug fixes
+
+- **A failed confinement runner no longer silently re-runs unconfined.** It fails closed with actionable text (retry with `sandbox_permissions: "danger-full-access"`, or set `sandbox: none` on the row). **Act only if you relied on the silent fallback.**
+- **`wsl_bash`'s bubblewrap profile is complete and its probe is functional.** The profile now carries `--unshare-pid` and the wrapper keeps the separator `bwrap <profile> -- <command>`, so a confined command can no longer reach the host through procfs magic links; the probe builds the same profile and actually runs a command instead of checking that `bwrap` exists.
+- **`git_bash`'s confinement probe no longer blocks the event loop** (it spawns asynchronously; default probe bound 4 s, WSL 8 s).
+- **`wsl_bash` accepts MSYS-style paths and `wslDistro` consistently**, and passes the working directory explicitly so the starting directory is a property of the call rather than of the distro.
+- **Promoted results are loss-aware**: a promotion that dropped output names the dropped bytes and the spill file, matching the foreground path.
+- **The Plugins page saves are fenced**: platform-driven saves no longer race the staged draft, style installation is guarded, `resetField` validates its key, and the row key has a single source.
+
+## Compatibility
+
+- **`install.ps1` and `uninstall.ps1` are gone; the tarball is 20 files (22 before).** Install or upgrade with `dsh plugin --profile web add dsh-win-multi-bash`, or add the patch rows by hand — a profile that still lists a `files` entry for the removed scripts is unaffected, since nothing loads them.
+- **`sandbox.denied` may be absent** (see above). A consumer that reads it must tolerate a missing field; `sandbox.unconfined` is new and equally optional.
+- **Confinement runner failures now fail closed** instead of degrading to an unwrapped run.
+- **The tool parameter table matches dsh's ordering** (`description` before `command`) and results carry `cwd` plus presentation metadata; both are additive for existing callers.
+- YAML written by hand keeps working; the knobs that were already volatile are unchanged, and `promoteOnTimeout` is read from the row's config only.
+
+## Verification
+
+Verified on dsh **0.2.1-alpha.2** and **0.2.0-rc.2**.
+
+- `smoke/audit.test.mjs`: **293 checks, 0 failures** (224 at v0.4.0), run three times per gate on rc.2 plus once against an isolated alpha.2 device; it covers the prompt dedup matrix, the volatile config projection, the browser half's form contract, the job/promotion behaviour, the sandbox facts and their once-per-load wording, and the repository records (bilingual hashes, LF, package `files`).
+- `npm test` (`smoke/run.ps1`): exit 0 — `git_bash`, `wsl_bash` and the base bundle's own `pwsh` seat each ran a real command in both the schema-default and pinned-`bashPath` variants.
+- `npm pack --dry-run`: 20 files, no `install.ps1` / `uninstall.ps1`.
+- Real-machine sandbox measurements behind the notes above: a WSL/bubblewrap write outside the workspace is refused and the row learns that host's refusal text (~0.3 s, once per row load); on the Windows host tested, the ACL runner cannot start MSYS bash, so `git_bash` reports `unconfined` per call.
+
 # dsh-win-multi-bash v0.4.0
 
 ## Improvements
