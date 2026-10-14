@@ -1,3 +1,23 @@
+# dsh-win-multi-bash v0.5.1
+
+## Bug fixes
+
+- **A configured shell path or distribution name that does not work is now reported instead of failing obscurely.** A pinned `bashPath` / `wslPath` that does not exist used to be handed straight to the command, so the first symptom was a bare `spawn ENOENT`; a pinned `wslDistro` that is not installed made every command fail with `WSL_E_DISTRO_NOT_FOUND`. The executor now logs one warning naming the value, falls back **at runtime** (auto-discovery for a shell path; the first finished distribution for the distribution name), and leaves the stored value exactly as you wrote it.
+- **Text knobs are trimmed when you save, and the trimmed value is shown back**, so what the page displays is what the profile stores. Blanking a field still clears it.
+
+## Compatibility
+
+- **The plugin never rewrites or deletes your configuration.** A value that fails the *syntax* check the page can make — a path that is not absolute, a distribution name containing spaces or quotes, a number that is not finite — shows a warning and is **still saved exactly as typed**; the fallback happens only at runtime. An existing value that would not pass that check today is left byte-for-byte untouched until you save it again.
+- The page's *syntax* check is deliberately not an existence check: a browser half cannot see your filesystem, so whether a path is real is decided when a command runs.
+
+## Verification
+
+Verified on dsh **0.2.1-alpha.2** and **0.2.0-rc.2**.
+
+- `smoke/audit.test.mjs`: **301 checks, 0 failures** (293 at v0.5.0), run three times on rc.2 plus once against an isolated alpha.2 device.
+- The stored-value guarantee is asserted, not assumed: with a value containing stray spaces in the profile, the form projects **no write at all** and the configuration bytes are identical before and after (checked by the audit and by a standalone probe).
+- `npm test` (`smoke/run.ps1`) and `npm pack --dry-run` (20 files) were green on the v0.5.0 tree; this release changes no shipped file except `lib/client.js`, the two executors and their tests.
+
 # dsh-win-multi-bash v0.5.0
 
 ## Improvements
