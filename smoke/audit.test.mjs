@@ -30,9 +30,10 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
+import { createRequire } from 'node:module'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 // ── helpers / imports ────────────────────────────────────────────────────────
@@ -346,6 +347,76 @@ console.log('\n[A] unit: vendor/bwrap-profiles.js')
   })
 }
 
+console.log('\n[A] unit: the vendored bwrap profile against the upstream artifact (drift guard)')
+{
+  // The profile is a vendored COPY (upstream's builder cannot be imported at
+  // runtime: `dsh-sandbox-local`'s `lib/*` is not exported and its main entry
+  // pulls the landlock native addon), so nothing else would notice when a dsh
+  // upgrade changes a mount flag. This reads the upstream artifact by ABSOLUTE
+  // PATH — `require.resolve('@deepseek-ai/dsh-sandbox-local/package.json')` for
+  // the package directory, never an exports subpath — and compares item by item.
+  //
+  // Two install shapes exist, in this order: a source install ships
+  // `src/profiles.ts`; the published package ships only the compiled
+  // `lib/index.js` bundle (which is what the runtime actually executes). With
+  // neither present the guard skips LOUDLY, naming the paths it tried, so a
+  // missing upstream package can never masquerade as "no drift".
+  const requireFromAudit = createRequire(import.meta.url)
+  const upstream = (() => {
+    try {
+      const pkgDir = dirname(requireFromAudit.resolve('@deepseek-ai/dsh-sandbox-local/package.json'))
+      for (const [shape, path] of [
+        ['src/profiles.ts', join(pkgDir, 'src', 'profiles.ts')],
+        ['lib/index.js (compiled bundle)', join(pkgDir, 'lib', 'index.js')],
+      ]) {
+        if (existsSync(path)) return { shape, path, text: readFileSync(path, 'utf8') }
+      }
+      console.log(`  … skipping bwrap drift guard: no profiles artifact under ${pkgDir} (tried src/profiles.ts, lib/index.js)`)
+      return undefined
+    } catch (error) {
+      console.log(`  … skipping bwrap drift guard: @deepseek-ai/dsh-sandbox-local is not installed (${String(error?.code ?? error)})`)
+      return undefined
+    }
+  })()
+
+  if (upstream === undefined) {
+    console.log('    (this is a drift detector, not a gate on runtimes without the upstream package)')
+  } else {
+    /** Every quoted literal inside a source snippet, in order. */
+    const literalsIn = (text) => [...text.matchAll(/(?:"([^"]+)"|'([^']+)')/g)].map((match) => match[1] ?? match[2])
+    const prefixMatch = /\[\s*(?:"|')--ro-bind(?:"|')[\s\S]*?\]/.exec(upstream.text)
+    test(`the upstream profile is readable and carries the --ro-bind prefix (${upstream.shape})`, () => {
+      assert.ok(prefixMatch !== null, `no --ro-bind array literal found in ${upstream.path}`)
+    })
+    const upstreamPrefix = prefixMatch === null ? [] : literalsIn(prefixMatch[0])
+
+    test('the vendored read-only profile matches upstream item by item', () => {
+      const ours = bwrapProfileArgs({ mode: 'read-only', workspaceRoot: '/mnt/g/LAB' })
+      const missing = upstreamPrefix.filter((arg) => !ours.includes(arg))
+      const extra = ours.filter((arg) => !upstreamPrefix.includes(arg))
+      assert.deepEqual({ missing, extra }, { missing: [], extra: [] },
+        `the vendored profile drifted from ${upstream.path}`)
+      assert.deepEqual(ours, upstreamPrefix, `the vendored profile's ORDER differs from ${upstream.path}`)
+    })
+
+    test('the workspace-write additions match upstream\'s push literals', () => {
+      const pushes = [...upstream.text.matchAll(/args\.push\(([\s\S]*?)\);/g)].map((match) => literalsIn(match[1]))
+      const ours = bwrapProfileArgs({ mode: 'workspace-write', workspaceRoot: '/mnt/g/LAB' })
+      const suffix = ours.slice(upstreamPrefix.length)
+      assert.deepEqual(suffix.slice(0, 2), ['--tmpfs', '/tmp'], `--tmpfs /tmp drifted from ${upstream.path}`)
+      assert.equal(suffix[2], '--bind', `--bind drifted from ${upstream.path}`)
+      assert.deepEqual(suffix.slice(3), ['/mnt/g/LAB', '/mnt/g/LAB'], 'the bind operands are the policy root, twice')
+      assert.equal(suffix.length, 5, 'workspace-write adds exactly --tmpfs /tmp and --bind root root')
+      if (pushes.length > 0) {
+        assert.deepEqual(pushes[0], ['--tmpfs', '/tmp'], `upstream's first push changed in ${upstream.path}`)
+        // Upstream's bind push carries identifier operands, so only its flag is a
+        // comparable literal; when the shape ever changes this names the file.
+        if (pushes.length > 1) assert.equal(pushes[1][0], '--bind', `upstream's bind push changed in ${upstream.path}`)
+      }
+    })
+  }
+}
+
 console.log('\n[A] unit: config schemas')
 {
   test('GitBashExecutor.Config defaults sandbox=auto', () => {
@@ -578,15 +649,19 @@ console.log('\n[A] unit: GitBashExecutor (internals hooks)')
       ctx: fakeCtx({
         sandboxPolicy: { resolve: () => ({ mode: 'read-only', workspaceRoot: process.cwd() }), defaultMode: 'read-only' },
         // A REAL child that outlives many event-loop turns, so an awaiting probe
-        // and a blocking one are unambiguously distinguishable.
+        // and a blocking one are unambiguously distinguishable. The margins are
+        // deliberately wide (800ms child, 20s probe deadline): a cold `node -e`
+        // start under load has been seen to take seconds, and a probe deadline
+        // that merely *races* the child would turn a deterministic invariant
+        // into a flake.
         sandbox: {
           confine: async () => ({
-            argv: [process.execPath, '-e', 'setTimeout(() => {}, 400)'],
+            argv: [process.execPath, '-e', 'setTimeout(() => {}, 800)'],
             denialSignatures: [], runnerFailureRules: [], enforcement: 'full',
           }),
         },
       }),
-      config: gitConfig({ bashPath: process.execPath, probeTimeoutMs: 4000 }),
+      config: gitConfig({ bashPath: process.execPath, probeTimeoutMs: 20000 }),
     })
     const ticks = []
     const timer = setInterval(() => ticks.push(1), 25)
@@ -864,6 +939,17 @@ console.log('\n[A] unit: WslBashExecutor (internals hooks)')
     assert.ok(bwrap.includes('--bind'))
     assert.ok(bwrap.includes('/mnt/g/LAB/202608'))
     assert.ok(bwrap.includes('--tmpfs'))
+    // The profile/command separator upstream uses (`sandbox-local/src/index.ts:330`):
+    // without it a profile argument could be read as the command.
+    const separator = bwrap.indexOf('--', 1)
+    assert.ok(separator > 1, 'the profile must be followed by an explicit -- separator')
+    assert.deepEqual(bwrap.slice(separator, separator + 3), ['--', 'bash', '-c'])
+    // And the embedded profile is exactly the vendored builder's output, so the
+    // argv stays comparable to upstream's item for item.
+    assert.deepEqual(
+      bwrap.slice(1, separator),
+      bwrapProfileArgs({ mode: 'workspace-write', workspaceRoot: '/mnt/g/LAB/202608' }),
+    )
   })
   test('bwrapArgv(): read-only mode has no --bind/--tmpfs', () => {
     const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: 'C:\\wsl.exe' }) })
@@ -875,6 +961,14 @@ console.log('\n[A] unit: WslBashExecutor (internals hooks)')
     })
     assert.ok(!argv.includes('--bind'))
     assert.ok(!argv.includes('--tmpfs'))
+    const bwrap = argv.slice(argv.indexOf('--') + 1)
+    const separator = bwrap.indexOf('--', 1)
+    assert.deepEqual(
+      bwrap.slice(1, separator),
+      bwrapProfileArgs({ mode: 'read-only', workspaceRoot: '/mnt/g/LAB/202608' }),
+      'read-only wraps with exactly the read-only profile',
+    )
+    assert.deepEqual(bwrap.slice(separator, separator + 3), ['--', 'bash', '-c'])
   })
   test('bwrapArgv(): UNC/non-drive workspace root fails loud', () => {
     const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: 'C:\\wsl.exe' }) })
