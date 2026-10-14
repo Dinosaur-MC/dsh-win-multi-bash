@@ -41,7 +41,7 @@ const __dirname = fileURLToPath(new URL('.', import.meta.url))
 const lib = join(__dirname, '..', 'lib')
 const libUrl = (...parts) => pathToFileURL(join(lib, ...parts)).href
 
-const { isRunnerSpawnFailure, classifyDenial, classifyRunnerFailure, matchesSignature } =
+const { isRunnerSpawnFailure, classifyDenial, classifyRunnerFailure, denialFacts, learnedDenialSignature, matchesSignature } =
   await import(libUrl('vendor', 'helpers.js'))
 const { BWRAP_RUNNER_FAILURE_RULES, bwrapProfileArgs } =
   await import(libUrl('vendor', 'bwrap-profiles.js'))
@@ -51,7 +51,7 @@ const { WslBashExecutor } = await import(libUrl('bash-wsl', 'index.js'))
 const { ownExecutor } = await import(libUrl('tool-bash', 'types', 'backend.js'))
 const { processJob, processOutcome, processSources, ringDelta } =
   await import(libUrl('tool-bash', 'types', 'background.js'))
-const { renderJobRead, renderPromoted, renderResult, unconfinedDetailMarker, unconfinedMarker } =
+const { renderJobRead, renderPromoted, renderResult, unconfinedDetailMarker, unconfinedMarker, unmatchedDialectMarker } =
   await import(libUrl('tool-bash', 'types', 'render.js'))
 const gitBashTool = await import(libUrl('tool-bash', 'types', 'git-bash.js'))
 const wslBashTool = await import(libUrl('tool-bash', 'types', 'wsl-bash.js'))
@@ -342,6 +342,33 @@ console.log('\n[A] unit: vendor/bwrap-profiles.js')
     assert.deepEqual(args.slice(-4), ['/tmp', '--bind', '/mnt/g/LAB', '/mnt/g/LAB'])
     assert.ok(args.includes('--tmpfs'))
   })
+  // task-19: the `denied` fact may be absent on purpose, and a refusal can teach
+  // this host's dialect.
+  test('denialFacts: matched → true, success → false, unknown failure → absent', () => {
+    const signatures = ['access is denied', 'read-only file system']
+    assert.deepEqual(denialFacts(1, 'bash: /x: Read-only file system', signatures), { denied: true })
+    assert.deepEqual(denialFacts(1, 'ACCESS IS DENIED.', signatures), { denied: true }, 'matching stays case-insensitive')
+    assert.deepEqual(denialFacts(0, '', signatures), { denied: false }, 'a confined success says nothing was denied')
+    assert.deepEqual(denialFacts(0, 'warning: read-only file system', signatures), { denied: false })
+    assert.deepEqual(denialFacts(1, 'bash: line 3: syntax error near unexpected token', signatures), {},
+      'a failure this dialect does not explain must not be reported as "not denied"')
+    assert.deepEqual(denialFacts(null, '', signatures), {}, 'signal termination is not a denial either')
+  })
+  test('learnedDenialSignature: keeps the stable part of a refusal, refuses junk', () => {
+    assert.equal(
+      learnedDenialSignature(
+        'bash: line 1: /g/LAB/.dsh-denial-probe-abcd1234: Read-only file system',
+        ['.dsh-denial-probe-abcd1234', String.raw`G:\LAB\.dsh-denial-probe-abcd1234`, String.raw`G:\LAB`],
+      ),
+      'Read-only file system',
+      'the probe path is stripped, the stable message survives',
+    )
+    assert.equal(learnedDenialSignature('denied: permission denied'), 'denied: permission denied')
+    assert.equal(learnedDenialSignature(''), undefined)
+    assert.equal(learnedDenialSignature('x'), undefined, 'too short to identify a dialect')
+    assert.equal(learnedDenialSignature(undefined), undefined)
+    assert.equal(learnedDenialSignature('a'.repeat(200)), undefined, 'too long to be a signature')
+  })
   test('BWRAP_RUNNER_FAILURE_RULES matches "bwrap: " stderr lines', () => {
     assert.notEqual(classifyRunnerFailure(1, 'bwrap: no space left', BWRAP_RUNNER_FAILURE_RULES), undefined)
   })
@@ -585,7 +612,43 @@ console.log('\n[A] unit: GitBashExecutor (internals hooks)')
     // The old contract here was "no sandbox facts at all", which could not be
     // told apart from "this deployment composes no sandbox". It is now the
     // explicit, structured fact.
-    assert.deepEqual(result.sandbox, { mode: 'read-only', denied: false, unconfined: true })
+    // task-19: no `denied` on an unwrapped run — the sandbox never ran, so it can
+    // deny nothing; the fact that matters is `unconfined`.
+    assert.deepEqual(result.sandbox, { mode: 'read-only', unconfined: true })
+  })
+  // task-19: a confined failure whose stderr matches NO known signature must
+  // report no `denied` at all, and the renderer must say the dialect is unknown.
+  testAsync('execute(): a confined failure with an unmatched signature omits denied and says so', async () => {
+    const build = (signatures) => {
+      const ex = bareInstance(GitBashExecutor, {
+        ctx: fakeCtx({
+          subprocess: fakeSubprocess(),
+          sandboxPolicy: { resolve: () => ({ mode: 'read-only', workspaceRoot: process.cwd() }), defaultMode: 'read-only' },
+          sandbox: {
+            confine: async () => ({
+              argv: [GIT_BASH, '-c', 'printf unrelated-complaint >&2; exit 3'],
+              enforcement: 'partial',
+              denialSignatures: signatures,
+              runnerFailureRules: [],
+            }),
+          },
+        }),
+        config: gitConfig({ sandbox: 'auto', probeTimeoutMs: 20000 }),
+      })
+      ex.internals.probeConfined = async () => true
+      return ex
+    }
+    const spec = { command: 'echo x', timeoutMs: 30000, stdoutMaxBytes: 4096, workdir: process.cwd() }
+    const unknown = build(['nonexistent dialect'])
+    const unmatched = await (await unknown.execute(unknown.resolve(spec))).result()
+    assert.deepEqual(unmatched.sandbox, { mode: 'read-only', enforcement: 'partial' },
+      'an unexplained failure reports no `denied`: the key must be absent, not false')
+    assert.ok(renderResult(unmatched, []).includes(unmatchedDialectMarker()),
+      'and the model is told the dialect is unknown instead of reading a plain failure')
+    const known = build(['unrelated-complaint'])
+    const matched = await (await known.execute(known.resolve(spec))).result()
+    assert.equal(matched.sandbox.denied, true, 'a matching signature still reports denied: true')
+    assert.ok(!renderResult(matched, []).includes('denial dialect'))
   })
   testAsync('execute(): confined path stamps sandbox facts (denied=false)', async () => {
     const ex = bareInstance(GitBashExecutor, {
@@ -994,7 +1057,7 @@ console.log('\n[A] unit: WslBashExecutor (internals hooks)')
     const result = await (await ex.execute(ex.resolve({ command: 'echo wsl-unconfined-ok', timeoutMs: 30000, stdoutMaxBytes: 4096, workdir: process.cwd() }))).result()
     assert.equal(result.exitCode, 0)
     assert.match(result.stdout.text, /wsl-unconfined-ok/)
-    assert.deepEqual(result.sandbox, { mode: 'read-only', denied: false, unconfined: true })
+    assert.deepEqual(result.sandbox, { mode: 'read-only', unconfined: true })
   })
   }
 }
@@ -1257,6 +1320,36 @@ console.log('\n[A] unit: job reads carry their loss/sandbox notices; the exporte
       processOutcome(proc({ mode: 'danger-full-access', denied: false }), [], { unconfinedIsAutomatic: true, unconfinedDetail: true }).detail,
       'exit code: 0',
       'danger-full-access says everything through its mode',
+    )
+  })
+  test('renderResult: a confined failure with no matching dialect says so instead of denying it', () => {
+    // task-19: `denialFacts` leaves `denied` OUT when a failure matched no
+    // signature; the renderer must then name the unknown dialect rather than let
+    // the run read as a plain command error (or, worse, as "not denied").
+    const base = {
+      stdout: { text: 'x\n', truncated: false },
+      stderr: { text: 'some unrelated complaint\n', truncated: false },
+      timedOut: false, stopped: undefined, signal: null, exitCode: 1,
+    }
+    const unknown = renderResult({ ...base, sandbox: { mode: 'read-only', enforcement: 'partial' } }, [])
+    assert.equal(unknown, `x\n[stderr]\nsome unrelated complaint\n${unmatchedDialectMarker()}\n[exit code: 1]`)
+    assert.ok(unknown.trimEnd().endsWith('[exit code: 1]'), unknown)
+    // A success never carries it (nothing failed).
+    assert.equal(
+      renderResult({ ...base, exitCode: 0, signal: null, sandbox: { mode: 'read-only', enforcement: 'partial' } }, []),
+      'x\n[stderr]\nsome unrelated complaint\n',
+    )
+    // A matched denial keeps its own marker.
+    const denied = renderResult({ ...base, sandbox: { mode: 'read-only', denied: true, enforcement: 'partial' } }, [])
+    assert.ok(denied.includes('[sandbox: file access denied under read-only mode]') && !denied.includes('denial dialect'), denied)
+    // An unconfined run must never be mistaken for the unknown-dialect case.
+    assert.ok(
+      !renderResult({ ...base, sandbox: { mode: 'read-only', unconfined: true } }, []).includes('denial dialect'),
+      'unconfined failures belong to the unconfined path, not this one',
+    )
+    // A runner failure has its own, more specific note.
+    assert.ok(
+      !renderResult({ ...base, sandbox: { mode: 'read-only', denied: false, runnerFailed: true } }, []).includes('denial dialect'),
     )
   })
   test('the unconfined notes have ONE wording: the job detail imports them from the foreground renderer', () => {
@@ -2663,7 +2756,7 @@ console.log('\n[B] boot integration: an auto-degraded sandbox reports `unconfine
         ['auto + failed probe: the fact rides the value and the model reads the note', async () => {
           const result = await rawCall(ctx, { command: 'echo auto-degraded' })
           assert.equal(result.isError, false, rawText(result))
-          assert.deepEqual(result.value.sandbox, { mode: 'read-only', denied: false, unconfined: true })
+          assert.deepEqual(result.value.sandbox, { mode: 'read-only', unconfined: true })
           assert.match(rawText(result), /\[sandbox: not applied — the confinement probe found no usable sandbox, so this command ran unconfined under read-only mode; repair the sandbox or set sandbox: none on this tool row to accept unconfined runs\]/)
         }],
         ['the schema declares the field, so validation cannot strip it', async () => {
@@ -2796,7 +2889,7 @@ console.log('\n[B] boot integration: an auto-degraded BACKGROUND job says so in 
           // runtime's shape (`id/kind/label/status/detail/startedAt/finishedAt` —
           // no sandbox field), so for background jobs the note is the only channel.
           const value = await valueOf(fgFirst, { command: 'echo fg-degraded-3' })
-          assert.deepEqual(value.sandbox, { mode: 'read-only', denied: false, unconfined: true })
+          assert.deepEqual(value.sandbox, { mode: 'read-only', unconfined: true })
         }],
       ])
     } finally {
@@ -2845,6 +2938,52 @@ console.log('\n[B] boot integration: an auto-degraded BACKGROUND job says so in 
       } finally {
         if (wrapped) await wrapped.fiber.dispose()
       }
+    }
+  }
+}
+
+console.log('\n[B] boot integration: dialect discovery learns this host\'s refusal text (REAL wsl probe)')
+{
+  // task-19: after a SUCCESSFUL functional probe, one doomed write outside the
+  // granted root shows what a refusal prints on THIS host, and that text joins
+  // the provider's signature set. The probe root is pinned under .temp/ so the
+  // doomed name lands in a directory this suite owns; the write must be refused.
+  const labRoot = join(__dirname, '..', '.temp', 'dialect-lab')
+  mkdirSync(labRoot, { recursive: true })
+  const labParent = dirname(labRoot)
+  const leftovers = () => readdirSync(labParent).filter((name) => name.startsWith('.dsh-denial-probe-'))
+
+  if (!HAS_WSL) {
+    console.log('  … skipping discovery fixture: no wsl.exe on this host')
+  } else {
+    let ctx
+    try {
+      ctx = await bootFixture(`
+- id: sandbox-policy
+  name: '@deepseek-ai/dsh-sandbox-policy'
+  config:
+    mode: read-only
+    workspaceRoot: '${labRoot.replaceAll('\\', '\\\\')}'
+`, 'dialect-discovery.yml')
+      await runTests(ctx, [
+        ['the real bwrap path discovers a signature and creates nothing', async () => {
+          const ex = bareInstance(WslBashExecutor, {
+            ctx,
+            config: WslBashExecutor.Config({ wslPath: WSL_EXE }),
+          })
+          assert.equal(ex.requireBwrapUsable(), true, 'the functional probe must pass before discovery can run')
+          assert.equal(typeof ex.denialDiscovery, 'string', 'the WSL path must learn a signature on this host')
+          assert.ok(ex.denialDiscovery.length >= 4)
+          console.log(`  … learned denial signature: ${JSON.stringify(ex.denialDiscovery)}`)
+          assert.ok(ex.denialDiscoveryInvalid !== true, 'the doomed write must have been refused')
+          assert.deepEqual(leftovers(), [], 'the doomed write must leave no file behind')
+          assert.deepEqual(ex.effectiveDenialSignatures(['provider-signature']),
+            ['provider-signature', ex.denialDiscovery], 'the learned signature joins the provider set')
+        }],
+      ])
+    } finally {
+      if (ctx) await ctx.fiber.dispose()
+      assert.deepEqual(leftovers(), [], 'no probe file may survive the fixture')
     }
   }
 }
