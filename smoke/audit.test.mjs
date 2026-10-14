@@ -3155,6 +3155,142 @@ console.log('\n[B] boot integration: dialect discovery learns this host\'s refus
   }
 }
 
+console.log('\n[B] boot integration: a background job records the tool call that created it (M1 / alpha.3)')
+{
+  // alpha.3 added `JobSpec.toolCall?` and writes it into the durable
+  // `job/registered` / `job/settled` payloads and the public job view. The two
+  // facts asserted here are MEASURED, not assumed (report §: rc.2 and alpha.2 share
+  // the same `jobs.start`, which ignores the field; alpha.3 records it):
+  //   1. the registry RECEIVES `toolCall.callId` on every generation (so removing
+  //      it is observable here, not only on alpha.3);
+  //   2. the runtime either records it (alpha.3) or ignores it without erroring.
+  const JOBS_RECORDS_TOOLCALL = (() => {
+    try {
+      const path = createRequire(import.meta.url).resolve('@deepseek-ai/dsh-jobs-local/package.json')
+      return readFileSync(join(dirname(path), 'lib', 'index.js'), 'utf8').includes('toolCall')
+    } catch {
+      return false
+    }
+  })()
+
+  if (!HAS_GIT_BASH) {
+    console.log('  … skipping M1 fixture: no Git Bash probed on this host')
+  } else {
+    const callOf = (ctx, name, args, callId) => ctx.tools.execute({
+      signal: new AbortController().signal,
+      callId: callId ?? ToolCallId(`m1-${Math.random().toString(36).slice(2)}`),
+      name,
+      arguments: { description: `m1 ${name}`, ...args },
+    })
+    const textOf = (result) => (result.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('').replace(/\r\n/g, '\n')
+
+    let ctx
+    try {
+      ctx = await bootFixture(PLUGIN_ROWS(GIT_BASH), 'jobs-toolcall.yml')
+      await runTests(ctx, [
+        [JOBS_RECORDS_TOOLCALL
+            ? 'jobs.start receives toolCall.callId, and this runtime records it in the durable view'
+            : 'jobs.start receives toolCall.callId, and this runtime accepts and ignores it', async () => {
+          const jobs = ctx.get('jobs')
+          const specs = []
+          const events = []
+          const realStart = jobs.start
+          jobs.start = function (spec) { specs.push(spec); return realStart.call(this, spec) }
+          const subscription = jobs.events.subscribe({}, (event) => events.push(event))
+          try {
+            const callId = ToolCallId(`m1-${Math.random().toString(36).slice(2)}`)
+            const started = await callOf(ctx, 'git_bash', { command: 'echo m1-witness', run_in_background: true }, callId)
+            const startedText = textOf(started)
+            assert.equal(started.isError, false, startedText)
+            const jobId = startedText.match(/started background job (\S+)/)?.[1]
+            assert.ok(jobId && jobId !== 'undefined', `the job id must be a real id: ${startedText}`)
+            // 1. what WE sent — observable on every generation (M1's own witness).
+            assert.equal(specs.length, 1, 'one registration')
+            assert.equal(specs[0].toolCall?.callId, callId, 'the registry must receive the originating call id')
+            assert.deepEqual(Object.keys(specs[0]).sort(), ['kind', 'label', 'output', 'run', 'toolCall'],
+              'and no other JobSpec key changed')
+            assert.equal(specs[0].label, 'echo m1-witness', 'label unchanged')
+            assert.equal(typeof specs[0].run, 'function', 'run unchanged')
+            assert.ok(Array.isArray(specs[0].output), 'output unchanged')
+            if (specs[0].toolCall.rootCallId !== undefined)
+              assert.equal(typeof specs[0].toolCall.rootCallId, 'string', 'rootCallId is only included when it exists')
+            // 2. what the runtime did with it.
+            const registered = events.find((event) => event.type === 'registered')
+            assert.ok(registered, 'the registry announced the registration')
+            assert.equal(registered.job.id, jobId)
+            const record = jobs.store?.get?.(jobId)
+            if (JOBS_RECORDS_TOOLCALL) {
+              // alpha.3 keeps the record in its own store and copies it into the
+              // durable `job/registered` payload (`recordSessionEvent`); the
+              // in-process `view()` deliberately omits it, so the store record is
+              // the observable here (the durable event needs an owner session the
+              // agentless fixture does not have — asserted below as a boundary).
+              assert.equal(record?.toolCall?.callId, callId, 'alpha.3 records the call id with the job')
+              assert.equal(typeof record?.toolCall?.rootCallId, 'string', 'and the root call id with it')
+            } else {
+              assert.equal(record?.toolCall, undefined, 'an older runtime accepts the field and ignores it')
+              assert.equal(registered.job.toolCall, undefined, 'its view never grows the field either')
+              assert.equal(started.value.jobId, jobId, 'and the job still starts exactly as before')
+            }
+            // 3. the model-facing view: shape-stable on every generation.
+            const read = await callOf(ctx, 'job_output', { job_id: jobId })
+            const view = read.value?.job
+            assert.ok(view, 'job_output returns the job view')
+            assert.equal(view.toolCall, undefined, 'the public job view keeps its shape')
+            assert.equal(view.id, jobId)
+            assert.equal(view.label, 'echo m1-witness')
+            // 4. the identity tracks the CALL, not a constant: a foreground call
+            //    registers its own job (timeout promotion) and reports its own id.
+            const before = specs.length
+            const ownCallId = ToolCallId(`m1-fg-${Math.random().toString(36).slice(2)}`)
+            await callOf(ctx, 'git_bash', { command: 'echo m1-foreground' }, ownCallId)
+            assert.equal(specs.length, before + 1, 'a foreground call registers its own job for promotion')
+            assert.equal(specs.at(-1).toolCall.callId, ownCallId, 'and carries that call id, not the previous one')
+            assert.notEqual(specs.at(-1).toolCall.callId, callId)
+          } finally {
+            jobs.start = realStart
+            if (typeof subscription === 'function') subscription()
+            else subscription?.dispose?.()
+          }
+        }],
+      ])
+    } finally {
+      if (ctx) await ctx.fiber.dispose()
+    }
+
+    let degrade
+    try {
+      degrade = await bootFixture(PLUGIN_ROWS(GIT_BASH), 'jobs-toolcall-degrade.yml')
+      await runTests(degrade, [
+        ['a registry that rejects the field is retried without it, and the verdict is cached', async () => {
+          const jobs = degrade.get('jobs')
+          const realStart = jobs.start
+          const calls = []
+          jobs.start = function (spec) {
+            calls.push([...Object.keys(spec)].sort())
+            if (spec.toolCall !== undefined) throw new Error('invalid job spec: unknown field "toolCall"')
+            return realStart.call(this, spec)
+          }
+          try {
+            const first = await execTool(degrade, 'git_bash', { command: 'echo m1-degrade', run_in_background: true })
+            assert.match(first, /started background job \S+/, first)
+            assert.equal(calls.length, 2, `one rejected attempt then a clean one: ${JSON.stringify(calls)}`)
+            assert.ok(calls[0].includes('toolCall') && !calls[1].includes('toolCall'), JSON.stringify(calls))
+            // Settled once per row: the next job does not try the field again.
+            await execTool(degrade, 'git_bash', { command: 'echo m1-degrade-2', run_in_background: true })
+            assert.equal(calls.length, 3, 'the second job must not attempt the field again')
+            assert.ok(!calls[2].includes('toolCall'))
+          } finally {
+            jobs.start = realStart
+          }
+        }],
+      ])
+    } finally {
+      if (degrade) await degrade.fiber.dispose()
+    }
+  }
+}
+
 console.log('\n[B] boot integration: no job registry — config decides the schema, the call fails loud')
 {
   if (!HAS_GIT_BASH) {
