@@ -211,6 +211,13 @@ const HAS_GIT_BASH = GIT_BASH.length > 0
 // WSL is likewise never hardcoded: only the canonical launcher location is
 // considered, and the real-spawn WSL test skips when it is absent.
 const WSL_EXE = process.env.DSH_AUDIT_WSL ?? 'C:\\Windows\\System32\\wsl.exe'
+// A wsl.exe-shaped pin that EXISTS (so no runtime fallback fires) but is not WSL:
+// `node -e bwrap …` exits non-zero, so the functional bwrap probe fails
+// deterministically on a host whose WSL itself works, while the command it is
+// asked to run still SPAWNS (and fails as an ordinary command, exit 9) — which is
+// what the degrade fixtures need. (A pinned distro that does not exist no longer
+// degrades at all: it falls back at runtime, by design.)
+const BROKEN_WSL = process.execPath
 const HAS_WSL = existsSync(WSL_EXE)
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -537,9 +544,32 @@ console.log('\n[A] unit: config schemas')
 
 console.log('\n[A] unit: GitBashExecutor (internals hooks)')
 {
-  test('bashPath(): configured pin is returned verbatim', () => {
-    const ex = bareInstance(GitBashExecutor, { config: GitBashExecutor.Config({ bashPath: 'C:\\pinned\\bash.exe' }) })
-    assert.equal(ex.bashPath(), 'C:\\pinned\\bash.exe')
+  test('bashPath(): a pin that exists is returned verbatim', () => {
+    const ex = bareInstance(GitBashExecutor, { config: GitBashExecutor.Config({ bashPath: process.execPath }) })
+    assert.equal(ex.bashPath(), process.execPath)
+  })
+  // A3: a pin that is NOT there falls back at RUNTIME and says so once per row;
+  // the stored value is never rewritten (nothing here writes config at all).
+  test('bashPath(): a pin that is missing warns once and falls back to discovery', () => {
+    // Windows paths are built from the separator's code point so this file needs no
+    // backslash escapes of its own.
+    const BS = String.fromCharCode(92)
+    const pinned = `C:${BS}pinned${BS}bash.exe`
+    const discovered = `C:${BS}discovered${BS}bash.exe`
+    const warnings = []
+    const ex = bareInstance(GitBashExecutor, {
+      ctx: { logger: { warn: (message) => warnings.push(String(message)) } },
+      config: GitBashExecutor.Config({ bashPath: pinned }),
+    })
+    ex.internals.resolveBashPath = (configured) => configured ?? discovered
+    ex.internals.registryBashPaths = () => undefined
+    assert.equal(ex.bashPath(), discovered)
+    assert.equal(warnings.length, 1, warnings.join(' | '))
+    assert.ok(warnings[0].startsWith('bash-git: gitBash.bashPath "'), warnings[0])
+    assert.ok(warnings[0].includes(JSON.stringify(pinned)), warnings[0])
+    assert.ok(warnings[0].includes('does not exist; falling back to auto-discovery'), warnings[0])
+    assert.equal(ex.bashPath(), discovered)
+    assert.equal(warnings.length, 1, 'the second call must not warn again')
   })
   test('bashPath(): undefined resolution throws loud naming probes', () => {
     const ex = bareInstance(GitBashExecutor, { config: GitBashExecutor.Config({}) })
@@ -548,8 +578,8 @@ console.log('\n[A] unit: GitBashExecutor (internals hooks)')
     assert.throws(() => ex.bashPath(), /Git Bash was not found \(probed/)
   })
   test('gitArgv: [bashPath, -c, command]', () => {
-    const ex = bareInstance(GitBashExecutor, { config: GitBashExecutor.Config({ bashPath: 'C:\\b.exe' }) })
-    assert.deepEqual(ex.gitArgv({ command: 'ls -la' }), ['C:\\b.exe', '-c', 'ls -la'])
+    const ex = bareInstance(GitBashExecutor, { config: GitBashExecutor.Config({ bashPath: process.execPath }) })
+    assert.deepEqual(ex.gitArgv({ command: 'ls -la' }), [process.execPath, '-c', 'ls -la'])
   })
   test('sandboxMode: undeclared until resolveSandboxMode settles it', () => {
     const ex = bareInstance(GitBashExecutor, { config: GitBashExecutor.Config({}) })
@@ -908,9 +938,26 @@ console.log('\n[A] unit: bash resolution (git-path inference, never the WSL laun
 
 console.log('\n[A] unit: WslBashExecutor (internals hooks)')
 {
-  test('wslPath(): configured pin returned verbatim', () => {
-    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: 'C:\\wsl-pinned.exe' }) })
-    assert.equal(ex.wslPath(), 'C:\\wsl-pinned.exe')
+  test('wslPath(): a pin that exists is returned verbatim', () => {
+    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: WSL_EXE }) })
+    assert.equal(ex.wslPath(), WSL_EXE)
+  })
+  test('wslPath(): a pin that is missing warns once and falls back to the standard location', () => {
+    const BS = String.fromCharCode(92)
+    const pinned = `C:${BS}nope${BS}wsl.exe`
+    const warnings = []
+    const ex = bareInstance(WslBashExecutor, {
+      ctx: { logger: { warn: (message) => warnings.push(String(message)) } },
+      config: WslBashExecutor.Config({ wslPath: pinned }),
+    })
+    ex.internals.resolveWslPath = (configured) => configured ?? WSL_EXE
+    assert.equal(ex.wslPath(), WSL_EXE)
+    assert.equal(warnings.length, 1, warnings.join(' | '))
+    assert.ok(warnings[0].startsWith('bash-wsl: wslBash.wslPath "'), warnings[0])
+    assert.ok(warnings[0].includes(JSON.stringify(pinned)), warnings[0])
+    assert.ok(warnings[0].includes('does not exist; falling back to the standard Windows location'), warnings[0])
+    ex.wslPath()
+    assert.equal(warnings.length, 1, 'once per row')
   })
   test('wslPath(): undefined resolution throws loud naming probes', () => {
     const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({}) })
@@ -929,35 +976,50 @@ console.log('\n[A] unit: WslBashExecutor (internals hooks)')
   // the WSL start directory is a property of the spec rather than of the
   // distro's automount/inheritance behaviour.
   test('argv(): --cd always carries the resolved workdir', () => {
-    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: 'C:\\wsl.exe' }) })
+    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: WSL_EXE }) })
     ex.distro = () => 'Ubuntu-24.04'
     const argv = ex.argv({ command: 'x', workdir: 'G:\\other' })
-    assert.deepEqual(argv.slice(0, 5), ['C:\\wsl.exe', '--cd', 'G:\\other', '-d', 'Ubuntu-24.04'])
+    assert.deepEqual(argv.slice(0, 5), [WSL_EXE, '--cd', 'G:\\other', '-d', 'Ubuntu-24.04'])
     assert.deepEqual(argv.slice(5), ['--', 'bash', '-c', ex.payload('x')])
   })
   test('argv(): a workdir equal to process.cwd() still gets --cd (auto-cd, not a skip)', () => {
-    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: 'C:\\wsl.exe' }) })
+    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: WSL_EXE }) })
     ex.distro = () => 'Ubuntu-24.04'
     const argv = ex.argv({ command: 'x', workdir: process.cwd() })
-    assert.deepEqual(argv.slice(0, 3), ['C:\\wsl.exe', '--cd', process.cwd()])
+    assert.deepEqual(argv.slice(0, 3), [WSL_EXE, '--cd', process.cwd()])
   })
   test('argv(): a Linux workdir passes through verbatim', () => {
-    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: 'C:\\wsl.exe' }) })
+    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: WSL_EXE }) })
     ex.distro = () => undefined
-    assert.deepEqual(ex.argv({ command: 'x', workdir: '/mnt/g/LAB' }), ['C:\\wsl.exe', '--cd', '/mnt/g/LAB', '--', 'bash', '-c', ex.payload('x')])
+    assert.deepEqual(ex.argv({ command: 'x', workdir: '/mnt/g/LAB' }), [WSL_EXE, '--cd', '/mnt/g/LAB', '--', 'bash', '-c', ex.payload('x')])
   })
   test('argv(): distro omitted when probe found none', () => {
-    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: 'C:\\wsl.exe' }) })
+    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: WSL_EXE }) })
     ex.distro = () => undefined
-    assert.deepEqual(ex.argv({ command: 'x', workdir: process.cwd() }), ['C:\\wsl.exe', '--cd', process.cwd(), '--', 'bash', '-c', ex.payload('x')])
+    assert.deepEqual(ex.argv({ command: 'x', workdir: process.cwd() }), [WSL_EXE, '--cd', process.cwd(), '--', 'bash', '-c', ex.payload('x')])
   })
   test('defaultWorkdir() is gone — no consumer compares against a config default any more', () => {
     assert.equal(typeof WslBashExecutor.prototype.defaultWorkdir, 'undefined')
   })
-  test('distro(): explicit wslDistro wins over probe', () => {
+  test('distro(): an installed wslDistro wins over the probed first entry', () => {
     const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslDistro: 'Pinned' }) })
-    ex.internals.probeDistro = () => { throw new Error('must not probe') }
+    ex.internals.probeDistro = () => ['Pinned', 'Ubuntu-24.04']
     assert.equal(ex.distro(), 'Pinned')
+  })
+  // A3: a pin this host does not have would fail every command with wsl.exe's own
+  // error; the row uses the first listed distro at RUNTIME instead and says so once.
+  test('distro(): an uninstalled wslDistro falls back to the first listed one and warns once', () => {
+    const warnings = []
+    const ex = bareInstance(WslBashExecutor, {
+      ctx: { logger: { warn: (message) => warnings.push(String(message)) } },
+      config: WslBashExecutor.Config({ wslDistro: 'NoSuchDistro' }),
+    })
+    ex.internals.probeDistro = () => ['Ubuntu-24.04', 'Debian']
+    assert.equal(ex.distro(), 'Ubuntu-24.04')
+    assert.equal(warnings.length, 1, warnings.join(' | '))
+    assert.match(warnings[0], /^bash-wsl: wslBash\.wslDistro "NoSuchDistro" is not installed; falling back to "Ubuntu-24\.04"\.$/)
+    ex.distro()
+    assert.equal(warnings.length, 1, 'once per row')
   })
   test('distro(): probe result cached and used', () => {
     let calls = 0
@@ -991,7 +1053,7 @@ console.log('\n[A] unit: WslBashExecutor (internals hooks)')
     assert.equal(await ex.resolveSandboxMode(), 'read-only')
   })
   test('bwrapArgv(): workspace root converted to /mnt/<drive>', () => {
-    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: 'C:\\wsl.exe' }) })
+    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: WSL_EXE }) })
     ex.distro = () => 'Ubuntu-24.04'
     const argv = ex.bwrapArgv({
       command: 'x',
@@ -1018,7 +1080,7 @@ console.log('\n[A] unit: WslBashExecutor (internals hooks)')
     )
   })
   test('bwrapArgv(): read-only mode has no --bind/--tmpfs', () => {
-    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: 'C:\\wsl.exe' }) })
+    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: WSL_EXE }) })
     ex.distro = () => undefined
     const argv = ex.bwrapArgv({
       command: 'x',
@@ -1037,7 +1099,7 @@ console.log('\n[A] unit: WslBashExecutor (internals hooks)')
     assert.deepEqual(bwrap.slice(separator, separator + 3), ['--', 'bash', '-c'])
   })
   test('bwrapArgv(): UNC/non-drive workspace root fails loud', () => {
-    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: 'C:\\wsl.exe' }) })
+    const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslPath: WSL_EXE }) })
     ex.distro = () => undefined
     assert.throws(() => ex.bwrapArgv({
       command: 'x',
@@ -1941,14 +2003,119 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.equal(state.fields.find((knob) => knob.key === 'gitBash.probeTimeoutMs').text, '12345')
   })
 
-  await testAsync('an invalid number blocks the save instead of writing it', async () => {
+  // ── A3: trim on save; a warning is never a write ─────────────────────────────
+  const BS = String.fromCharCode(92)
+  const win = (...parts) => parts.join(BS)
+
+  await testAsync('A3: a text draft is TRIMMED into the write, and the form echoes the trimmed value', async () => {
+    const scope = fakeScope()
+    const form = new RowConfigForm(scope, gitRow)
+    const typed = `  ${win('C:', 'Git', 'usr', 'bin', 'bash.exe')}  `
+    form.edit('gitBash.bashPath', typed)
+    // The draft is echoed as typed while it is being edited (caret-friendly), and
+    // the WRITE is the trimmed value.
+    assert.equal(form.project().fields.find((k) => k.key === 'gitBash.bashPath').text, typed)
+    await form.save()
+    assert.deepEqual(scope.calls.length, 1)
+    assert.deepEqual(scope.calls[0].ops, [{ op: 'set', path: ['gitBash', 'bashPath'], value: win('C:', 'Git', 'usr', 'bin', 'bash.exe') }])
+    // What the field then shows is what was stored: the trimmed value.
+    const stored = fakeScope({ value: { gitBash: { bashPath: win('C:', 'Git', 'usr', 'bin', 'bash.exe') } } })
+    const after = new RowConfigForm(stored, gitRow)
+    assert.equal(after.project().fields.find((k) => k.key === 'gitBash.bashPath').text, win('C:', 'Git', 'usr', 'bin', 'bash.exe'))
+    after.dispose()
+    form.dispose()
+  })
+
+  await testAsync('A3: an invalid value warns, still saves as typed, and plans no repair write', async () => {
+    const scope = fakeScope()
+    const form = new RowConfigForm(scope, gitRow)
+    const bad = win('relative', 'bash.exe')
+    form.edit('gitBash.bashPath', bad)
+    const projected = form.project()
+    const field = projected.fields.find((k) => k.key === 'gitBash.bashPath')
+    assert.equal(field.invalid, true, 'the field carries the visible warning marker')
+    assert.equal(field.invalidReason, 'path')
+    assert.equal(projected.invalid, false, 'a warning never blocks the save (A3: the user input wins)')
+    await form.save()
+    // The user's input is written — trimmed, and as typed otherwise; no default is
+    // written back and nothing is deleted to "repair" it.
+    assert.deepEqual(scope.calls.length, 1)
+    assert.deepEqual(scope.calls[0].ops, [{ op: 'set', path: ['gitBash', 'bashPath'], value: bad }])
+    form.dispose()
+  })
+
+  await testAsync('A3: a non-finite number is still refused a write (nothing to carry), warning shown', async () => {
     const scope = fakeScope()
     const form = new RowConfigForm(scope, gitRow)
     form.edit('gitBash.probeTimeoutMs', 'soon')
-    assert.equal(form.project().invalid, true)
+    const field = form.project().fields.find((k) => k.key === 'gitBash.probeTimeoutMs')
+    assert.equal(field.invalid, true)
+    assert.equal(field.invalidReason, 'number')
+    assert.equal(form.project().invalid, false, 'the card itself reports no blocker')
     await form.save()
     assert.deepEqual(scope.calls, [], 'no mutation for a draft no control accepts')
-    assert.equal(form.project().dirty, true)
+    assert.equal(form.project().dirty, true, 'and the form stays dirty for the user to fix')
+    form.dispose()
+  })
+
+  await testAsync('A3: a blank text control is a CLEAR, never an error', async () => {
+    const scope = fakeScope({ user: { gitBash: { bashPath: win('C:', 'old', 'bash.exe') } } })
+    const form = new RowConfigForm(scope, gitRow)
+    form.edit('gitBash.bashPath', '   ')
+    const field = form.project().fields.find((k) => k.key === 'gitBash.bashPath')
+    assert.equal(field.invalid, false, 'whitespace-only is a clear, not an invalid value')
+    await form.save()
+    assert.deepEqual(scope.calls[0].ops, [{ op: 'unset', path: ['gitBash', 'bashPath'] }])
+    form.dispose()
+  })
+
+  await testAsync('A3: a stored value that violates the rule is NEVER rewritten by the form', async () => {
+    // The user's constraint, pinned: an old value (here a path padded with spaces,
+    // the shape a pre-trim release could store) keeps its exact bytes until the
+    // user saves over it. Projecting the form must produce no write at all.
+    const stored = `  ${win('C:', 'Program Files', 'Git', 'bin', 'bash.exe')}  `
+    const scope = fakeScope({
+      value: { enableRunInBackground: true, gitBash: { sandbox: 'auto', bashPath: stored } },
+      base: { gitBash: { sandbox: 'auto' } },
+      user: { gitBash: { bashPath: stored } },
+    })
+    const form = new RowConfigForm(scope, gitRow)
+    const before = JSON.stringify(scope.getSnapshot())
+    const projected = form.project()
+    assert.equal(projected.fields.find((k) => k.key === 'gitBash.bashPath').text, stored, 'the stored bytes are shown verbatim — no trim echo, no migration')
+    assert.deepEqual(planOps(gitRow.fields, new Map(), scope.getSnapshot()), [], 'projection plans no write')
+    assert.equal(projected.dirty, false)
+    await form.save()
+    assert.deepEqual(scope.calls, [], 'and a save with no drafts sends nothing')
+    assert.equal(JSON.stringify(scope.getSnapshot()), before, 'the stored bytes are byte-for-byte unchanged')
+    form.dispose()
+  })
+
+  test('A3: the syntax rules are the three documented ones, and existence is NOT one of them', () => {
+    const gitForm = new RowConfigForm(fakeScope(), ROWS[0])
+    const wslForm = new RowConfigForm(fakeScope(), ROWS[1])
+    const forms = [gitForm, wslForm]
+    const reason = (key, text) => {
+      const form = key.startsWith('wslBash') ? wslForm : gitForm
+      form.edit(key, text)
+      const field = form.project().fields.find((k) => k.key === key)
+      assert.ok(field, `no field for ${key}`)
+      form.discard()
+      return field.invalidReason
+    }
+    assert.equal(reason('gitBash.bashPath', win('C:', 'Git', 'bash.exe')), undefined)
+    assert.equal(reason('gitBash.bashPath', '/c/Git/bash.exe'), undefined, 'the POSIX drive form is accepted')
+    assert.equal(reason('gitBash.bashPath', win(BS, 'server', 'share', 'bash.exe')), undefined, 'a UNC path is accepted')
+    assert.equal(reason('gitBash.bashPath', 'bash.exe'), 'path')
+    assert.equal(reason('gitBash.cwd', 'relative'), 'path')
+    assert.equal(reason('wslBash.wslPath', 'wsl.exe'), 'path')
+    assert.equal(reason('wslBash.wslDistro', 'Ubuntu 24.04'), 'distro')
+    assert.equal(reason('wslBash.wslDistro', 'Ubuntu"24.04'), 'distro')
+    assert.equal(reason('wslBash.wslDistro', 'Ubuntu-24.04'), undefined)
+    // No existence check anywhere in this layer: a syntactically perfect path to a
+    // file that is not there is NOT flagged here (the executor warns at use time).
+    assert.equal(reason('gitBash.bashPath', win('C:', 'definitely', 'not', 'here', 'bash.exe')), undefined)
+    for (const form of forms) form.dispose()
   })
 
   test('a live settings update republished by the scope reaches the card', () => {
@@ -2751,7 +2918,7 @@ console.log('\n[B] boot integration: an auto-degraded sandbox reports `unconfine
       ctx = await bootFixture(WSL_ROW(`
   config:
     wslBash:
-      wslDistro: 'no-such-distro-probe'`), 'unconfined-auto.yml')
+      wslPath: '${BROKEN_WSL}'`), 'unconfined-auto.yml')
       await runTests(ctx, [
         ['auto + failed probe: the fact rides the value and the model reads the note', async () => {
           const result = await rawCall(ctx, { command: 'echo auto-degraded' })
@@ -2853,7 +3020,7 @@ console.log('\n[B] boot integration: an auto-degraded BACKGROUND job says so in 
       bgFirst = await bootFixture(WSL_ROW(`
   config:
     wslBash:
-      wslDistro: 'no-such-distro-probe'`), 'unconfined-bg-first.yml')
+      wslPath: '${BROKEN_WSL}'`), 'unconfined-bg-first.yml')
       await runTests(bgFirst, [
         ['a background job that degrades FIRST carries the full explanation; the next one only the short marker', async () => {
           const started1 = await execTool(bgFirst, 'wsl_bash', { command: 'echo bg-degraded-1', run_in_background: true })
@@ -2877,7 +3044,7 @@ console.log('\n[B] boot integration: an auto-degraded BACKGROUND job says so in 
       fgFirst = await bootFixture(WSL_ROW(`
   config:
     wslBash:
-      wslDistro: 'no-such-distro-probe'`), 'unconfined-fg-first.yml')
+      wslPath: '${BROKEN_WSL}'`), 'unconfined-fg-first.yml')
       await runTests(fgFirst, [
         ['a foreground call that degrades first carries the full explanation; the next only the short marker', async () => {
           const first = await execTool(fgFirst, 'wsl_bash', { command: 'echo fg-degraded-1' })
@@ -3355,9 +3522,15 @@ console.log('\n[B] boot integration: misconfiguration matrices')
       bashPath: 'G:\\no-such-git\\usr\\bin\\bash.exe'
 `, 'bad-bashpin.yml')
     await runTests(ctx, [
-      ['unresolvable pinned bashPath surfaces as a failed command, not a crash', async () => {
+      ['a stale pinned bashPath falls back at runtime instead of failing the command', async () => {
+        // A3, and status quo notes: before this change the pin was trusted verbatim,
+        // so this command died on a bare spawn ENOENT. Now the pin is used only when
+        // it is really there: the row discovers Git for Windows at RUNTIME (and warns
+        // once — covered by the unit guard above), while the stored value is left
+        // exactly as it is. Nothing in this plugin writes config.
         const r = await execToolResult(ctx, 'git_bash', { command: 'echo x' })
-        assert.equal(r.isError, true, `expected an error result, got: ${r.text.slice(0, 200)}`)
+        assert.equal(r.isError, false, `the runtime fallback must let the command run: ${r.text.slice(0, 200)}`)
+        assert.match(r.text, /x/)
       }],
     ])
   } finally {
