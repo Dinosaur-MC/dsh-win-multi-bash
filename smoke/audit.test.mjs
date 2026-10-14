@@ -28,7 +28,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync, rmSync } from 'node:fs'
@@ -51,7 +51,7 @@ const { WslBashExecutor } = await import(libUrl('bash-wsl', 'index.js'))
 const { ownExecutor } = await import(libUrl('tool-bash', 'types', 'backend.js'))
 const { processJob, processOutcome, processSources, ringDelta } =
   await import(libUrl('tool-bash', 'types', 'background.js'))
-const { renderJobRead, renderPromoted, renderResult } =
+const { renderJobRead, renderPromoted, renderResult, unconfinedMarker } =
   await import(libUrl('tool-bash', 'types', 'render.js'))
 const gitBashTool = await import(libUrl('tool-bash', 'types', 'git-bash.js'))
 const wslBashTool = await import(libUrl('tool-bash', 'types', 'wsl-bash.js'))
@@ -574,7 +574,7 @@ console.log('\n[A] unit: GitBashExecutor (internals hooks)')
   if (!HAS_GIT_BASH) {
     console.log('  … skipping real-spawn execute() tests: no Git Bash probed on this host')
   } else {
-  testAsync('execute(): unconfined path passes plain git argv (no sandbox facts)', async () => {
+  testAsync('execute(): an explicitly unconfined git run reports the fact (sandbox: none)', async () => {
     const ex = bareInstance(GitBashExecutor, {
       ctx: fakeCtx({ subprocess: fakeSubprocess() }),
       config: gitConfig({ sandbox: 'none' }),
@@ -582,7 +582,10 @@ console.log('\n[A] unit: GitBashExecutor (internals hooks)')
     const result = await (await ex.execute(ex.resolve({ command: 'echo unconfined-ok', timeoutMs: 30000, stdoutMaxBytes: 4096, workdir: process.cwd() }))).result()
     assert.equal(result.exitCode, 0)
     assert.match(result.stdout.text, /unconfined-ok/)
-    assert.equal(result.sandbox, undefined)
+    // The old contract here was "no sandbox facts at all", which could not be
+    // told apart from "this deployment composes no sandbox". It is now the
+    // explicit, structured fact.
+    assert.deepEqual(result.sandbox, { mode: 'read-only', denied: false, unconfined: true })
   })
   testAsync('execute(): confined path stamps sandbox facts (denied=false)', async () => {
     const ex = bareInstance(GitBashExecutor, {
@@ -982,7 +985,7 @@ console.log('\n[A] unit: WslBashExecutor (internals hooks)')
   if (!HAS_WSL) {
     console.log('  … skipping real-spawn WSL tests: no wsl.exe on this host')
   } else {
-  testAsync('execute(): unconfined path passes plain argv (no sandbox facts)', async () => {
+  testAsync('execute(): an explicitly unconfined wsl run reports the fact (sandbox: none)', async () => {
     const ex = bareInstance(WslBashExecutor, {
       ctx: fakeCtx({ subprocess: fakeSubprocess() }),
       config: WslBashExecutor.Config({ wslPath: WSL_EXE, sandbox: 'none' }),
@@ -991,7 +994,7 @@ console.log('\n[A] unit: WslBashExecutor (internals hooks)')
     const result = await (await ex.execute(ex.resolve({ command: 'echo wsl-unconfined-ok', timeoutMs: 30000, stdoutMaxBytes: 4096, workdir: process.cwd() }))).result()
     assert.equal(result.exitCode, 0)
     assert.match(result.stdout.text, /wsl-unconfined-ok/)
-    assert.equal(result.sandbox, undefined)
+    assert.deepEqual(result.sandbox, { mode: 'read-only', denied: false, unconfined: true })
   })
   }
 }
@@ -1140,6 +1143,41 @@ console.log('\n[A] unit: job reads carry their loss/sandbox notices; the exporte
       /\[sandbox: the sandbox runner itself failed under workspace-write mode — the command did not run; this is a sandbox problem, not a command failure\]/,
     )
   })
+  // task-15: an unconfined run reports the fact, and the model hears about it
+  // ONLY when the tool degraded to it itself (`auto`), never for an explicit
+  // `sandbox: none` — that is expected configuration, not a surprise.
+  test('renderResult: an automatically degraded run announces the missing sandbox', () => {
+    const base = {
+      stdout: { text: 'x\n', truncated: false },
+      stderr: { text: '', truncated: false },
+      timedOut: false,
+      stopped: undefined,
+      signal: null,
+      exitCode: 0,
+    }
+    const unconfined = { mode: 'read-only', denied: false, unconfined: true }
+    const announced = renderResult({ ...base, sandbox: unconfined }, [], { unconfinedIsAutomatic: true })
+    assert.match(announced, /\[sandbox: not applied — the confinement probe found no usable sandbox, so this command ran unconfined under read-only mode; repair the sandbox or set sandbox: none on this tool row to accept unconfined runs\]/)
+    // The exit marker stays last, so the card's exit pill still parses.
+    const withExit = renderResult({ ...base, exitCode: 3, sandbox: unconfined }, [], { unconfinedIsAutomatic: true })
+    assert.ok(withExit.trimEnd().endsWith('[exit code: 3]'), withExit)
+    assert.equal(renderResult({ ...base, sandbox: unconfined }, [], {}), 'x\n', 'an explicit `sandbox: none` stays quiet')
+    assert.equal(renderResult({ ...base, sandbox: unconfined }), 'x\n', 'and so does a caller that passes no options')
+    assert.equal(
+      renderResult({ ...base, sandbox: { mode: 'read-only', denied: false, enforcement: 'full' } }, [], { unconfinedIsAutomatic: true }),
+      'x\n',
+      'a wrapped run never carries the note',
+    )
+  })
+  test('renderJobRead: the promoted path announces it under the same rule', () => {
+    const unconfined = { mode: 'read-only', denied: false, unconfined: true }
+    assert.match(
+      renderJobRead('x\n', false, [], unconfined, [], { unconfinedIsAutomatic: true }),
+      /\[sandbox: not applied — the confinement probe found no usable sandbox, so this command ran unconfined under read-only mode/,
+    )
+    assert.equal(renderJobRead('x\n', false, [], unconfined, [], {}), 'x\n', 'explicit none: fact, no sentence')
+    assert.equal(renderJobRead('x\n', false, [], unconfined), 'x\n', 'no options: no sentence')
+  })
   // S1's transport half: the read's own `lossy`/spill facts must reach the
   // renderer. `ringDelta` is the text half; the call site is pinned end-to-end
   // by the tiny-ring fixture below.
@@ -1167,6 +1205,46 @@ console.log('\n[A] unit: job reads carry their loss/sandbox notices; the exporte
       [],
     )
     assert.match(runner.detail, /; \[sandbox: the sandbox runner itself failed under read-only mode/)
+    // task-17: an unconfined BACKGROUND run is announced in the terminal detail
+    // under exactly the foreground rule — only the tool's own degradation, never
+    // an explicit `sandbox: none`, never a wrapped run.
+    const unconfined = { mode: 'read-only', denied: false, unconfined: true }
+    const proc = (sandbox) => ({ status: 'completed', exitCode: 0, signal: null, sandbox })
+    assert.equal(
+      processOutcome(proc(unconfined), [], { unconfinedIsAutomatic: true }).detail,
+      `exit code: 0; ${unconfinedMarker('read-only')}`,
+      'an auto-degraded job detail must carry the note, byte-identical to the foreground wording',
+    )
+    assert.equal(processOutcome(proc(unconfined), [], { unconfinedIsAutomatic: false }).detail, 'exit code: 0')
+    assert.equal(processOutcome(proc(unconfined), []).detail, 'exit code: 0', 'no options: conservative silence')
+    assert.equal(
+      processOutcome(proc({ mode: 'read-only', denied: false, enforcement: 'full' }), [], { unconfinedIsAutomatic: true }).detail,
+      'exit code: 0',
+      'a wrapped run never carries the note',
+    )
+    assert.equal(
+      processOutcome(proc({ mode: 'danger-full-access', denied: false }), [], { unconfinedIsAutomatic: true }).detail,
+      'exit code: 0',
+      'danger-full-access says everything through its mode',
+    )
+  })
+  test('the unconfined note has ONE wording: the job detail imports it from the foreground renderer', () => {
+    // Two copies of the same sentence would drift; assert the single source AND
+    // the byte-identical output on both paths.
+    const backgroundSource = readFileSync(join(lib, 'tool-bash', 'types', 'background.js'), 'utf8')
+    assert.ok(
+      /import \{[^}]*unconfinedMarker[^}]*\} from '\.\/render\.js'/.test(backgroundSource),
+      'background.js must import the marker from render.js rather than restate it',
+    )
+    const marker = unconfinedMarker('read-only')
+    const job = processOutcome({ status: 'completed', exitCode: 0, signal: null, sandbox: { mode: 'read-only', denied: false, unconfined: true } }, [], { unconfinedIsAutomatic: true })
+    const foreground = renderResult({
+      stdout: { text: 'x\n', truncated: false }, stderr: { text: '', truncated: false },
+      timedOut: false, stopped: undefined, signal: null, exitCode: 0,
+      sandbox: { mode: 'read-only', denied: false, unconfined: true },
+    }, [], { unconfinedIsAutomatic: true })
+    assert.ok(job.detail.endsWith(marker) && foreground.includes(marker), JSON.stringify({ job: job.detail, foreground }))
+    assert.equal(job.detail.slice(job.detail.indexOf('[')), marker, 'the job detail note IS the marker, not a paraphrase')
   })
   // G4: the stopped marker's position is contract — after the timeout marker,
   // before the signal/exit marker dsh's own parser anchors on.
@@ -2498,6 +2576,190 @@ console.log('\n[B] boot integration: a promoted call whose read lost output repo
       ])
     } finally {
       if (ctx) await ctx.fiber.dispose()
+    }
+  }
+}
+
+console.log('\n[B] boot integration: an auto-degraded sandbox reports `unconfined` (REAL wsl probe)')
+{
+  // The three shapes the user's ruling distinguishes, all against the REAL wsl
+  // provider on this host:
+  //   1. `sandbox: auto` whose probe FAILS  → fact + a sentence the model reads;
+  //   2. `sandbox: none`                    → fact, no sentence (expected config);
+  //   3. a wrapped run                      → no fact, byte-identical to before.
+  // (1) is made deterministic by pinning a distro that does not exist: the
+  // functional bwrap probe then fails on a host whose WSL itself works.
+  const WSL_ROW = (extra) => `${CORE_ROW_ONLY}
+- id: win-mb-tool-wsl
+  name: 'dsh-win-multi-bash/tool-wsl-bash'${extra}
+`
+  const WSL_BWRAP_OK = HAS_WSL && (() => {
+    const probe = spawnSync(WSL_EXE, [
+      '-e', 'bwrap', '--ro-bind', '/', '/', '--dev', '/dev', '--unshare-pid',
+      '--proc', '/proc', '--die-with-parent', '--', '/bin/true',
+    ], { timeout: 20000, stdio: 'ignore' })
+    return probe.status === 0
+  })()
+
+  const rawCall = (ctx, args) => ctx.tools.execute({
+    signal: new AbortController().signal,
+    callId: ToolCallId(`unconfined-${Math.random().toString(36).slice(2)}`),
+    name: 'wsl_bash',
+    arguments: { description: 'unconfined probe', ...args },
+  })
+  const rawText = (result) => (result.content ?? [])
+    .filter((block) => block.type === 'text').map((block) => block.text).join('').replace(/\r\n/g, '\n')
+
+  if (!HAS_WSL) {
+    console.log('  … skipping unconfined fixture: no wsl.exe on this host')
+  } else {
+    let ctx
+    try {
+      ctx = await bootFixture(WSL_ROW(`
+  config:
+    wslBash:
+      wslDistro: 'no-such-distro-probe'`), 'unconfined-auto.yml')
+      await runTests(ctx, [
+        ['auto + failed probe: the fact rides the value and the model reads the note', async () => {
+          const result = await rawCall(ctx, { command: 'echo auto-degraded' })
+          assert.equal(result.isError, false, rawText(result))
+          assert.deepEqual(result.value.sandbox, { mode: 'read-only', denied: false, unconfined: true })
+          assert.match(rawText(result), /\[sandbox: not applied — the confinement probe found no usable sandbox, so this command ran unconfined under read-only mode; repair the sandbox or set sandbox: none on this tool row to accept unconfined runs\]/)
+        }],
+        ['the schema declares the field, so validation cannot strip it', async () => {
+          // `additionalProperties: false` is why this structural check matters:
+          // without the declaration the value above would come back without it.
+          const variants = ctx.tools.get('wsl_bash').output.schema.oneOf
+          const foreground = variants.find((variant) => variant.properties.kind.const === 'foreground')
+          assert.equal(foreground.properties.sandbox.properties.unconfined?.type, 'boolean')
+        }],
+      ])
+    } finally {
+      if (ctx) await ctx.fiber.dispose()
+    }
+
+    let noneCtx
+    try {
+      noneCtx = await bootFixture(WSL_ROW(`
+  config:
+    wslBash:
+      sandbox: none`), 'unconfined-none.yml')
+      await runTests(noneCtx, [
+        ['sandbox: none carries the fact but never the note', async () => {
+          const result = await rawCall(noneCtx, { command: 'echo explicit-none' })
+          assert.equal(result.value.sandbox.unconfined, true)
+          assert.ok(!rawText(result).includes('not applied'), `expected no sandbox note: ${rawText(result)}`)
+          assert.match(rawText(result), /explicit-none/)
+        }],
+      ])
+    } finally {
+      if (noneCtx) await noneCtx.fiber.dispose()
+    }
+
+    if (!WSL_BWRAP_OK) {
+      console.log('  … skipping wrapped-shape case: this host\'s WSL has no usable bwrap')
+    } else {
+      let wrapped
+      try {
+        wrapped = await bootFixture(WSL_ROW(''), 'unconfined-wrapped.yml')
+        await runTests(wrapped, [
+          ['a wrapped run is byte-identical to before: no `unconfined`, and no note', async () => {
+            const result = await rawCall(wrapped, { command: 'echo wrapped-ok' })
+            assert.deepEqual(result.value.sandbox, { mode: 'read-only', denied: false, enforcement: 'full' })
+            assert.ok(!rawText(result).includes('not applied'))
+            assert.match(rawText(result), /wrapped-ok/)
+          }],
+        ])
+      } finally {
+        if (wrapped) await wrapped.fiber.dispose()
+      }
+    }
+  }
+}
+
+console.log('\n[B] boot integration: an auto-degraded BACKGROUND job says so in its terminal detail (REAL wsl probe)')
+{
+  // task-17. A background job's terminal detail is the only line the model reads
+  // back for it, so an unconfined background command must announce itself there.
+  // Same real-provider trick as the foreground section: a distro that does not
+  // exist makes the functional probe fail deterministically.
+  const WSL_ROW = (extra) => `${CORE_ROW_ONLY}
+- id: win-mb-tool-wsl
+  name: 'dsh-win-multi-bash/tool-wsl-bash'${extra}
+`
+  const settledRead = async (ctx, jobId) => {
+    // Each `job_output` call CONSUMES the delta, so accumulate across polls:
+    // the note lands on the status line once the job settles, and the command's
+    // own output may have arrived in an earlier poll.
+    let seen = ''
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      const read = await execTool(ctx, 'job_output', { job_id: jobId })
+      seen += read
+      if (/exit code:|killed|failed/.test(read)) return seen
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    return seen
+  }
+  // `execToolResult` drops the structured value; the fact lives on it.
+  const valueOf = async (ctx, args) => (await ctx.tools.execute({
+    signal: new AbortController().signal,
+    callId: ToolCallId(`audit-bg-fact-${Math.random().toString(36).slice(2)}`),
+    name: 'wsl_bash',
+    arguments: { description: 'audit background fact', ...args },
+  })).value
+
+  if (!HAS_WSL) {
+    console.log('  … skipping background-unconfined fixture: no wsl.exe on this host')
+  } else {
+    let auto
+    try {
+      auto = await bootFixture(WSL_ROW(`
+  config:
+    wslBash:
+      wslDistro: 'no-such-distro-probe'`), 'unconfined-bg-auto.yml')
+      await runTests(auto, [
+        ['the job terminal detail carries the note for an auto-degraded background command', async () => {
+          const started = await execTool(auto, 'wsl_bash', { command: 'echo bg-degraded', run_in_background: true })
+          const jobId = started.match(/started background job (\S+)/)?.[1]
+          assert.ok(jobId, `no job id in: ${started}`)
+          const read = await settledRead(auto, jobId)
+          assert.match(read, /\[sandbox: not applied — the confinement probe found no usable sandbox, so this command ran unconfined under read-only mode; repair the sandbox or set sandbox: none on this tool row to accept unconfined runs\]/, read)
+        }],
+        ['the structured fact rides the value on the foreground path of the same fixture', async () => {
+          // The job view is the base runtime's shape (`id/kind/label/status/
+          // detail/startedAt/finishedAt` — no sandbox field), so the note is the
+          // background channel; the structured fact is asserted where it exists.
+          const value = await valueOf(auto, { command: 'echo fg-degraded' })
+          assert.deepEqual(value.sandbox, { mode: 'read-only', denied: false, unconfined: true })
+        }],
+      ])
+    } finally {
+      if (auto) await auto.fiber.dispose()
+    }
+
+    let none
+    try {
+      none = await bootFixture(WSL_ROW(`
+  config:
+    wslBash:
+      sandbox: none`), 'unconfined-bg-none.yml')
+      await runTests(none, [
+        ['an explicit `sandbox: none` background command carries no note', async () => {
+          const started = await execTool(none, 'wsl_bash', { command: 'echo bg-explicit-none', run_in_background: true })
+          const jobId = started.match(/started background job (\S+)/)?.[1]
+          assert.ok(jobId, `no job id in: ${started}`)
+          const read = await settledRead(none, jobId)
+          assert.match(read, /exit code: 0/)
+          assert.ok(!read.includes('not applied'), `expected no sandbox note, got: ${read}`)
+          assert.match(read, /bg-explicit-none/)
+        }],
+        ['…and the fact is still on the foreground value of that fixture', async () => {
+          const value = await valueOf(none, { command: 'echo fg-none' })
+          assert.equal(value.sandbox.unconfined, true)
+        }],
+      ])
+    } finally {
+      if (none) await none.fiber.dispose()
     }
   }
 }
