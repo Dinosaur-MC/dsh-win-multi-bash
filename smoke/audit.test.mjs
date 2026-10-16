@@ -52,7 +52,7 @@ const { WslBashExecutor } = await import(libUrl('bash-wsl', 'index.js'))
 const { ownExecutor } = await import(libUrl('tool-bash', 'types', 'backend.js'))
 const { processJob, processOutcome, processSources, ringDelta } =
   await import(libUrl('tool-bash', 'types', 'background.js'))
-const { renderJobRead, renderPromoted, renderResult, unconfinedDetailMarker, unconfinedMarker, unmatchedDialectMarker } =
+const { remoteSandboxMarker, renderJobRead, renderPromoted, renderResult, unconfinedDetailMarker, unconfinedMarker, unmatchedDialectMarker } =
   await import(libUrl('tool-bash', 'types', 'render.js'))
 const gitBashTool = await import(libUrl('tool-bash', 'types', 'git-bash.js'))
 const wslBashTool = await import(libUrl('tool-bash', 'types', 'wsl-bash.js'))
@@ -1400,6 +1400,25 @@ console.log('\n[A] unit: job reads carry their loss/sandbox notices; the exporte
       'exit code: 0',
       'danger-full-access says everything through its mode',
     )
+    // REVIEW B1: a REMOTE job carries the remote sentence, on success AND on
+    // failure. The unmatched-denial branch below it is what a failing `ssh.exe`
+    // used to be labelled with: exit 255 (a connection error) with a
+    // `{ mode, remote: true }` block satisfies that branch's every condition, so
+    // the model read a denial-dialect verdict about a sandbox that never ran. The
+    // foreground renderer never had this hole; the job detail is a second channel
+    // onto the same facts and must say the same thing.
+    const remoteFact = { mode: 'workspace-write', remote: true }
+    for (const [status, exitCode, signal, base] of [
+      ['completed', 0, null, 'exit code: 0'],
+      ['completed', 255, null, 'exit code: 255'],
+      ['killed', null, 'SIGTERM', 'signal: SIGTERM'],
+    ]) {
+      const detail = processOutcome({ status, exitCode, signal, sandbox: remoteFact }, ['danger-full-access']).detail
+      assert.equal(detail, base + '; ' + remoteSandboxMarker('workspace-write'),
+        'a remote job says what the foreground says, for ' + status + ' exit ' + String(exitCode))
+      assert.ok(!detail.includes('denial dialect'), detail)
+      assert.ok(!detail.includes('ran unconfined'), detail)
+    }
   })
   test('renderResult: a confined failure with no matching dialect says so instead of denying it', () => {
     // task-19: `denialFacts` leaves `denied` OUT when a failure matched no
@@ -2161,7 +2180,7 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
       sshPort: { get: () => over.sshPort },
       acceptNewHostKeys: { get: () => over.acceptNewHostKeys === true },
       connectTimeoutMs: { get: () => over.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS },
-      sandbox: { get: () => 'auto' },
+      sandbox: { get: () => over.sandbox ?? 'auto' },
       requireSandbox: { get: () => over.requireSandbox === true },
       probeTimeoutMs: { get: () => 4000 },
     },
@@ -2421,6 +2440,15 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     const demandingRow = bareSsh({ requireSandbox: true })
     assert.equal(await demandingRow.resolveSandboxMode(), 'workspace-write')
     assert.equal(demandingRow.sandboxMode, 'workspace-write', 'the sync getter reads the settled verdict')
+    // REVIEW N3: the stance must not silently disarm the demand. Under `sandbox:
+    // none` a demanding row still advertises escalation, because neither stance can
+    // be honoured by a local wrapper — and without the advertisement the refusal's
+    // own escape hatch (`sandbox_permissions`) is not in the parameter table, so the
+    // row could neither run nor be rescued.
+    assert.equal(await bareSsh({ requireSandbox: true, sandbox: 'none' }).resolveSandboxMode(), 'workspace-write',
+      'a demanding row advertises the way out under `sandbox: none` too')
+    assert.equal(await bareSsh({ requireSandbox: false, sandbox: 'none' }).resolveSandboxMode(), undefined,
+      'and a row that demands nothing still advertises nothing')
     // The confinement hooks are explicit REFUSALS, never plausible defaults: an
     // answer of 'false' would send the family down its unconfined path and report a
     // degradation fact about a confinement that was never attempted.
@@ -3616,6 +3644,50 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
     const text = (result.content ?? []).filter((entry) => entry.type === 'text').map((entry) => entry.text).join('')
     return { text, value: result.value, isError: result.isError }
   }
+
+  // The model-facing surface of the session row, before any shell is spawned and
+  // with no shell pin: what the tool says it offers, and what an `open` reports
+  // about whose host the session is on. Booted separately from the round trip so
+  // it runs on a machine with no Git Bash too — nothing here touches a PTY.
+  await testAsync('the terminal row offers every session backend it declares, and says which host a session is on', async () => {
+    const { TERMINAL_BACKENDS: SESSION_BACKENDS } = await import(libUrl('tool-bash', 'types', 'registry.js'))
+    const ctx = await bootFixture(TERMINAL_FIXTURE_ROWS([]), 'terminal-surface.yml')
+    try {
+      const definition = ctx.tools.get('terminal')
+      assert.ok(definition !== undefined, 'the terminal row must register')
+      // REVIEW N2: the description named "Git Bash, WSL or MSYS2" by hand while the
+      // `shell` enum declared beside it was derived — so the SSH backend was offered
+      // by the parameter list and denied by the prose the model reads first.
+      assert.ok(SESSION_BACKENDS.length >= 2, 'this build must declare session backends')
+      for (const backend of SESSION_BACKENDS) {
+        assert.ok(definition.parameters.properties.shell.enum.includes(backend.toolName),
+          'the shell enum must offer ' + backend.toolName)
+        assert.ok(definition.description.includes(backend.label.en),
+          'the description must name "' + backend.label.en + '": ' + definition.description.slice(0, 160))
+      }
+      assert.ok(!definition.description.includes('in Git Bash, WSL or MSYS2'),
+        'and it must not hand-list a subset of what the enum offers')
+      // REVIEW N1: a session in a remote backend used to read a LOCAL sandbox
+      // sentence and carry no remote token at all — the one fact that says whether
+      // the shell the model is typing into is on this host.
+      const renderOpen = (value) => definition.output.render({ action: 'open' }, value).map((block) => block.text).join('')
+      const openValue = (remote) => ({
+        kind: 'open', sessionId: 's1', shell: remote ? 'ssh_bash' : 'git_bash', pid: 7, cwd: 'C:/ws',
+        sandboxMode: 'none', unconfined: true, remote, output: 'ready', truncated: false, lossy: false, nextOffset: 5,
+      })
+      const openSchema = definition.output.schema.oneOf.find((branch) => branch.properties?.kind?.const === 'open')
+      assert.ok(openSchema !== undefined, 'the open value shape must exist')
+      assert.ok('remote' in openSchema.properties,
+        'the open schema must carry the remote fact, or the value is rejected')
+      const remote = renderOpen(openValue(true))
+      assert.ok(remote.includes('— remote: this session runs on the host its backend connects to'), remote)
+      assert.ok(!remote.includes('unconfined: the file sandbox does not wrap'),
+        'a remote session must not be described by a LOCAL sandbox sentence: ' + remote)
+      const local = renderOpen(openValue(false))
+      assert.ok(local.includes('— unconfined: the file sandbox does not wrap a PTY session'), local)
+      assert.ok(!local.includes('— remote: '), local)
+    } finally { await ctx.fiber.dispose() }
+  })
 
   if (GIT_BASH === '') {
     console.log('  … skipping the terminal round trip: no Git Bash was found to pin')

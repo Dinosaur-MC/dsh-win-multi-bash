@@ -137,7 +137,7 @@ wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"   # 验
 - **输出是流，所以有上限、且如实上报。** 每个会话保留最近 `maxBufferBytes`（默认 1 MiB）的**已清洗**文本，并分开报两件事：`truncated`（该会话某刻丢过输出）与 `lossy`（本次读取要的偏移已经滑出窗口，于是返回的是整段保留尾而不是增量）。ANSI 转义会被剥离；这里没有终端模拟器，所以用回车重绘一行的程序会变成多行。
 - **会话有上限、会被回收、且是进程内的。** `maxSessions`（默认 8）会具名拒绝下一次 `open`；`idleMs`（默认 10 分钟）内没有 `send`/`read`/`signal` 的会话会被终止，之后用它的 id 会被告知"已被空闲回收"，而不是含糊的 unknown。会话**不**跨 `dsh` 重启存活。
 - **会话不是作业。** 它不注册进 `ctx.jobs`，`job_kill` 够不到它：`close` 是唯一的结束方式，空闲回收兜底。
-- **PTY 会话未包裹运行，并且会说。** 文件沙箱包裹的是被 spawn 命令的 argv；终端会话由另一条 provider 调用分配，而在本机上 windows-acl runner 根本起不了 MSYS bash（见上，本机实测 `0xC0000142`），因此没有诚实的办法去包裹它。每次 `open` 都携带该事实；`terminal.allowUnconfined: false` 会让 `open` 直接拒绝而不是无保护运行。
+- **PTY 会话未包裹运行，并且会说。** 文件沙箱包裹的是被 spawn 命令的 argv；终端会话由另一条 provider 调用分配，而在本机上 windows-acl runner 根本起不了 MSYS bash（见上，本机实测 `0xC0000142`），因此没有诚实的办法去包裹它。每次 `open` 都携带该事实；`terminal.allowUnconfined: false` 会让 `open` 直接拒绝而不是无保护运行。若会话的后端效果在远端（SSH 方言），`open` 还会带上 `remote: true` 并在首行说明 —— 那正是这里唯一要紧的事：它碰到的文件根本不在本机；`unconfined` 依旧为真，因为无论哪种后端，PTY 会话都不会被包裹。
 - **本平台上只有 `SIGINT` 能到达 shell，其余四个都会明说。** 本机实测：win32 的 ConPTY 终端 `pid` 恒为 `0`，provider 的前台进程组查询返回同一个 0，而它的 kill 路径首行就是 `if (pid <= 0) return` —— 所以 `SIGTERM` 会**返回成功却什么都没送到**，`SIGKILL` 也因同样原因被 provider 拒绝。本工具因此把 `SIGTERM`/`SIGKILL` **具名拒绝**，而不是返回一个"送到了"的成功；`SIGTSTP`/`SIGHUP` 由 provider 拒绝并原样转达；`SIGINT` 以 Ctrl+C 字节投递，确实能打断前台命令（验证过：打断 `sleep 30` 后会话仍可继续使用）。
 - **两个 provider 事实值得知道。** Windows 上 `pid` 是 `0`（ConPTY），仅供展示；`inspectActivity()` 在那里恒为 `unknown`，所以就绪判定回落到"输出静默" —— 在能作答的 provider 上，`idle` 立即结算，`busy` 会继续等。
 - **SSH 会话是能回答首次连接提问的地方，也是唯一会回收远端的形态。** 用 `shell: ssh_bash` 调 `open`，跑的是 `ssh.exe -t … -- <主机>`、不带 `BatchMode`：真正的 PTY 正是让 ssh 敢于询问未知主机指纹、密码或密钥短语的条件——用 `send` 回答即可。同一个 PTY 也是会话结束时 sshd 回收远端进程组的原因，而单次 `ssh -T` 命令会在客户端被杀之后继续活着（实测，见「沙箱行为」）。两条如实限制：凡经 `send` 键入的内容都会进入工具调用记录，因此请用密钥认证而不是直接敲密码；会话的 `cwd` 是 `ssh.exe` 在本机运行的目录，绝不是远端目录。
@@ -205,7 +205,7 @@ lib/
 └── vendor/         运行器失败分类与 bwrap 配置辅助模块
 ```
 
-由于本插件没有任何行注册为 `ctx.shell`，patch 只插入自己的那些行、不禁用任何行：基座自身的 shell 接线（Windows 上是 `pwsh-sandbox`，其他平台是 `bash-sandbox`）保持原样，pwsh 无论本插件是否加载都正常工作。
+设计决策记录放在 `docs/decisions/`，并且**刻意不进**发布产物的 `files`（npm tarball）——因此从 npm 页看包的人仍然能通过本 README 拿到同样的论证。由于本插件没有任何行注册为 `ctx.shell`，patch 只插入自己的那些行、不禁用任何行：基座自身的 shell 接线（Windows 上是 `pwsh-sandbox`，其他平台是 `bash-sandbox`）保持原样，pwsh 无论本插件是否加载都正常工作。
 
 ## 前置条件
 
@@ -244,7 +244,7 @@ pnpm run test:audit
 
 改为运行完整审计套件：vendor 辅助模块、executor 内部与工具配置 schema 的纯单元覆盖，外加真实 `cordis.patch.yml` 与各类错误配置的 boot 集成矩阵。
 
-套件还完整覆盖了 SSH 方言，且**不需要网络**：argv 形状与选项顺序、让「经 `sshHost` 注入选项」变得不可能的取值校验、客户端解析与失效钉定的回退、`sandbox: { mode, remote: true }` 这个事实（以及 `denied` / `enforcement` / `unconfined` 的**缺席**）、渲染出的那句标记、`requireSandbox` 的 fail-closed，以及家族小节的远端门控。其中一条 boot 用例拿真实工具去打 `192.0.2.1`（TEST-NET-1，按定义不可路由），从而在没有服务器的情况下走完 spawn → 结果 → schema → 渲染的整条路径；「命令失败时依然报远端事实、而不是沙箱判词」这条检查就在那里。
+套件还完整覆盖了 SSH 方言，且**不需要网络**：argv 形状与选项顺序、让「经 `sshHost` 注入选项」变得不可能的取值校验、客户端解析与失效钉定的回退、`sandbox: { mode, remote: true }` 这个事实（以及 `denied` / `enforcement` / `unconfined` 的**缺席**）、渲染出的那句标记、`requireSandbox` 在两种立场下都 fail-closed、会话行按注册表派生的 shell 列表与其 `open` 所报的 `remote` 事实，以及家族小节的远端门控。其中一条 boot 用例拿真实工具去打 `192.0.2.1`（TEST-NET-1，按定义不可路由），从而在没有服务器的情况下走完 spawn → 结果 → schema → 渲染的整条路径；「命令失败时依然报远端事实、而不是沙箱判词」这条检查就在那里。
 
 **真机往返**是可选开启的，因为它需要一台可达主机与凭据：
 
@@ -289,6 +289,7 @@ dsh-win-multi-bash/
 ├── package.json            # dsh.bundle + dsh.client 清单；exports 暴露 . ./client ./tool-git-bash ./tool-wsl-bash ./tool-msys2-bash ./tool-ssh-bash
 ├── cordis.patch.yml        # 组合接线（即文档）
 ├── .gitattributes          # 所有文本文件 LF，二进制例外
+├── docs/decisions/         # 设计决策记录（只入仓库，不随包发布）
 ├── LICENSE / THIRD_PARTY_NOTICES
 ├── lib/                    # 打包实现（纯 ESM JS，无构建步骤）
 └── smoke/                  # 冒烟测试（不随包发布）
