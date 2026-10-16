@@ -1540,7 +1540,15 @@ const PLUGIN = join(__dirname, '..')
 
 // Fixtures must live where the loader can resolve '@deepseek-ai/*' and
 // 'dsh-win-multi-bash/*' — i.e. beside the smoke/node_modules junctions.
-const FIXTURE_DIR = __dirname
+/**
+ * Where this audit writes the fixtures and patches it generates: ONE scratch
+ * directory, already covered by the `.temp` rule in `.gitignore`. A new test therefore
+ * never needs a new ignore entry — the previous per-name entries (`smoke/fixture.*.yml`)
+ * are gone, and a run that is killed midway cannot leave an untracked file behind.
+ * `dialect-lab` below uses the same `.temp` convention.
+ */
+const FIXTURE_DIR = join(__dirname, '..', '.temp', 'smoke')
+mkdirSync(FIXTURE_DIR, { recursive: true })
 const writtenFixtures = []
 
 // `session-projection` is required: dsh-sandbox-policy waits on the shared

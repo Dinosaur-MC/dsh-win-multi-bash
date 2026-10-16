@@ -146,6 +146,6 @@ vite.config.ts.timestamp-*
 
 # dsh-win-multi-bash machine artifacts
 smoke/node_modules/
-smoke/fixture.default.cordis.yml
-smoke/fixture.pinned.cordis.yml
+# 生成物统一在 .temp/ 下（见上面的 `.temp` 规则）：smoke 的夹具/补丁写进 .temp/smoke/，
+# 因此不再需要逐条列出 smoke/fixture.*.yml 之类的一次性条目。
 

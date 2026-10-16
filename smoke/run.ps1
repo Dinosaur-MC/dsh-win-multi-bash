@@ -7,7 +7,7 @@
     在 smoke/node_modules 下建立两个 junction（不修改任何 profile）：
       - @deepseek-ai        → ~/.dsh/profiles/node_modules/@deepseek-ai（运行时基础包）
       - dsh-win-multi-bash  → 插件根目录（本包自身代码）
-    跑完删除 junction 与生成的 fixture。需要 node >= 20（本机 v22）。
+    跑完删除 junction 与生成的 fixture（夹具写在 .temp/smoke/，已被 .gitignore 的 .temp 规则覆盖）。需要 node >= 20（本机 v22）。
 #>
 $ErrorActionPreference = 'Stop'
 
@@ -15,6 +15,9 @@ $smoke = Split-Path -Parent $MyInvocation.MyCommand.Path
 $pluginRoot = Split-Path -Parent $smoke
 $runtimeScope = Join-Path $env:USERPROFILE '.dsh\profiles\node_modules\@deepseek-ai'
 $nmDir = Join-Path $smoke 'node_modules'
+# 生成的 fixture 与 audit.test.mjs 同处一个临时目录（.temp 已被 .gitignore 覆盖），
+# 这样命名夹具不再需要逐条添加 ignore 条目。
+$fixtureDir = Join-Path (Join-Path $pluginRoot '.temp') 'smoke'
 $linkPlugin = Join-Path $nmDir 'dsh-win-multi-bash'
 $linkScope = Join-Path $nmDir '@deepseek-ai'
 
@@ -107,21 +110,22 @@ try {
         $alpha2Rows = "- id: fs-sandbox`n  name: '@deepseek-ai/dsh-fs-sandbox'`n`n- id: working-directory`n  name: '@deepseek-ai/dsh-working-directory'`n"
     }
 
+    New-Item -ItemType Directory -Path $fixtureDir -Force | Out-Null
     $tpl = [System.IO.File]::ReadAllText((Join-Path $smoke 'fixture.template.cordis.yml'))
     $tpl = $tpl.Replace('__ALPHA2_SERVICE_ROWS__', $alpha2Rows)
     $default = $tpl.Replace('__BASH_PATH__', '')
-    [System.IO.File]::WriteAllText((Join-Path $smoke 'fixture.default.cordis.yml'), $default, [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText((Join-Path $fixtureDir 'fixture.default.cordis.yml'), $default, [System.Text.UTF8Encoding]::new($false))
 
     Write-Host '=== default (schema-default bash resolution) ==='
-    node (Join-Path $smoke 'driver.mjs') (Join-Path $smoke 'fixture.default.cordis.yml')
+    node (Join-Path $smoke 'driver.mjs') (Join-Path $fixtureDir 'fixture.default.cordis.yml')
 
     $gitBash = Find-GitBash
     if ($gitBash) {
         Write-Host ''
         Write-Host "=== pinned (explicit gitBash.bashPath → $gitBash) ==="
         $pinned = $tpl.Replace('__BASH_PATH__', $gitBash)
-        [System.IO.File]::WriteAllText((Join-Path $smoke 'fixture.pinned.cordis.yml'), $pinned, [System.Text.UTF8Encoding]::new($false))
-        node (Join-Path $smoke 'driver.mjs') (Join-Path $smoke 'fixture.pinned.cordis.yml')
+        [System.IO.File]::WriteAllText((Join-Path $fixtureDir 'fixture.pinned.cordis.yml'), $pinned, [System.Text.UTF8Encoding]::new($false))
+        node (Join-Path $smoke 'driver.mjs') (Join-Path $fixtureDir 'fixture.pinned.cordis.yml')
     } else {
         Write-Host ''
         Write-Host '=== pinned (skipped: 本机未探测到 Git Bash，无法构造显式 bashPath 变体) ==='
@@ -132,6 +136,6 @@ try {
     if (Test-Path $linkPlugin) { cmd /c rmdir "$linkPlugin" 2>$null | Out-Null }
     if (Test-Path $linkScope) { cmd /c rmdir "$linkScope" 2>$null | Out-Null }
     if (Test-Path $nmDir) { cmd /c rmdir /s /q "$nmDir" 2>$null | Out-Null }
-    Remove-Item (Join-Path $smoke 'fixture.default.cordis.yml') -Force -ErrorAction SilentlyContinue
-    Remove-Item (Join-Path $smoke 'fixture.pinned.cordis.yml') -Force -ErrorAction SilentlyContinue
+    Remove-Item (Join-Path $fixtureDir 'fixture.default.cordis.yml') -Force -ErrorAction SilentlyContinue
+    Remove-Item (Join-Path $fixtureDir 'fixture.pinned.cordis.yml') -Force -ErrorAction SilentlyContinue
 }
