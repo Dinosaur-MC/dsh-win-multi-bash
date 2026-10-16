@@ -2323,6 +2323,25 @@ console.log('\n[A] unit: sandbox private temp guard (self-heal for the sandbox p
     assert.deepEqual(Object.keys(new SandboxTempGuard({}).fs()).sort(), ['exists', 'mkdir', 'stat'])
   })
 
+  test('...and the module SOURCE carries no deleting or writing call at all (F3)', () => {
+    // The seam above is the module's OWN factory, so pinning its key set proves
+    // nothing about the module: a reviewer added a real `unlinkSync` import and
+    // call inside `heal()` and every assertion here stayed green. This reads the
+    // source, which is what makes "nothing is ever deleted" the enforced invariant
+    // its header claims rather than a property nobody checks.
+    const source = readFileSync(join(PLUGIN, 'lib', 'sandbox-temp-guard.js'), 'utf8')
+    // Comments are stripped first: the module's own prose explains that a manual
+    // `rmdir` out of band is what it exists to survive, and a naive substring
+    // check flagged that documentation as a deletion call.
+    const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+    for (const forbidden of ['unlink', 'rmSync', 'rmdir', 'rename(', 'writeFile', 'appendFile', 'truncate', 'createWriteStream', 'chmod'])
+      assert.ok(!code.includes(forbidden), 'sandbox-temp-guard.js must never call ' + forbidden)
+    // ...and its filesystem surface stays exactly the three read/create imports.
+    const imported = /import\s*\{([^}]*)\}\s*from\s*['"]node:fs['"]/.exec(source)
+    assert.ok(imported !== null, 'the fs import must stay explicit')
+    assert.deepEqual(imported[1].split(',').map((name) => name.trim()).sort(), ['existsSync', 'mkdirSync', 'statSync'])
+  })
+
   test('the knob is a tool-layer field on every row, volatile, and ON by default', () => {
     assert.deepEqual(TOOL_LAYER_FIELDS.map((knob) => knob.key), ['enableRunInBackground', SANDBOX_TEMP_GUARD_KNOB])
     assert.equal(gitBashTool.Config({})[SANDBOX_TEMP_GUARD_KNOB].get(), SANDBOX_TEMP_GUARD_DEFAULT)
@@ -2822,6 +2841,14 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
           const listed = await runTerminal(ctx, { action: 'list' })
           assert.equal(listed.value.kind, 'list')
           assert.ok(listed.value.sessions.some((session) => session.sessionId === id), 'list names the live session')
+          // F4: a reviewer showed that adding a key to `read`'s value (which makes
+          // the runtime drop the whole value) and deleting `open`'s waitReason both
+          // left this suite green, so both contracts are pinned here.
+          assert.ok(['quiet', 'idle', 'timeout'].includes(opened.value.waitReason), String(opened.value.waitReason))
+          const drained = await runTerminal(ctx, { action: 'read', sessionId: id })
+          assert.equal(drained.value.kind, 'session')
+          assert.deepEqual(Object.keys(drained.value).sort(), ['kind', 'lossy', 'nextOffset', 'output', 'truncated'],
+            'read must return exactly the declared fields')
         } finally {
           rmSync(dir, { recursive: true, force: true })
         }

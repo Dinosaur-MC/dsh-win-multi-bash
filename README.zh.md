@@ -64,7 +64,7 @@
 
 > 注意：`requireSandbox` 与 `sandbox: none` 互斥使用——显式 `none` 是用户主动放弃沙箱，保持放行；`requireSandbox` 只管「想沙箱但探针失败」的情形。
 
-- **windows-acl 后端对「恰好一个目录」是有状态的。** 它按 (会话, 工作区根) 只物化**一个**私有临时根 —— `%TEMP%\dsh-<6 个字母数字>` —— 并在整个会话里复用这个缓存路径；其 runner 把 `--temp` 当作「必须已存在」的入参，所以路径缺失就是硬失败（`windows-acl-run: --temp is not an existing directory: <路径>`，退出码 127），而且该会话之后**每一次被包裹的 spawn** 都会失败，直到它回来。手工重建该目录只恢复**存在性**：seam 的写授权（`tempWriteSid` 的 ACE）不会回来，受限子进程写自己的 `%TEMP%` 仍然被拒。因此本插件在 `git_bash` / `msys2_bash` 行下一条被包裹的命令上**重建该目录并重新施加 seam 自己的写授权** —— 这就是 `guardSandboxTemp`（默认开，见「运行时配置」）。本机 2026-10-16 实测（装置 `.temp/guard/device.mjs`）：没有授权时被包裹的 `cmd.exe` 写自己的 `%TEMP%` 报「拒绝访问。」；有授权时写入成功；删掉私有根后 runner 以 127 退出并打出上面那条签名；自愈之后同一条被包裹的写再次成功。
+- **windows-acl 后端对「恰好一个目录」是有状态的。** 它按 (会话, 工作区根) 只物化**一个**私有临时根 —— `%TEMP%\dsh-<6 个字母数字>` —— 并在整个会话里复用这个缓存路径；其 runner 把 `--temp` 当作「必须已存在」的入参，所以路径缺失就是硬失败（`windows-acl-run: --temp is not an existing directory: <路径>`，退出码 127），而且该会话之后**每一次被包裹的 spawn** 都会失败，直到它回来。手工重建该目录只恢复**存在性**：seam 的写授权（`tempWriteSid` 的 ACE）不会回来，受限子进程写自己的 `%TEMP%` 仍然被拒。因此本插件在 `git_bash` / `msys2_bash` 行下一条被包裹的命令上**重建该目录并重新施加 seam 自己的写授权** —— 这就是 `guardSandboxTemp`（默认开，见「运行时配置」）。本机 2026-10-16 实测（由本包自己的审计复现；临时的装置脚本属工作区产物，不随包发布）：没有授权时被包裹的 `cmd.exe` 写自己的 `%TEMP%` 报「拒绝访问。」；有授权时写入成功；删掉私有根后 runner 以 127 退出并打出上面那条签名；自愈之后同一条被包裹的写再次成功。
 
 ### 为 `wsl_bash` 启用 bwrap 沙箱
 
@@ -117,7 +117,7 @@ wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"   # 验
 | `open` | 开启会话，返回 `sessionId`、pid、cwd 与启动输出。 |
 | `send` | 写入 `text`（默认补回车，除 `submit: false`）并返回回复。 |
 | `read` | 只读新输出；`offset` 可按全流字节偏移重读。 |
-| `signal` | 向前台进程组投递 `SIGINT` / `SIGTERM` / `SIGKILL` / `SIGTSTP` / `SIGHUP`。 |
+| `signal` | 向前台进程组投递信号。在本平台上只有 `SIGINT`（Ctrl+C）真正到达 shell —— 见下面「信号」条。 |
 | `close` | 结束会话并等待其会话树静默。 |
 | `list` | 你拥有的会话。 |
 
@@ -127,10 +127,10 @@ wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"   # 验
 - **输出是流，所以有上限、且如实上报。** 每个会话保留最近 `maxBufferBytes`（默认 1 MiB）的**已清洗**文本，并分开报两件事：`truncated`（该会话某刻丢过输出）与 `lossy`（本次读取要的偏移已经滑出窗口，于是返回的是整段保留尾而不是增量）。ANSI 转义会被剥离；这里没有终端模拟器，所以用回车重绘一行的程序会变成多行。
 - **会话有上限、会被回收、且是进程内的。** `maxSessions`（默认 8）会具名拒绝下一次 `open`；`idleMs`（默认 10 分钟）内没有 `send`/`read`/`signal` 的会话会被终止，之后用它的 id 会被告知"已被空闲回收"，而不是含糊的 unknown。会话**不**跨 `dsh` 重启存活。
 - **会话不是作业。** 它不注册进 `ctx.jobs`，`job_kill` 够不到它：`close` 是唯一的结束方式，空闲回收兜底。
-- **PTY 会话未包裹运行，并且会说。** 文件沙箱包裹的是被 spawn 命令的 argv；终端会话由另一条 provider 调用分配，而在 Windows 上 windows-acl runner 根本起不了 MSYS bash（见上），因此没有诚实的办法去包裹它。每次 `open` 都携带该事实；`terminal.allowUnconfined: false` 会让 `open` 直接拒绝而不是无保护运行。
-- **信号原样透传。** Windows provider 支持 `SIGINT`（Ctrl+C）、`SIGTERM`、`SIGKILL`；它会拒绝 `SIGTSTP`/`SIGHUP`，该拒绝会原样转达而不是假装成功。
+- **PTY 会话未包裹运行，并且会说。** 文件沙箱包裹的是被 spawn 命令的 argv；终端会话由另一条 provider 调用分配，而在本机上 windows-acl runner 根本起不了 MSYS bash（见上，本机实测 `0xC0000142`），因此没有诚实的办法去包裹它。每次 `open` 都携带该事实；`terminal.allowUnconfined: false` 会让 `open` 直接拒绝而不是无保护运行。
+- **本平台上只有 `SIGINT` 能到达 shell，其余四个都会明说。** 本机实测：win32 的 ConPTY 终端 `pid` 恒为 `0`，provider 的前台进程组查询返回同一个 0，而它的 kill 路径首行就是 `if (pid <= 0) return` —— 所以 `SIGTERM` 会**返回成功却什么都没送到**，`SIGKILL` 也因同样原因被 provider 拒绝。本工具因此把 `SIGTERM`/`SIGKILL` **具名拒绝**，而不是返回一个"送到了"的成功；`SIGTSTP`/`SIGHUP` 由 provider 拒绝并原样转达；`SIGINT` 以 Ctrl+C 字节投递，确实能打断前台命令（验证过：打断 `sleep 30` 后会话仍可继续使用）。
 - **两个 provider 事实值得知道。** Windows 上 `pid` 是 `0`（ConPTY），仅供展示；`inspectActivity()` 在那里恒为 `unknown`，所以就绪判定回落到"输出静默" —— 在能作答的 provider 上，`idle` 立即结算，`busy` 会继续等。
-- **默认值是测出来的，不是猜的。** `quietMs` 500 ms 相对实测最坏块间间隔（216 ms，`ls -la /usr/bin | head -80` 跑 18 次）留了约 2.3 倍余量；1 MiB 正是单条 `seq 1 200000`（1.42 MiB）越过的边界，这也让 `truncated` 可被观察到；`waitMs` 10 秒用 40×200 ms 的 ticker 验证过（返回部分输出且会话存活）；启动预算覆盖实测约 460 ms 到首提示符。以上每一项都能在插件面板的行上即时改。
+- **默认值是测出来的，不是猜的。** `quietMs` 500 ms 相对实测最坏块间间隔（216 ms，`ls -la /usr/bin | head -80` 跑 18 次）留了约 2.3 倍余量；1 MiB 正是单条 `seq 1 200000` 越过的边界（原生 1,489,391 B；经本插件的转义剥离后剩 1,289,146 B = 1.229 MiB，而环形缓冲计的就是后者），这也让 `truncated` 可被观察到；`waitMs` 10 秒用 40×200 ms 的 ticker 验证过（返回部分输出且会话存活）；启动预算覆盖实测约 460 ms 到首提示符。以上每一项都能在插件面板的行上即时改。
 
 ## 运行时配置（插件管理面板）
 
