@@ -53,8 +53,14 @@
 #                         and the user enables it. It exists to prove the
 #                         skeleton: adding a shell is one executor file plus one
 #                         declaration in lib/shell-dialects.js.
+#   win-mb-tool-ssh     — the `ssh_bash` tool, owning its own SshBashExecutor: the
+#                         family's only REMOTE dialect (`effects: 'remote'` in the
+#                         registry). **Opt-in** for the same reason plus one of
+#                         its own — it needs a host, which only a deployment can
+#                         name. Nothing local bounds its file effects, so it reports
+#                         `sandbox: { mode, remote: true }` rather than a verdict.
 #
-# All three rows are win32-only; POSIX keeps the base bundle's own bash wiring.
+# All four rows are win32-only; POSIX keeps the base bundle's own bash wiring.
 # The tool rows are independent of each other and of the core row — the section
 # follows whichever subset is mounted, and the core row's absence degrades to
 # the fallback described above rather than to a broken prompt.
@@ -131,6 +137,26 @@
       # be pinned per machine:
       #   msys2Bash:
       #     bashPath: '<MSYS2 安装目录>\usr\bin\bash.exe'
+      disabled: true
+
+    - id: win-mb-tool-ssh
+      name: 'dsh-win-multi-bash/tool-ssh-bash'
+      # OPT-IN and Windows-only: a deployment has to name its host before this
+      # tool can do anything, so the row ships switched OFF and the user enables
+      # it in the panel. It drives a remote shell through the OpenSSH client, and
+      # it is the family's only REMOTE dialect: its file effects are on the other
+      # host, so no local file sandbox is applied to it and every result carries
+      # `sandbox: { mode, remote: true }` instead of a sandbox verdict. The
+      # `terminal` row offers the same dialect for a PERSISTENT session (a real
+      # PTY is what lets ssh ask for a fingerprint, a password or a passphrase).
+      # Pin the target (and the client, when it is not the Windows OpenSSH one):
+      #   sshBash:
+      #     sshHost: '<host or an ssh_config alias>'
+      #     sshUser: '<user>'
+      #     sshPort: 22
+      #     sshPath: '<path to ssh.exe>'
+      #     acceptNewHostKeys: false   # trust-on-first-use; a CHANGED key still fails
+      #     connectTimeoutMs: 15000    # connection-phase bound (ConnectTimeout)
       disabled: true
 
     # The interactive-session row: it registers the model-facing `terminal`

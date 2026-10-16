@@ -6,7 +6,7 @@
     "type": "git",
     "url": "git+https://github.com/Dinosaur-MC/dsh-win-multi-bash.git"
   },
-  "description": "Windows multi-bash plugin for dsh: git_bash, wsl_bash and opt-in msys2_bash model tools, each owning its own Git Bash / WSL / MSYS2 executor and leaving the ctx.shell seat to dsh's own pwsh executor.",
+  "description": "Windows multi-bash plugin for dsh: git_bash, wsl_bash and opt-in msys2_bash model tools, plus an opt-in ssh_bash dialect that drives a remote shell over the OpenSSH client. Each dialect owns its own executor and leaves the ctx.shell seat to dsh's own pwsh executor.",
   "keywords": [
     "dsh-plugin",
     "windows",
@@ -14,6 +14,7 @@
     "git-bash",
     "wsl",
     "msys2",
+    "ssh",
     "shell-select"
   ],
   "license": "MIT",
@@ -35,6 +36,7 @@
     "./tool-git-bash": "./lib/tool-bash/types/git-bash.js",
     "./tool-wsl-bash": "./lib/tool-bash/types/wsl-bash.js",
     "./tool-msys2-bash": "./lib/tool-bash/types/msys2-bash.js",
+    "./tool-ssh-bash": "./lib/tool-bash/types/ssh-bash.js",
     "./package.json": "./package.json"
   },
   "files": [
