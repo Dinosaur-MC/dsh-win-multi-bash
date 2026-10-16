@@ -1,3 +1,26 @@
+# dsh-win-multi-bash v0.7.0
+
+## Improvements
+
+- **An interactive PTY session tool: `terminal`.** `open` / `send` / `read` / `signal` / `close` / `list` drive a real Git Bash, WSL or MSYS2 session that survives between calls, so a REPL, a debugger or an interactive prompt works where a one-shot command cannot. A session is reclaimed after `idleMs` untouched, output is kept in a bounded ring with truncation reported, and the tool takes **no** `ctx.shell` seat — the base bundle's own pwsh provider stays exactly where it was, which the suite asserts. A PTY session is not sandbox-wrapped, and the row says so in its own result (`sandbox: { mode, unconfined: true }`) instead of implying otherwise.
+- **A sandbox private temp directory that was removed out of band heals itself, under one switch at the top of the plugin.** `guardSandboxTemp` (default on) is declared once on the package row rather than once per shell row, and the interval beside it (`tempWatchMs`, default 10000 ms) is a live value: a change applies without reloading a row. Healing is deterministic before a wrapped command runs — the engine checks at the call entry **and** again once the sandbox seam returns the argv it is about to spawn — with a timer as the unattended safety net for roots no command is about to use. Nothing is ever deleted: a missing `dsh-<6 alphanumerics>` direct child of an OS temp root is recreated and re-granted.
+
+- **The unwrapped-run notice is a per-row knob (`sandboxNotice`).** `once` (default) prints the full explanation on a row's first degraded run and then keeps the body silent, so the model's context stops carrying the same paragraph on every call; `always` keeps the short marker on each one. The structured fact `sandbox.unconfined: true` is unchanged for every degraded run.
+- **`msys2_bash` discovers its own bash again when no `bashPath` is pinned** — the discovery helper returned the candidate table itself instead of calling it.
+- **One verification entry point.** `smoke/prepare.mjs` replaces the two PowerShell bootstrap scripts: it links the profile runtime where the packaged code resolves `@deepseek-ai/*`, writes its fixtures under `.temp/smoke/`, and removes only the links it created. `pnpm test` runs the driver smoke; `pnpm run test:audit` runs the suite.
+- **Docs:** the README (both languages) says where the self-heal switch lives, what its default interval is, and which command runs each verification entry.
+
+## Compatibility
+
+- **No existing tool changes name, parameters or result shape**, and every new knob defaults to the previous behaviour.
+- `guardSandboxTemp` moved from the tool layer to the package row: a profile that pinned it per shell row should pin it on the plugin row instead. A row that ever declares its own value still wins.
+
+## Verification
+
+- `pnpm test`: exit 0 — `git_bash`, `wsl_bash` and the base bundle's own `pwsh` seat each ran a real command (`git-bash-ok` / `wsl-ok` / `pwsh-ok`) with `shellSeatPresent: true`, in both the schema-default and the pinned-`bashPath` variant.
+- `pnpm run test:audit`: **376 assertions, 0 failures**, repeated on the same tree.
+- `npm pack --dry-run`: 28 files, 149,229 B packed — nothing from `smoke/`, `.temp/` or this file.
+
 # dsh-win-multi-bash v0.6.0
 
 ## Improvements
