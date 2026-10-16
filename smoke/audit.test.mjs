@@ -2240,8 +2240,8 @@ console.log('\n[A] unit: sandbox private temp guard (self-heal for the sandbox p
   // plus the seam's own write grant. Pinned here: the decision table (what may
   // be touched at all), every failure path, and both integration points.
   const {
-    SANDBOX_TEMP_GUARD_DEFAULT, SANDBOX_TEMP_GUARD_KNOB, SANDBOX_TEMP_NAME,
-    GUARD_REASONS, HEAL_OUTCOMES, SandboxTempGuard, classifySandboxTempTarget,
+    SANDBOX_TEMP_GUARD_DEFAULT, SANDBOX_TEMP_GUARD_KNOB, SANDBOX_TEMP_NAME, SANDBOX_TEMP_WATCH_MS,
+    GUARD_REASONS, HEAL_OUTCOMES, SandboxTempGuard, classifySandboxTempTarget, startSandboxTempWatch,
     loadAclGrantApi, missingTempDirectoryOf, sandboxTempArgument, workspaceArgument,
   } = await import(libUrl('sandbox-temp-guard.js'))
   const { TOOL_LAYER_FIELDS, TERMINAL_ROWS } = await import(libUrl('tool-bash', 'types', 'registry.js'))
@@ -2348,7 +2348,7 @@ console.log('\n[A] unit: sandbox private temp guard (self-heal for the sandbox p
   })
 
   test('the guard can only ever create: its own fs seam has no deleting or writing operation', () => {
-    assert.deepEqual(Object.keys(new SandboxTempGuard({}).fs()).sort(), ['exists', 'mkdir', 'stat'])
+    assert.deepEqual(Object.keys(new SandboxTempGuard({}).fs()).sort(), ['exists', 'mkdir', 'readdir', 'stat'])
   })
 
   test('...and the module SOURCE carries no deleting or writing call at all (F3)', () => {
@@ -2367,7 +2367,7 @@ console.log('\n[A] unit: sandbox private temp guard (self-heal for the sandbox p
     // ...and its filesystem surface stays exactly the three read/create imports.
     const imported = /import\s*\{([^}]*)\}\s*from\s*['"]node:fs['"]/.exec(source)
     assert.ok(imported !== null, 'the fs import must stay explicit')
-    assert.deepEqual(imported[1].split(',').map((name) => name.trim()).sort(), ['existsSync', 'mkdirSync', 'statSync'])
+    assert.deepEqual(imported[1].split(',').map((name) => name.trim()).sort(), ['existsSync', 'mkdirSync', 'readdirSync', 'statSync'])
   })
 
   test('the knob is a tool-layer field on every row, volatile, and ON by default', () => {
@@ -2402,6 +2402,192 @@ console.log('\n[A] unit: sandbox private temp guard (self-heal for the sandbox p
     assert.equal(plain.sandboxTempGuardEnabled, true)
     plain.attachToolLayer(undefined)
     assert.equal(plain.sandboxTempGuardEnabled, SANDBOX_TEMP_GUARD_DEFAULT)
+  })
+
+  assert.ok(Number.isFinite(SANDBOX_TEMP_WATCH_MS) && SANDBOX_TEMP_WATCH_MS >= 1000,
+    'the watch interval must be a real interval, not 0/NaN (that would spin the host)')
+
+  // The third channel, and the only one that reaches a row whose probe verdict is
+  // negative — the case this machine is actually in: the windows-acl runner cannot
+  // start MSYS bash (probe failed => the row never confines again), while the HARNESS
+  // keeps using the same (session, workspace root) private root. Deleting that root
+  // then bricks every confined tool the harness runs until a human rebuilds it; the
+  // repair itself needs no elevation, because the host process is not confined.
+  await testAsync('ensureSeen(): the watch repairs a root that vanished after the probe, with no confined run', async () => {
+    const root = scratchRoot()
+    const missing = join(root, 'dsh-Ab12Cd')
+    const records = []
+    const warnings = []
+    const guard = new SandboxTempGuard({
+      tempRoots: () => [root],
+      warn: (key, message) => warnings.push(key + ': ' + message),
+      internals: { aclApi: async () => fakeAcl(records) },
+    })
+    await guard.ensureArgvUsable({ argv: runnerArgv('C:/ws', missing) }, { mode: 'read-only', workspaceRoot: 'C:/ws' })
+    assert.ok(existsSync(missing), 'the one confine call a never-confining row makes still creates the root')
+    rmSync(missing, { recursive: true, force: true })
+    records.length = 0
+    warnings.length = 0
+    const repaired = await guard.ensureSeen()
+    assert.equal(repaired.length, 1, 'the watch repairs exactly the vanished root')
+    assert.equal(repaired[0].channel, 'temp-watch')
+    assert.equal(repaired[0].action, 'heal')
+    assert.ok(existsSync(missing), 'the root the shared seam hands out must exist again')
+    assert.deepEqual(records, [['create', 'SID(' + missing + ')'], ['add', missing, true], ['dispose']])
+    assert.equal(warnings.length, 1)
+    // Cheap when nothing is wrong: a tick over a healthy root touches neither fs nor ACL.
+    records.length = 0
+    assert.deepEqual(await guard.ensureSeen(), [])
+    assert.deepEqual(records, [], 'a healthy root must not be re-granted on every tick')
+  })
+
+  await testAsync('ensureSeen(): the row switch stops the watch too, and remembers nothing to repair', async () => {
+    const root = scratchRoot()
+    const missing = join(root, 'dsh-Ab12Cd')
+    let mkdirCalls = 0
+    const guard = new SandboxTempGuard({
+      enabled: () => false,
+      tempRoots: () => [root],
+      internals: { mkdir: () => { mkdirCalls += 1 }, aclApi: async () => fakeAcl([]) },
+    })
+    guard.remember({ argv: runnerArgv('C:/ws', missing) }, {})
+    assert.deepEqual(await guard.ensureSeen(), [], 'a disabled guard repairs nothing')
+    assert.equal(mkdirCalls, 0, 'and never touches the filesystem')
+  })
+
+  await testAsync('startTempWatch(): the base registers ONE disposable timer, and a tick heals in the host', async () => {
+    const { ShellExecutorBase: Base } = await import(libUrl('shell-executor.js'))
+    const root = scratchRoot()
+    const missing = join(root, 'dsh-Ab12Cd')
+    let disposer
+    let effectLabel = ''
+    const guard = new SandboxTempGuard({ tempRoots: () => [root], warn: () => {}, internals: { aclApi: async () => fakeAcl([]) } })
+    await guard.ensureArgvUsable({ argv: runnerArgv('C:/ws', missing) }, {})
+    rmSync(missing, { recursive: true, force: true })
+    // The real prototype (a tick calls sibling methods, and a plain object crashed
+    // the whole audit), with the class's GETTERS shadowed by own data properties:
+    // neither Object.assign nor a spread can overwrite `tempGuard`.
+    const hostInstance = (fields) => {
+      const made = Object.create(Base.prototype)
+      for (const [key, value] of Object.entries(fields)) Object.defineProperty(made, key, { value, writable: true, configurable: true })
+      return made
+    }
+    const host = hostInstance({
+      tempGuard: guard,
+      tempWatchMs: 5,
+      tempWatchStarted: false,
+      sandboxTempGuardEnabled: true,
+      warnOnce: () => {},
+      ctx: { effect: (callback, label) => { effectLabel = label; disposer = callback() } },
+    })
+    assert.equal(Base.prototype.startTempWatch.call(host), host)
+    assert.ok(typeof disposer === 'function', 'the timer must be disposable through ctx.effect')
+    assert.ok(effectLabel.includes('temp watch'), String(effectLabel))
+    await new Promise((done) => setTimeout(done, 60))
+    assert.ok(existsSync(missing), 'one tick must repair the vanished root')
+    disposer()
+    // Registering twice would leave a second interval behind on every call.
+    const twice = hostInstance({
+      tempGuard: guard, tempWatchMs: 5, tempWatchStarted: true, sandboxTempGuardEnabled: true, warnOnce: () => {},
+      ctx: { effect: () => { throw new Error('must not register a second timer') } },
+    })
+    assert.equal(Base.prototype.startTempWatch.call(twice), twice)
+    // A tick with no working guard must be REPORTED, never thrown out of the timer:
+    // an uncaught throw here takes the whole host down (measured, this file).
+    const broken = hostInstance({
+      tempGuard: undefined,
+      tempWatchMs: 5,
+      tempWatchStarted: false,
+      sandboxTempGuardEnabled: true,
+      warnOnce: undefined,
+      ctx: { effect: (callback) => callback() },
+    })
+    assert.equal(Base.prototype.startTempWatch.call(broken), broken)
+    await new Promise((done) => setTimeout(done, 40))
+  })
+
+  await testAsync('ensureTempRootUsable(): with nothing remembered it ASKS the seam, then heals what the seam requires', async () => {
+    const { ShellExecutorBase: Base } = await import(libUrl('shell-executor.js'))
+    const root = scratchRoot()
+    const missing = join(root, 'dsh-Ab12Cd')
+    let confineCalls = 0
+    const guard = new SandboxTempGuard({ tempRoots: () => [root], warn: () => {}, internals: { aclApi: async () => fakeAcl([]) } })
+    const host = Object.create(Base.prototype)
+    for (const [key, value] of Object.entries({
+      tempGuard: guard,
+      sandboxTempGuardEnabled: true,
+      warnSilentlyOnce: () => {},
+      ctx: {
+        sandboxPolicy: { resolve: () => ({ mode: 'workspace-write', workspaceRoot: 'C:/ws' }) },
+        sandbox: { confine: async () => { confineCalls += 1; return { argv: runnerArgv('C:/ws', missing), temp: missing } } },
+      },
+    })) Object.defineProperty(host, key, { value, writable: true, configurable: true })
+    // The premise of this machine: the probe threw INSIDE the seam, so this row never
+    // reached ensureArgvUsable and the guard knows no root at all.
+    assert.equal(guard.seenTempArgvs.length, 0)
+    await Base.prototype.ensureTempRootUsable.call(host)
+    assert.equal(confineCalls, 1, 'it must ask the seam exactly once')
+    assert.ok(existsSync(missing), 'the root the seam is about to require must exist afterwards')
+    assert.equal(guard.seenTempArgvs.length, 1, 'and it is remembered for the steady state')
+    await Base.prototype.ensureTempRootUsable.call(host)
+    assert.equal(confineCalls, 1, 'the steady state must not call the seam again')
+  })
+
+  await testAsync('rememberAmbient()/ensureAmbient(): a root learned from the listing is rebuilt when it vanishes', async () => {
+    const root = scratchRoot()
+    const victim = join(root, 'dsh-Ab12Cd')
+    mkdirSync(victim)
+    const guard = new SandboxTempGuard({ tempRoots: () => [root], warn: () => {}, internals: { aclApi: async () => fakeAcl([]) } })
+    assert.equal(guard.rememberAmbient(), 1, 'the listing is the source that needs no seam')
+    assert.deepEqual(guard.ambientRoots, [victim])
+    rmSync(victim, { recursive: true, force: true })
+    const repaired = await guard.ensureAmbient()
+    assert.equal(repaired.length, 1)
+    assert.equal(repaired[0].channel, 'ambient-root')
+    assert.equal(repaired[0].action, 'heal')
+    assert.ok(existsSync(victim), 'a root the listing saw must be rebuilt after it vanishes')
+    assert.deepEqual(await guard.ensureAmbient(), [], 'and nothing is done while it exists')
+    // Only the private-root shape, directly under a temp root, may be adopted.
+    mkdirSync(join(root, 'dsh-toolong'))
+    mkdirSync(join(root, 'plain-dir'))
+    const before = guard.ambientRoots.length
+    guard.rememberAmbient()
+    assert.equal(guard.ambientRoots.length, before, 'only dsh-<6 alnum> may be adopted')
+    // The knob stops this channel exactly like the others.
+    const off = new SandboxTempGuard({ enabled: () => false, tempRoots: () => [root], warn: () => {} })
+    off.rememberAmbient()
+    assert.deepEqual(await off.ensureAmbient(), [])
+  })
+
+  test('the guard is shell-free by construction: its code reaches into nothing from the tool layer', () => {
+    const source = readFileSync(join(PLUGIN, 'lib', 'sandbox-temp-guard.js'), 'utf8')
+    const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+    // The contract is: no dependency on the SHELL/tool layer and none on the sandbox
+    // seam. A host context is accepted for one thing only — owning a disposable timer.
+    for (const forbidden of ['shell-executor', 'bash-git', 'bash-wsl', 'bash-msys2', 'tool-bash', 'ctx.shell', 'ctx.sandbox', 'ctx.subprocess'])
+      assert.ok(!code.includes(forbidden), 'the guard must not reach into ' + forbidden)
+    const imported = [...code.matchAll(/from ['"]([^'"]+)['"]/g)].map((match) => match[1])
+    assert.ok(imported.length > 0 && imported.every((specifier) => specifier.startsWith('node:')),
+      'the guard may import node builtins only, got: ' + imported.join(', '))
+  })
+
+  await testAsync('startSandboxTempWatch(): its own row drives the guard, with no shell tool involved', async () => {
+    const root = scratchRoot()
+    const victim = join(root, 'dsh-Ab12Cd')
+    mkdirSync(victim)
+    const guard = new SandboxTempGuard({ tempRoots: () => [root], warn: () => {}, internals: { aclApi: async () => fakeAcl([]) } })
+    let label = ''
+    let disposer
+    const ctx = { effect: (callback, name) => { label = name; disposer = callback() } }
+    assert.equal(startSandboxTempWatch(ctx, { guard, intervalMs: 5 }), guard)
+    assert.ok(label.includes('temp guard'), String(label))
+    assert.deepEqual(guard.ambientRoots, [victim], 'mounting seeds the memory from the listing, before anything vanishes')
+    rmSync(victim, { recursive: true, force: true })
+    await new Promise((done) => setTimeout(done, 40))
+    assert.ok(existsSync(victim), 'the timer repairs it with no shell command anywhere in sight')
+    disposer()
+    // A context that cannot own a timer gets no driver at all, and no crash.
+    assert.equal(startSandboxTempWatch({}, { guard, intervalMs: 5 }), undefined)
   })
 
   // These are AWAITED, unlike the (fire-and-forget) testAsync calls elsewhere in
