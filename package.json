@@ -47,7 +47,8 @@
     "THIRD_PARTY_NOTICES"
   ],
   "scripts": {
-    "test": "powershell -NoProfile -ExecutionPolicy Bypass -File smoke/run.ps1"
+    "test": "node smoke/prepare.mjs",
+    "test:audit": "node smoke/prepare.mjs audit"
   },
   "dsh": {
     "bundle": {

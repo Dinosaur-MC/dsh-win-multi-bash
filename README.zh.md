@@ -214,17 +214,19 @@ dsh plugin --profile web remove dsh-win-multi-bash
 
 ## 验证
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\smoke\run.ps1
+```bash
+pnpm test
 ```
 
 在 profile 运行时上 boot 真实组合（不修改任何 profile），验证 `git_bash` / `wsl_bash` 注册并真实执行（含显式 `bashPath` 变体），并断言 `ctx.shell` 仍由基座自带的行提供——这正是本插件曾经弄坏的那一点。需要 node `^22.19.0 || >=24.0.0`——即本包声明的 `engines.node` 范围。
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\smoke\audit.ps1
+```bash
+pnpm run test:audit
 ```
 
 改为运行完整审计套件：vendor 辅助模块、executor 内部与工具配置 schema 的纯单元覆盖，外加真实 `cordis.patch.yml` 与各类错误配置的 boot 集成矩阵。
+
+两个入口都跑 `smoke/prepare.mjs`：它把 profile 运行时链进 `smoke/node_modules`（已存在但不是预期链接的一律拒碰），把夹具写进 `.temp/smoke/`，并在结束时只删自己建的链接。pinned 变体里用的 `bashPath` 来自插件 `lib/` 自己的解析器，绝不硬编码。
 
 ## 故障排查
 

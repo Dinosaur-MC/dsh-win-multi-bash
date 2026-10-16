@@ -214,17 +214,19 @@ The manual equivalent is the profile's `cordis.patch.yml`: the `insert:` rows th
 
 ## Verification
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\smoke\run.ps1
+```bash
+pnpm test
 ```
 
 Boots a real composition over the profile runtime (modifying nothing), verifies `git_bash` / `wsl_bash` register and execute real commands — including an explicit `bashPath` variant — and asserts `ctx.shell` is still provided by the base bundle's own row (the regression this plugin once caused). Requires node `^22.19.0 || >=24.0.0` — the `engines.node` range this package declares.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\smoke\audit.ps1
+```bash
+pnpm run test:audit
 ```
 
 Runs the full audit suite instead: pure-unit coverage of the vendor helpers, executor internals and tool config schemas, plus boot-integration matrices for the real `cordis.patch.yml` and for misconfigurations.
+
+Both entries run `smoke/prepare.mjs`: it links the profile runtime into `smoke/node_modules` (refusing to touch anything that is not already the expected link), writes its fixtures under `.temp/smoke/`, and removes only the links it created. The `bashPath` it pins comes from the plugin's own resolver in `lib/`, never a hardcoded path.
 
 ## Troubleshooting
 

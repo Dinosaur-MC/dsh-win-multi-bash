@@ -12,8 +12,9 @@
  *      `- insert:` blocks and `!!js` disabled tags) and executes a scenario
  *      matrix through git_bash / wsl_bash and the base bundle's shell seat.
  *
- * Run via smoke/audit.ps1 (it sets up the smoke/node_modules junctions and
- * cleans up after). Requires the profile runtime at ~/.dsh/profiles.
+ * Run via `pnpm test:audit` (or `node smoke/prepare.mjs audit`): that Node
+ * bootstrap links the profile runtime into smoke/node_modules and cleans up
+ * after. Requires the profile runtime at ~/.dsh/profiles.
  *
  * Exit code 0 = all assertions passed; every failure prints a ✗ line.
  *
@@ -5240,15 +5241,17 @@ console.log('\n[A] unit: repository records (bilingual pair, LF discipline, publ
     }
   })
 
-  test('every PowerShell script starts with a UTF-8 BOM', () => {
-    // Windows PowerShell 5.1 reads a BOM-less UTF-8 script as GBK: the Chinese
-    // comments corrupt and a damaged byte can swallow a newline, so the rest of
-    // the script lands inside a comment and parsing fails far from the cause.
-    // smoke/run.ps1 regressed that way the moment a rewrite dropped its BOM.
-    for (const path of ['smoke/run.ps1', 'smoke/audit.ps1']) {
-      const head = readFileSync(join(PLUGIN, path)).subarray(0, 3)
-      assert.ok(head[0] === 0xef && head[1] === 0xbb && head[2] === 0xbf, `${path} must start with a UTF-8 BOM (PowerShell 5.1 reads it as GBK without one)`)
+  test('the smoke bootstrap is Node, and the PowerShell scripts are gone', () => {
+    // Two PowerShell scripts used to duplicate this bootstrap, and one of them
+    // re-implemented the plugin OWN Git Bash probe. One Node entry replaced them,
+    // which also retired the UTF-8 BOM requirement PowerShell 5.1 imposed (a
+    // rewrite once dropped run.ps1 BOM and PowerShell then read it as GBK).
+    for (const gone of ['smoke/run.ps1', 'smoke/audit.ps1']) {
+      assert.ok(!existsSync(join(PLUGIN, gone)), gone + ' must be gone: the Node bootstrap replaced it')
     }
+    assert.ok(existsSync(join(PLUGIN, 'smoke/prepare.mjs')), 'the Node bootstrap must exist')
+    assert.equal(manifest.scripts.test, 'node smoke/prepare.mjs', 'npm test must run the Node bootstrap')
+    assert.equal(manifest.scripts['test:audit'], 'node smoke/prepare.mjs audit', 'and so must the audit entry')
   })
 
   test('the published file list ships the wiring and the implementation, and no hand-wiring scripts', () => {
