@@ -517,7 +517,11 @@ console.log('\n[A] unit: config schemas')
     assert.equal(typeof packageRow.name, 'string')
     assert.equal(packageRow.name, 'dsh-win-multi-bash', 'the plugin name is the bare package specifier')
     assert.equal(typeof packageRow.apply, 'function')
-    assert.ok(!('Config' in packageRow), 'the core row owns no tool and no config of its own')
+    // It owns no TOOL, but it does own the deployment-wide switches: the top-level
+    // self-heal switch is read here, and declaring Config is also what makes the Host
+    // serve this row's namespace (the precondition for the top-level card).
+    assert.ok('Config' in packageRow, 'the core row declares the top-level switches')
+    assert.equal(typeof packageRow.Config, 'function')
     for (const s of ['systemPrompt', 'tools']) assert.ok(packageRow.inject.includes(s), `the core row must inject ${s}`)
   })
   test('the development-only shell-prompt row is deleted, not shimmed', () => {
@@ -2192,19 +2196,19 @@ console.log('\n[A] unit: runtime-editable config surface (the volatile projectio
   // the page never shows. The projected set is therefore the plugin's
   // configurable-option list, and it is pinned here so a field added to a
   // backend without `.volatile()` cannot silently stay YAML-only.
-  test('the git_bash row exposes the tool-layer switch and every executor knob', () => {
+  test('the git_bash row exposes the background switch and every executor knob', () => {
+    // No guardSandboxTemp here: the deployment-wide switch is listed ONCE, on the
+    // package row, and a row copy is exactly the repetition this pins against.
     assert.deepEqual(volatilePaths(gitBashTool.Config), [
       'enableRunInBackground',
-      'guardSandboxTemp',
       'gitBash.cwd', 'gitBash.timeoutMs', 'gitBash.maxTimeoutMs', 'gitBash.maxOutputBytes',
       'gitBash.maxSpillBytes', 'gitBash.graceMs',
       'gitBash.bashPath', 'gitBash.sandbox', 'gitBash.probeTimeoutMs', 'gitBash.requireSandbox', 'gitBash.sandboxNotice',
     ])
   })
-  test('the wsl_bash row exposes the tool-layer switch and every executor knob', () => {
+  test('the wsl_bash row exposes the background switch and every executor knob', () => {
     assert.deepEqual(volatilePaths(wslBashTool.Config), [
       'enableRunInBackground',
-      'guardSandboxTemp',
       'wslBash.cwd', 'wslBash.timeoutMs', 'wslBash.maxTimeoutMs', 'wslBash.maxOutputBytes',
       'wslBash.maxSpillBytes', 'wslBash.graceMs',
       'wslBash.wslPath', 'wslBash.wslDistro', 'wslBash.sandbox', 'wslBash.probeTimeoutMs', 'wslBash.requireSandbox', 'wslBash.sandboxNotice',
@@ -2370,22 +2374,25 @@ console.log('\n[A] unit: sandbox private temp guard (self-heal for the sandbox p
     assert.deepEqual(imported[1].split(',').map((name) => name.trim()).sort(), ['existsSync', 'mkdirSync', 'readdirSync', 'statSync'])
   })
 
-  test('the knob is a tool-layer field on every row, volatile, and ON by default', () => {
-    assert.deepEqual(TOOL_LAYER_FIELDS.map((knob) => knob.key), ['enableRunInBackground', SANDBOX_TEMP_GUARD_KNOB])
-    assert.equal(gitBashTool.Config({})[SANDBOX_TEMP_GUARD_KNOB].get(), SANDBOX_TEMP_GUARD_DEFAULT)
-    assert.equal(wslBashTool.Config({})[SANDBOX_TEMP_GUARD_KNOB].get(), SANDBOX_TEMP_GUARD_DEFAULT)
-    assert.equal(gitBashTool.Config({})[SANDBOX_TEMP_GUARD_KNOB].get(), true)
-    // Non-volatile would mean YAML-only: the Plugins page could never reach it.
-    assert.equal(gitBashTool.Config.dict[SANDBOX_TEMP_GUARD_KNOB].meta?.volatile, true)
+  test('the self-heal switch is listed ONCE, on the package row, never on a tool row', () => {
+    assert.deepEqual(TOOL_LAYER_FIELDS.map((knob) => knob.key), ['enableRunInBackground'])
+    // The deployment-wide self-heal switch is NOT a tool-layer field any more: it is
+    // declared once on the package row, so no tool row repeats it and no row page
+    // shows it. A row that ever declares its own still wins (the override path).
+    for (const tool of [gitBashTool, wslBashTool]) {
+      assert.ok(!(SANDBOX_TEMP_GUARD_KNOB in tool.Config({})), 'a tool row must not carry the deployment-wide switch')
+      assert.equal(tool.Config.dict[SANDBOX_TEMP_GUARD_KNOB], undefined, 'and it must not be reachable as a row option either')
+    }
     // The switch belongs to the rows that RUN a confined command (the dialect
     // rows). The terminal row deliberately does NOT carry it: a PTY session is
     // never wrapped by the sandbox seam, so a switch there would be a control
     // that cannot do anything — the opposite of what this file exists to prevent.
     const terminalRowId = TERMINAL_ROWS[0].rowId
     for (const row of REGISTRY_ROWS) {
-      const carries = row.fields.some((knob) => knob.key === SANDBOX_TEMP_GUARD_KNOB)
-      if (row.rowId === terminalRowId) assert.ok(!carries, row.rowId + ' must not offer a switch its PTY sessions can never use')
-      else assert.ok(carries, row.rowId + ' is missing the guard switch on its page')
+      // THE SWITCH IS LISTED ONCE, on the package row (its own Config): a tool row
+      // must not repeat it, because four copies of one deployment-wide knob is
+      // exactly the drift a single top-level switch exists to prevent.
+      assert.ok(!row.fields.some((knob) => knob.key === SANDBOX_TEMP_GUARD_KNOB), row.rowId + ' must not repeat the deployment-wide switch')
     }
   })
 
@@ -2531,6 +2538,82 @@ console.log('\n[A] unit: sandbox private temp guard (self-heal for the sandbox p
     assert.equal(guard.seenTempArgvs.length, 1, 'and it is remembered for the steady state')
     await Base.prototype.ensureTempRootUsable.call(host)
     assert.equal(confineCalls, 1, 'the steady state must not call the seam again')
+  })
+
+  await testAsync('confineRun(): by the time it returns, the seam argv is usable — the spawn never sees a missing --temp', async () => {
+    const { ShellExecutorBase: Base } = await import(libUrl('shell-executor.js'))
+    const root = scratchRoot()
+    const missing = join(root, 'dsh-Qq77Ww')
+    const guard = new SandboxTempGuard({ tempRoots: () => [root], warn: () => {}, internals: { aclApi: async () => fakeAcl([]) } })
+    const host = Object.create(Base.prototype)
+    for (const [key, value] of Object.entries({
+      tempGuard: guard,
+      sandboxTempGuardEnabled: true,
+      tempWatchStarted: true,
+      warnOnce: () => {},
+      warnSilentlyOnce: () => {},
+      ctx: {
+        sandbox: { confine: async (argv) => ({ argv: runnerArgv('C:/ws', missing), temp: missing }) },
+      },
+    })) Object.defineProperty(host, key, { value, writable: true, configurable: true })
+    // The premise: the seam hands back an argv naming a root that is GONE. The
+    // caller spawns whatever this call returns, so the repair has to be inside it.
+    assert.ok(!existsSync(missing), 'the premise is a missing private root')
+    const policy = { mode: 'workspace-write', workspaceRoot: 'C:/ws' }
+    const confined = await Base.prototype.confineRun.call(host, ['bash', '-c', 'echo hi'], policy, undefined)
+    const temp = sandboxTempArgument(confined.argv)
+    assert.equal(temp, missing, 'the seam result is returned unmodified')
+    assert.ok(existsSync(temp), 'and the root it names exists BEFORE the caller can spawn it')
+  })
+
+  test('the interval is a LIVE value: the knob applies without a reload, and has a floor', async () => {
+    const mod = await import(libUrl('sandbox-temp-guard.js'))
+    assert.equal(typeof mod.getSandboxTempWatchMs, 'function', 'the live value must be readable')
+    assert.equal(typeof mod.setSandboxTempWatchMs, 'function', 'and writable by the package row')
+    assert.equal(mod.getSandboxTempWatchMs(), mod.SANDBOX_TEMP_WATCH_MS, 'it starts at the shipped default')
+    assert.equal(mod.setSandboxTempWatchMs(2000), 2000, 'a value from the page is taken as-is')
+    assert.equal(mod.getSandboxTempWatchMs(), 2000, 'and read back live, with no reload')
+    assert.equal(mod.setSandboxTempWatchMs(5), 2000, 'a value under the floor is refused, not latched')
+    assert.equal(mod.setSandboxTempWatchMs('nonsense'), 2000, 'and so is a non-number')
+    assert.ok(mod.SANDBOX_TEMP_WATCH_MS <= 10_000, 'the shipped default is the timelier one')
+  })
+
+  test("the plugin row declares the switch, and the client lists it at the TOP level", () => {
+    // The Host serves a settings namespace only when the row declares a Config, and
+    // the official page renders a bundle config card only for plugins.bundle.config
+    // keyed by the PACKAGE name — a row-level form alone can never reach the top.
+    const index = readFileSync(join(PLUGIN, 'lib', 'index.js'), 'utf8')
+    assert.ok(index.includes('guardSandboxTemp'), 'the package row must declare the switch')
+    assert.ok(index.includes('config.guardSandboxTemp !== false'), 'and the switch must reach the driver')
+    assert.ok(index.includes('z.boolean().default(SANDBOX_TEMP_GUARD_DEFAULT)'), 'the switch defaults to the guard default')
+    assert.ok(index.includes('z.natural().default(SANDBOX_TEMP_WATCH_MS)'), 'and the interval to the watch constant')
+    // Volatile is not decoration: a plain field is served read-only, and the page
+    // then reports the row as unconfigurable instead of rendering the switch.
+    assert.ok(index.includes('guardSandboxTemp: z.boolean().default(SANDBOX_TEMP_GUARD_DEFAULT).volatile()'), 'the switch must be volatile')
+    assert.ok(index.includes('tempWatchMs: z.natural().default(SANDBOX_TEMP_WATCH_MS).volatile()'), 'and so must the interval')
+    const client = readFileSync(join(PLUGIN, 'lib', 'client.js'), 'utf8')
+    assert.ok(client.includes('plugins.bundle.config'), 'the client must register the top-level seat')
+    // The switch card is offered at every seat a deployment might render it from:
+    // the core row's own page, and the bundle seat under both candidate keys.
+    assert.ok(!client.includes('["plugins.row.config", rowKey(CORE_ROW_ID)]'), 'the core row page must not carry it')
+    assert.ok(client.includes('"settings.section"'), 'and the top-level Settings section must')
+    assert.ok(client.includes('["plugins.bundle.config", CORE_ROW_ID]'), 'the bundle seat under the served namespace')
+    assert.ok(client.includes('["plugins.bundle.config", PACKAGE_NAME]'), 'and under the package name the contract words it with')
+  })
+
+  await testAsync("startSandboxTempWatch(): the row switch off means no repair at all", async () => {
+    const root = scratchRoot()
+    const victim = join(root, 'dsh-Ab12Cd')
+    mkdirSync(victim)
+    // A pre-built guard carries its own switch, so this one is built OFF: the point
+    // is that the driver repairs nothing at all when the deployment turned it off.
+    const guard = new SandboxTempGuard({ enabled: () => false, tempRoots: () => [root], warn: () => {}, internals: { aclApi: async () => fakeAcl([]) } })
+    let disposer
+    startSandboxTempWatch({ effect: (callback) => { disposer = callback() } }, { guard, intervalMs: 5 })
+    rmSync(victim, { recursive: true, force: true })
+    await new Promise((done) => setTimeout(done, 40))
+    assert.ok(!existsSync(victim), 'a disabled guard must not recreate anything')
+    disposer()
   })
 
   await testAsync('rememberAmbient()/ensureAmbient(): a root learned from the listing is rebuilt when it vanishes', async () => {
@@ -3176,7 +3259,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
       ['win-mb-tool-git', gitBashTool, 'gitBash'],
       ['win-mb-tool-wsl', wslBashTool, 'wslBash'],
     ]) {
-      assert.deepEqual(Object.keys(tool.Config.dict), ['enableRunInBackground', 'guardSandboxTemp', 'promoteOnTimeout', partition])
+      assert.deepEqual(Object.keys(tool.Config.dict), ['enableRunInBackground', 'promoteOnTimeout', partition])
       assert.equal(tool.Config.dict.promoteOnTimeout.meta?.volatile, undefined, 'promoteOnTimeout must stay plain')
       const paths = volatilePaths(tool.Config)
       assert.ok(!paths.includes('promoteOnTimeout'), `${rowId}: promoteOnTimeout must not be projected`)
@@ -3451,8 +3534,14 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     }
     // The bundle page also gets the core-row label and note, on their own slots.
     const detail = slotRegistrations.filter((entry) => entry.options.name !== 'plugins.row.config')
-    assert.deepEqual(detail.map((entry) => entry.options.name), ['plugins.detail.badge', 'plugins.detail.section'])
-    for (const entry of detail) {
+    // The bundle seat comes first, under both candidate keys; then the badge/note.
+    assert.deepEqual(detail.map((entry) => entry.options.name), ['plugins.bundle.config', 'plugins.bundle.config', 'settings.section', 'plugins.detail.badge', 'plugins.detail.section'])
+    assert.deepEqual(detail.slice(0, 2).map((entry) => entry.options.key), [client.__internals.CORE_ROW_ID, 'dsh-win-multi-bash'])
+    // The Settings surface is where this deployment actually renders a contribution.
+    assert.equal(detail[2].options.id, 'win-mb-bash-switch')
+    assert.equal(detail[0].component, RowConfigCard)
+    assert.equal(typeof detail[0].options.inject().hooks.rowForm.getSnapshot, 'function')
+    for (const entry of detail.slice(3)) {
       assert.equal(entry.options.locale, client.NS)
       assert.equal(entry.options.id, 'dsh-win-multi-bash:core')
     }
