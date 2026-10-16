@@ -2647,12 +2647,16 @@ console.log('\n[A] unit: sandbox private temp guard (self-heal for the sandbox p
     assert.ok(index.includes('tempWatchMs: z.natural().default(SANDBOX_TEMP_WATCH_MS).volatile()'), 'and so must the interval')
     const client = readFileSync(join(PLUGIN, 'lib', 'client.js'), 'utf8')
     assert.ok(client.includes('plugins.bundle.config'), 'the client must register the top-level seat')
-    // The switch card is offered at every seat a deployment might render it from:
-    // the core row's own page, and the bundle seat under both candidate keys.
+    // The switch card is offered at every key a deployment might ask that seat with:
+    // the bundle seat under the served namespace, and under the package name.
     assert.ok(!client.includes('["plugins.row.config", rowKey(CORE_ROW_ID)]'), 'the core row page must not carry it')
-    assert.ok(client.includes('"settings.section"'), 'and the top-level Settings section must')
     assert.ok(client.includes('["plugins.bundle.config", CORE_ROW_ID]'), 'the bundle seat under the served namespace')
     assert.ok(client.includes('["plugins.bundle.config", PACKAGE_NAME]'), 'and under the package name the contract words it with')
+    // Listed exactly once, as the README words it. Measured on this host (2026-10-17):
+    // a `settings.section` contribution rendered the same form a second time, as an
+    // unlabelled top-level Settings entry, because a section registration here carries
+    // no label at all. The bundle card is the one place.
+    assert.ok(!client.includes('ctx.slots.inject("settings.section"'), 'the Settings panel must not carry a second copy')
   })
 
   await testAsync("startSandboxTempWatch(): the row switch off means no repair at all", async () => {
@@ -3588,14 +3592,13 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     }
     // The bundle page also gets the core-row label and note, on their own slots.
     const detail = slotRegistrations.filter((entry) => entry.options.name !== 'plugins.row.config')
-    // The bundle seat comes first, under both candidate keys; then the badge/note.
-    assert.deepEqual(detail.map((entry) => entry.options.name), ['plugins.bundle.config', 'plugins.bundle.config', 'settings.section', 'plugins.detail.badge', 'plugins.detail.section'])
+    // The bundle seat comes first, under both candidate keys; then the badge/note. No
+    // `settings.section` entry: that surface showed the same form a second time.
+    assert.deepEqual(detail.map((entry) => entry.options.name), ['plugins.bundle.config', 'plugins.bundle.config', 'plugins.detail.badge', 'plugins.detail.section'])
     assert.deepEqual(detail.slice(0, 2).map((entry) => entry.options.key), [client.__internals.CORE_ROW_ID, 'dsh-win-multi-bash'])
-    // The Settings surface is where this deployment actually renders a contribution.
-    assert.equal(detail[2].options.id, 'win-mb-bash-switch')
     assert.equal(detail[0].component, RowConfigCard)
     assert.equal(typeof detail[0].options.inject().hooks.rowForm.getSnapshot, 'function')
-    for (const entry of detail.slice(3)) {
+    for (const entry of detail.slice(2)) {
       assert.equal(entry.options.locale, client.NS)
       assert.equal(entry.options.id, 'dsh-win-multi-bash:core')
     }
