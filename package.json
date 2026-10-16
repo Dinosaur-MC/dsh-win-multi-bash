@@ -1,18 +1,19 @@
 {
   "name": "dsh-win-multi-bash",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "author": "Dinosaur_MC",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Dinosaur-MC/dsh-win-multi-bash.git"
   },
-  "description": "Windows multi-bash plugin for dsh: git_bash / wsl_bash model tools, each owning its own Git Bash / WSL executor and leaving the ctx.shell seat to dsh's own pwsh executor.",
+  "description": "Windows multi-bash plugin for dsh: git_bash, wsl_bash and opt-in msys2_bash model tools, each owning its own Git Bash / WSL / MSYS2 executor and leaving the ctx.shell seat to dsh's own pwsh executor.",
   "keywords": [
     "dsh-plugin",
     "windows",
     "bash",
     "git-bash",
     "wsl",
+    "msys2",
     "shell-select"
   ],
   "license": "MIT",

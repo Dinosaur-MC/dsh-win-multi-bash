@@ -1,3 +1,29 @@
+# dsh-win-multi-bash v0.6.0
+
+## Improvements
+
+- **A third shell dialect, `msys2_bash`, ships switched off.** It exposes MSYS2's UCRT64 bash as its own model tool — `uname` reports the MSYS runtime rather than Linux, `pacman` is reachable, `$MSYSTEM` is exported — with its own facts in the tool description; its `bash.exe` is discovered under the installation roots the dialect declares, or pinned per machine with `msys2Bash.bashPath`. The row arrives `disabled: true`: enable it in the Plugins page if you want a second toolchain next to Git Bash.
+- **Adding a shell is now one executor file plus one declaration.** Every dialect is declared once — id, tool name, row id, config key, executor class, argv style, executable resolver, sandbox stances, family facts, default-enabled — and the tool modules, the shared prompt section's membership, the row wiring, the config partition and the package exports are all derived from that declaration. The mechanism half moved into a shared executor base, so a new dialect inherits existing behaviour instead of copying it: `lib/bash-git/index.js` **658 → 550 lines**, `lib/bash-wsl/index.js` **571 → 471**.
+- **A declaration that does not hold together refuses to load.** Five startup checks (unique dialect id / tool name / row id / config key; a `configKey` that does not match the client form partition; a tool name that collides with the family section's name; a sandbox stance list without `auto`; family facts with no shared text) throw at load time instead of leaving a half-wired tool behind. Forgetting a derived surface is a loud failure now, not a silently disabled feature.
+- **A background job keeps the identity of the call that created it.** `jobs.start` now carries `toolCall` (call id and root call id), so dsh's job records name the originating tool call; on a runtime that does not know the field, the plugin drops it and retries once instead of failing the call.
+- **Docs:** the README (both languages) now carries status badges — npm, license, Node, stars, the required dsh version, `platform: windows`, the three dialects — and a *Roadmap (registered, not implemented)* section naming the two next tools (an interactive PTY session and a remote SSH terminal).
+
+## Compatibility
+
+- **No existing tool changes name, parameters or result shape.** `msys2_bash` is a new opt-in row; `git_bash` and `wsl_bash` keep their schemas, their sandbox facts and their wording. The shared prompt section's text, its order (between dsh's `TOOL_BASH` and `TOOL_PWSH`) and its one-copy-per-composition rule are unchanged.
+- **An existing profile keeps working untouched.** The patch's three existing rows are byte-identical, and the package `exports` map only gained entries (`./factory`, `./shell-family`, `./registry`, `./tool-msys2-bash`).
+- **The browser half still comes from the core row** (`win-mb-plugin`, the bare package-name row). Switching that row off still leaves both older tools working with the shared guidance in their own descriptions, and only the Configure pages disappear.
+
+## Verification
+
+Verified on dsh **0.2.1-alpha.4**, with the same plugin code re-run on **0.2.1-alpha.3** as a control.
+
+- `smoke/audit.test.mjs`: **326 checks, 0 failures** (301 at v0.5.1), two runs per runtime.
+- `npm pack --dry-run`: **25 files** (20 at v0.5.1 — five new `lib/` files carry the dialect registry, the shared executor base and the MSYS2 dialect). Tests, docs and these notes stay out of the tarball.
+- **All three dialects run for real on this machine**: `git_bash` (MSYS/Git Bash), `wsl_bash` (WSL, bubblewrap stance) and `msys2_bash` (MSYS2 UCRT64 — `$MSYSTEM=UCRT64`, `pacman` reachable, a non-ASCII working directory read back).
+- The startup checks and the two unmergeable dialect differences (symlink resolution when locating the executable; each dialect's own sandbox-stance vocabulary) are covered by named guards; putting the pre-refactor wiring back turns each named guard red.
+- The audit no longer depends on an artifact being present: it creates its own probe parent directory, so a fresh clone (no `.temp/`) is green on the **first** run instead of only on the second.
+
 # dsh-win-multi-bash v0.5.1
 
 ## Bug fixes
