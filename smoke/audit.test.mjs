@@ -1999,10 +1999,24 @@ console.log('\n[A] unit + [B] boot: the MSYS2 dialect end to end (S3)')
   // non-ASCII path).
   const { CLIENT_ROWS, PATCH_ROWS, EXPORT_SUBPATHS, TOOL_INSTANCES, dialectById } = await import(libUrl('tool-bash', 'types', 'registry.js'))
   const msys2Tool = await import(libUrl('tool-bash', 'types', 'msys2-bash.js'))
-  const { declaredBashPaths, msys2RootOf, msys2ToolPath } = await import(libUrl('bash-msys2', 'index.js'))
+  const { Msys2BashExecutor, declaredBashPaths, msys2RootOf, msys2ToolPath } = await import(libUrl('bash-msys2', 'index.js'))
   const declaration = dialectById('msys2')
   const candidates = declaredBashPaths()
   const MSYS2_BASH = candidates.find((candidate) => existsSync(candidate))
+
+  test('the unpinned probe returns its candidate list (the defect a live session found)', () => {
+    // `msys2Candidates()` used to return the FUNCTION instead of calling it, so both
+    // callers threw; every MSYS2 test above pins `bashPath`, which short-circuits the
+    // method, so the suite stayed green while an unpinned row could never discover its
+    // own installation. Both callers are pinned here, against a bare instance.
+    const bare = Object.create(Msys2BashExecutor.prototype)
+    bare.config = { bashPath: { get: () => '' } }
+    bare.internals = {}
+    const probed = bare.msys2Candidates()
+    assert.ok(Array.isArray(probed), 'the probe must return the candidate list, not the function itself')
+    assert.deepEqual(probed, declaredBashPaths(), 'and it must be the declaration-driven list')
+    assert.doesNotThrow(() => bare.tryBashPath(), 'unpinned discovery must be able to run at all')
+  })
 
   test('the declaration reaches every derived surface, and the name does not collide', () => {
     assert.equal(declaration.toolName, 'msys2_bash')
