@@ -2566,16 +2566,57 @@ console.log('\n[A] unit: sandbox private temp guard (self-heal for the sandbox p
     assert.ok(existsSync(temp), 'and the root it names exists BEFORE the caller can spawn it')
   })
 
-  test('the interval is a LIVE value: the knob applies without a reload, and has a floor', async () => {
+  // `testAsync`, not `test`: with the synchronous helper an assertion failure here is an
+  // uncaught rejection that aborts the whole file (later cases never run, and the ✓ is
+  // printed before the assertion), which is exactly how this case first hid a bug.
+  await testAsync('the interval is a LIVE value: the knob applies without a reload, and has a floor', async () => {
     const mod = await import(libUrl('sandbox-temp-guard.js'))
     assert.equal(typeof mod.getSandboxTempWatchMs, 'function', 'the live value must be readable')
     assert.equal(typeof mod.setSandboxTempWatchMs, 'function', 'and writable by the package row')
     assert.equal(mod.getSandboxTempWatchMs(), mod.SANDBOX_TEMP_WATCH_MS, 'it starts at the shipped default')
-    assert.equal(mod.setSandboxTempWatchMs(2000), 2000, 'a value from the page is taken as-is')
-    assert.equal(mod.getSandboxTempWatchMs(), 2000, 'and read back live, with no reload')
-    assert.equal(mod.setSandboxTempWatchMs(5), 2000, 'a value under the floor is refused, not latched')
-    assert.equal(mod.setSandboxTempWatchMs('nonsense'), 2000, 'and so is a non-number')
+    // Module state is shared with every other test in this file, so the value is
+    // restored: a leaked 2000 would silently couple later cases to this one.
+    const shipped = mod.getSandboxTempWatchMs()
+    try {
+      assert.equal(mod.setSandboxTempWatchMs(2000), 2000, 'a value from the page is taken as-is')
+      assert.equal(mod.getSandboxTempWatchMs(), 2000, 'and read back live, with no reload')
+      assert.equal(mod.setSandboxTempWatchMs(5), mod.SANDBOX_TEMP_WATCH_MS_MIN, 'a value under the floor is CLAMPED UP, never silently ignored')
+      assert.equal(mod.setSandboxTempWatchMs('nonsense'), mod.SANDBOX_TEMP_WATCH_MS, 'a non-number falls back to the shipped default')
+      // A live source (what the package row publishes) is resolved on every read.
+      let asked = 3000
+      assert.equal(mod.setSandboxTempWatchMs(() => asked), 3000, 'an accessor is accepted')
+      asked = 4000
+      assert.equal(mod.getSandboxTempWatchMs(), 4000, 'and re-read after the handle changes')
+    } finally {
+      mod.setSandboxTempWatchMs(shipped)
+      assert.equal(mod.getSandboxTempWatchMs(), shipped, 'the live value must be left as it was found')
+    }
     assert.ok(mod.SANDBOX_TEMP_WATCH_MS <= 10_000, 'the shipped default is the timelier one')
+  })
+
+  // REGRESSION GUARD (review of the previous commit found this whole family missing).
+  // A `.volatile()` field arrives in `apply` as a live handle, not as a value: comparing
+  // the handle to `false` kept the OFF path from ever existing, `Number(handle)` was NaN
+  // so the interval knob was ignored, and the handle handed to `setTimeout` was coerced
+  // to 1 ms — a synchronous `%TEMP%` listing about a thousand times a second.
+  await testAsync('the package row resolves its .volatile() knobs to live VALUES, not to handles', async () => {
+    const plugin = await import(libUrl('index.js'))
+    const guardApi = await import(libUrl('sandbox-temp-guard.js'))
+    let enabled = false
+    let asked = 1500
+    const resolved = { guardSandboxTemp: { get: () => enabled }, tempWatchMs: { get: () => asked } }
+    const disposers = []
+    // `apply` returns early without a `systemPrompt` service; the guard is published first.
+    plugin.apply({ logger: { warn: () => {} }, effect: (callback) => { const off = callback(); disposers.push(off); return off; } }, resolved)
+    assert.equal(guardApi.getSandboxTempGuardEnabled(), false, 'off must mean OFF, not a truthy handle')
+    assert.equal(guardApi.getSandboxTempWatchMs(), 1500, 'the interval must land as a NUMBER, not a handle')
+    enabled = true
+    asked = 2500
+    assert.equal(guardApi.getSandboxTempGuardEnabled(), true, 'a later page change is seen without re-running apply')
+    assert.equal(guardApi.getSandboxTempWatchMs(), 2500, 'and so is the interval')
+    for (const off of disposers) if (typeof off === 'function') off()
+    guardApi.setSandboxTempGuardEnabled(true)
+    guardApi.setSandboxTempWatchMs(guardApi.SANDBOX_TEMP_WATCH_MS)
   })
 
   test("the plugin row declares the switch, and the client lists it at the TOP level", () => {
@@ -2584,7 +2625,11 @@ console.log('\n[A] unit: sandbox private temp guard (self-heal for the sandbox p
     // keyed by the PACKAGE name — a row-level form alone can never reach the top.
     const index = readFileSync(join(PLUGIN, 'lib', 'index.js'), 'utf8')
     assert.ok(index.includes('guardSandboxTemp'), 'the package row must declare the switch')
-    assert.ok(index.includes('config.guardSandboxTemp !== false'), 'and the switch must reach the driver')
+    // `.volatile()` fields arrive as live handles, so the row must READ THROUGH them: the
+    // previous form compared the handle itself to false and silently killed the OFF path.
+    assert.ok(index.includes('live(config.guardSandboxTemp) !== false'), 'the switch must be resolved through its handle')
+    assert.ok(index.includes('setSandboxTempWatchMs(() => live(config.tempWatchMs))'), 'and the interval published as a live source')
+    assert.ok(!index.includes('intervalMs: config.tempWatchMs'), 'a raw handle must never reach the timer')
     assert.ok(index.includes('z.boolean().default(SANDBOX_TEMP_GUARD_DEFAULT)'), 'the switch defaults to the guard default')
     assert.ok(index.includes('z.natural().default(SANDBOX_TEMP_WATCH_MS)'), 'and the interval to the watch constant')
     // Volatile is not decoration: a plain field is served read-only, and the page
