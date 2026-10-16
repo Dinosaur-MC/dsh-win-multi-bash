@@ -1293,6 +1293,14 @@ console.log('\n[A] unit: job reads carry their loss/sandbox notices; the exporte
     assert.equal(short, `x\n${unconfinedMarker('read-only')}`)
     assert.ok(!short.includes('confinement probe found no usable sandbox'), 'the short marker explains nothing')
     assert.ok(unconfinedMarker('read-only').length < 120, `the short marker must stay short: ${unconfinedMarker('read-only').length} chars`)
+    // `sandboxNotice: once` (the default) spends the row's one announcement on its
+    // first degraded run, so every later renderer suppresses the text entirely —
+    // the structured `sandbox.unconfined` fact is what still carries the truth.
+    assert.equal(
+      renderResult({ ...base, sandbox: unconfined }, [], { unconfinedIsAutomatic: true, unconfinedSilent: true }),
+      'x\n',
+      'a silenced notice leaves the output untouched',
+    )
     for (const clause of ['confinement probe found no usable sandbox', 'repair the sandbox', 'sandbox: none']) {
       assert.ok(announced.includes(clause), `the full explanation must state "${clause}": ${announced}`)
     }
@@ -1876,6 +1884,7 @@ console.log('\n[A] unit: the shared executor base owns the mechanism, each diale
   // either is ever unified, and the first one fails if a dialect re-implements
   // (and so can drift from) the shared mechanism.
   const { ShellExecutorBase, sharedStanceConfig } = await import(libUrl('shell-executor.js'))
+  const { SANDBOX_NOTICE_LEVELS } = await import(libUrl('shell-dialects.js'))
   const { dialectById } = await import(libUrl('tool-bash', 'types', 'registry.js'))
   const { candidateExists: wslCandidateExists } = await import(libUrl('bash-wsl', 'index.js'))
   const { candidateExists: gitCandidateExists } = await import(libUrl('bash-git', 'index.js'))
@@ -1936,16 +1945,20 @@ console.log('\n[A] unit: the shared executor base owns the mechanism, each diale
   })
 
   test('the shared stance fragment builds each vocabulary (and its deadline) from the declaration', () => {
-    const fragment = sharedStanceConfig(['auto', 'none'], 1234)
+    const fragment = sharedStanceConfig(['auto', 'none'], 1234, SANDBOX_NOTICE_LEVELS)
     // A union built here still holds its member schemas; `deriveConfig` is what
     // normalizes them into the plain list the two Configs expose.
     assert.equal(String(fragment.sandbox), '"auto" | "none"')
-    assert.equal(String(sharedStanceConfig(['auto', 'none', 'bwrap'], 1).sandbox), '"auto" | "none" | "bwrap"')
+    assert.equal(String(sharedStanceConfig(['auto', 'none', 'bwrap'], 1, SANDBOX_NOTICE_LEVELS).sandbox), '"auto" | "none" | "bwrap"')
     assert.equal(fragment.sandbox.meta.default, 'auto')
     assert.equal(fragment.sandbox.meta.volatile, true)
     assert.equal(fragment.probeTimeoutMs.meta.default, 1234)
     assert.equal(fragment.requireSandbox.meta.default, false)
-    assert.deepEqual(Object.keys(sharedStanceConfig(['auto'], 1)).sort(), ['probeTimeoutMs', 'requireSandbox', 'sandbox'])
+    // The unwrapped-run notice vocabulary comes from the registry, so the schema
+    // union and the browser form's options cannot drift; `once` is the default
+    // because repeating the sentence on every call only costs context.
+    assert.equal(fragment.sandboxNotice.meta.default, 'once')
+    assert.deepEqual(Object.keys(sharedStanceConfig(['auto'], 1, SANDBOX_NOTICE_LEVELS)).sort(), ['probeTimeoutMs', 'requireSandbox', 'sandbox', 'sandboxNotice'])
   })
 
   test('familyRowComposed answers from the registered fact first, then the loader', () => {
@@ -2171,7 +2184,7 @@ console.log('\n[A] unit: runtime-editable config surface (the volatile projectio
       'guardSandboxTemp',
       'gitBash.cwd', 'gitBash.timeoutMs', 'gitBash.maxTimeoutMs', 'gitBash.maxOutputBytes',
       'gitBash.maxSpillBytes', 'gitBash.graceMs',
-      'gitBash.bashPath', 'gitBash.sandbox', 'gitBash.probeTimeoutMs', 'gitBash.requireSandbox',
+      'gitBash.bashPath', 'gitBash.sandbox', 'gitBash.probeTimeoutMs', 'gitBash.requireSandbox', 'gitBash.sandboxNotice',
     ])
   })
   test('the wsl_bash row exposes the tool-layer switch and every executor knob', () => {
@@ -2180,7 +2193,7 @@ console.log('\n[A] unit: runtime-editable config surface (the volatile projectio
       'guardSandboxTemp',
       'wslBash.cwd', 'wslBash.timeoutMs', 'wslBash.maxTimeoutMs', 'wslBash.maxOutputBytes',
       'wslBash.maxSpillBytes', 'wslBash.graceMs',
-      'wslBash.wslPath', 'wslBash.wslDistro', 'wslBash.sandbox', 'wslBash.probeTimeoutMs', 'wslBash.requireSandbox',
+      'wslBash.wslPath', 'wslBash.wslDistro', 'wslBash.sandbox', 'wslBash.probeTimeoutMs', 'wslBash.requireSandbox', 'wslBash.sandboxNotice',
     ])
   })
   test('each sandbox stance offers exactly the values its backend accepts', () => {
@@ -2196,6 +2209,7 @@ console.log('\n[A] unit: runtime-editable config surface (the volatile projectio
     assert.equal(git.gitBash.probeTimeoutMs.get(), 4000)
     assert.equal(git.gitBash.sandbox.get(), 'auto')
     assert.equal(git.gitBash.requireSandbox.get(), false)
+    assert.equal(git.gitBash.sandboxNotice.get(), 'once', 'the row explains an unwrapped run once by default')
     assert.equal(wsl.wslBash.probeTimeoutMs.get(), 8000)
     assert.equal(wsl.wslBash.sandbox.get(), 'auto')
   })
@@ -3199,7 +3213,12 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.equal(tree.children.length, gitRow.fields.length, 'one control per knob')
     assert.equal(tree.children[0].type, 'div', 'the tool-layer switch is a checkbox row')
     assert.ok(tree.children.some((child) => child.type === 'SettingsValueField'))
-    const sandbox = tree.children[tree.children.length - 3]
+    // Declaration order: sandbox, probeTimeoutMs, requireSandbox, sandboxNotice —
+    // the notice enum is the last control the form draws.
+    const notice = tree.children[tree.children.length - 1]
+    assert.equal(notice.children[1].type, 'SegmentedControl')
+    assert.deepEqual(notice.children[1].props.options.map((option) => option.value), ['once', 'always'])
+    const sandbox = tree.children[tree.children.length - 4]
     assert.equal(sandbox.children[1].type, 'SegmentedControl')
     assert.deepEqual(sandbox.children[1].props.options.map((option) => option.value), ['auto', 'none'])
     form.dispose()
@@ -4064,9 +4083,10 @@ console.log('\n[B] boot integration: an auto-degraded BACKGROUND job says so in 
       bgFirst = await bootFixture(WSL_ROW(`
   config:
     wslBash:
-      wslPath: '${BROKEN_WSL}'`), 'unconfined-bg-first.yml')
+      wslPath: '${BROKEN_WSL}'
+      sandboxNotice: always`), 'unconfined-bg-first.yml')
       await runTests(bgFirst, [
-        ['a background job that degrades FIRST carries the full explanation; the next one only the short marker', async () => {
+        ['with `sandboxNotice: always` a background job that degrades FIRST carries the full explanation; the next one only the short marker', async () => {
           const started1 = await execTool(bgFirst, 'wsl_bash', { command: 'echo bg-degraded-1', run_in_background: true })
           const jobId1 = started1.match(/started background job (\S+)/)?.[1]
           assert.ok(jobId1, `no job id in: ${started1}`)
@@ -4088,9 +4108,10 @@ console.log('\n[B] boot integration: an auto-degraded BACKGROUND job says so in 
       fgFirst = await bootFixture(WSL_ROW(`
   config:
     wslBash:
-      wslPath: '${BROKEN_WSL}'`), 'unconfined-fg-first.yml')
+      wslPath: '${BROKEN_WSL}'
+      sandboxNotice: always`), 'unconfined-fg-first.yml')
       await runTests(fgFirst, [
-        ['a foreground call that degrades first carries the full explanation; the next only the short marker', async () => {
+        ['with `sandboxNotice: always` a foreground call that degrades first carries the full explanation; the next only the short marker', async () => {
           const first = await execTool(fgFirst, 'wsl_bash', { command: 'echo fg-degraded-1' })
           assert.ok(first.includes(unconfinedDetailMarker('read-only')), `first call must carry the full explanation: ${first}`)
           const second = await execTool(fgFirst, 'wsl_bash', { command: 'echo fg-degraded-2' })
@@ -4105,6 +4126,55 @@ console.log('\n[B] boot integration: an auto-degraded BACKGROUND job says so in 
       ])
     } finally {
       if (fgFirst) await fgFirst.fiber.dispose()
+    }
+
+    // The default level is `once`: the row explains itself on its FIRST degraded
+    // run and stays silent afterwards. The structured `sandbox.unconfined` fact is
+    // what carries the truth from then on, which is why the sentence no longer has
+    // to repeat itself into the context window on every call.
+    let fgOnce
+    try {
+      fgOnce = await bootFixture(WSL_ROW(`
+  config:
+    wslBash:
+      wslPath: '${BROKEN_WSL}'`), 'unconfined-fg-once.yml')
+      await runTests(fgOnce, [
+        ['by default (`sandboxNotice: once`) the first degraded call explains itself and the second stays silent', async () => {
+          const first = await execTool(fgOnce, 'wsl_bash', { command: 'echo once-1' })
+          assert.ok(first.includes(unconfinedDetailMarker('read-only')), `the first call must explain itself: ${first}`)
+          const second = await execTool(fgOnce, 'wsl_bash', { command: 'echo once-2' })
+          assert.ok(!second.includes('[sandbox: not applied'), `the second call must carry no notice: ${second}`)
+          assert.ok(!second.includes('confinement probe found no usable sandbox'), `and no explanation either: ${second}`)
+          const value = await valueOf(fgOnce, { command: 'echo once-3' })
+          assert.deepEqual(value.sandbox, { mode: 'read-only', unconfined: true }, 'the fact still rides on every result')
+        }],
+      ])
+    } finally {
+      if (fgOnce) await fgOnce.fiber.dispose()
+    }
+
+    let bgOnce
+    try {
+      bgOnce = await bootFixture(WSL_ROW(`
+  config:
+    wslBash:
+      wslPath: '${BROKEN_WSL}'`), 'unconfined-bg-once.yml')
+      await runTests(bgOnce, [
+        ['by default the second degraded background job carries no notice in its terminal detail', async () => {
+          const started1 = await execTool(bgOnce, 'wsl_bash', { command: 'echo bg-once-1', run_in_background: true })
+          const jobId1 = started1.match(/started background job (\S+)/)?.[1]
+          assert.ok(jobId1, `no job id in: ${started1}`)
+          const read1 = await settledRead(bgOnce, jobId1)
+          assert.ok(read1.includes(unconfinedDetailMarker('read-only')), `the first job detail must explain itself: ${read1}`)
+          const started2 = await execTool(bgOnce, 'wsl_bash', { command: 'echo bg-once-2', run_in_background: true })
+          const jobId2 = started2.match(/started background job (\S+)/)?.[1]
+          assert.ok(jobId2, `no job id in: ${started2}`)
+          const read2 = await settledRead(bgOnce, jobId2)
+          assert.ok(!read2.includes('[sandbox: not applied'), `the second job detail must carry no notice: ${read2}`)
+        }],
+      ])
+    } finally {
+      if (bgOnce) await bgOnce.fiber.dispose()
     }
 
     let none
