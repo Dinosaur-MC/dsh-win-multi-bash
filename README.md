@@ -2,6 +2,15 @@ English | [中文](README.zh.md)
 
 # dsh-win-multi-bash
 
+[![npm version](https://img.shields.io/npm/v/dsh-win-multi-bash.svg)](https://www.npmjs.com/package/dsh-win-multi-bash)
+[![license](https://img.shields.io/npm/l/dsh-win-multi-bash.svg)](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/LICENSE)
+[![node](https://img.shields.io/node/v/dsh-win-multi-bash.svg)](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/package.json)
+[![GitHub stars](https://img.shields.io/github/stars/Dinosaur-MC/dsh-win-multi-bash.svg)](https://github.com/Dinosaur-MC/dsh-win-multi-bash/stargazers)
+![dsh ≥ 0.1.7-rc.2](https://img.shields.io/badge/dsh-%E2%89%A5%200.1.7--rc.2-blue.svg)
+![platform: windows](https://img.shields.io/badge/platform-windows-0078d4.svg)
+![dialects: MSYS, WSL, MSYS2](https://img.shields.io/badge/dialects-MSYS%20%7C%20WSL%20%7C%20MSYS2-4c1.svg)
+[![Listed on dsh-plugin.org](https://dsh-plugin.org/badges/listed.svg)](https://dsh-plugin.org/plugins/dinosaur-mc/dsh-win-multi-bash)
+
 A Windows multi-bash plugin for DeepSeek Harness: the `git_bash` / `wsl_bash` model tools, each owning its own Git Bash / WSL executor. The plugin never touches the `ctx.shell` seat — dsh's own pwsh executor keeps it — so pwsh behavior is identical to a deployment without the plugin.
 
 ## What it provides
@@ -177,7 +186,7 @@ The manual equivalent is the profile's `cordis.patch.yml`: the `insert:` rows th
 powershell -ExecutionPolicy Bypass -File .\smoke\run.ps1
 ```
 
-Boots a real composition over the profile runtime (modifying nothing), verifies `git_bash` / `wsl_bash` register and execute real commands — including an explicit `bashPath` variant — and asserts `ctx.shell` is still provided by the base bundle's own row (the regression this plugin once caused). Requires node >= 20.
+Boots a real composition over the profile runtime (modifying nothing), verifies `git_bash` / `wsl_bash` register and execute real commands — including an explicit `bashPath` variant — and asserts `ctx.shell` is still provided by the base bundle's own row (the regression this plugin once caused). Requires node `^22.19.0 || >=24.0.0` — the `engines.node` range this package declares.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\smoke\audit.ps1

@@ -2,6 +2,15 @@
 
 # dsh-win-multi-bash
 
+[![npm version](https://img.shields.io/npm/v/dsh-win-multi-bash.svg)](https://www.npmjs.com/package/dsh-win-multi-bash)
+[![license](https://img.shields.io/npm/l/dsh-win-multi-bash.svg)](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/LICENSE)
+[![node](https://img.shields.io/node/v/dsh-win-multi-bash.svg)](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/package.json)
+[![GitHub stars](https://img.shields.io/github/stars/Dinosaur-MC/dsh-win-multi-bash.svg)](https://github.com/Dinosaur-MC/dsh-win-multi-bash/stargazers)
+![dsh ≥ 0.1.7-rc.2](https://img.shields.io/badge/dsh-%E2%89%A5%200.1.7--rc.2-blue.svg)
+![platform: windows](https://img.shields.io/badge/platform-windows-0078d4.svg)
+![dialects: MSYS, WSL, MSYS2](https://img.shields.io/badge/dialects-MSYS%20%7C%20WSL%20%7C%20MSYS2-4c1.svg)
+[![已收录于 dsh-plugin.org](https://dsh-plugin.org/badges/listed.svg)](https://dsh-plugin.org/plugins/dinosaur-mc/dsh-win-multi-bash)
+
 适用于 DeepSeek Harness 的 Windows multi-bash 插件：`git_bash` / `wsl_bash` 两个模型工具，各自持有自己的 Git Bash / WSL 执行器。插件不碰 `ctx.shell` 席位——该席位仍由 dsh 自带的 pwsh 执行器持有——因此 pwsh 行为与未装插件时完全一致。
 
 ## 功能一览
@@ -177,7 +186,7 @@ dsh plugin --profile web remove dsh-win-multi-bash
 powershell -ExecutionPolicy Bypass -File .\smoke\run.ps1
 ```
 
-在 profile 运行时上 boot 真实组合（不修改任何 profile），验证 `git_bash` / `wsl_bash` 注册并真实执行（含显式 `bashPath` 变体），并断言 `ctx.shell` 仍由基座自带的行提供——这正是本插件曾经弄坏的那一点。需要 node >= 20。
+在 profile 运行时上 boot 真实组合（不修改任何 profile），验证 `git_bash` / `wsl_bash` 注册并真实执行（含显式 `bashPath` 变体），并断言 `ctx.shell` 仍由基座自带的行提供——这正是本插件曾经弄坏的那一点。需要 node `^22.19.0 || >=24.0.0`——即本包声明的 `engines.node` 范围。
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\smoke\audit.ps1

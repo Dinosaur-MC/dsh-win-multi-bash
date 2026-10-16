@@ -3,5 +3,5 @@
 # deepseek-harness per-section format). Both languages carry equal authority;
 # after editing either side, bring the other along and re-record both hashes:
 #   git hash-object README.md README.zh.md
-README.md: fbc880efebcb9076cd100bc1a3df5e78584fd0bf
-README.zh.md: a12e17932af19ecc59aa58a3c70a9a28a08b5e4f
+README.md: a3d64ec70bc83452d3a0ff7f0805eb2f39732f1b
+README.zh.md: d18c2a92583ecba3803a84b780451af669e3ab15
