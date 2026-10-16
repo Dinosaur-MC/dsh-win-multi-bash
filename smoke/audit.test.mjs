@@ -2045,7 +2045,12 @@ console.log('\n[A] unit + [B] boot: the MSYS2 dialect end to end (S3)')
           assert.match(out, /DRIVE=[a-z]/, out)
         }],
         ['msys2_bash survives a non-ASCII workdir (and reads a file there)', async () => {
-          const dir = mkdtempSync(join(process.cwd(), '.temp', 'msys2-guard'))
+          // `.temp` is gitignored, so it is absent in a fresh clone and in every
+          // copied device: create the parent before mkdtemp, or the FIRST run of
+          // this suite dies here and only the second one is green.
+          const guardRoot = join(process.cwd(), '.temp')
+          mkdirSync(guardRoot, { recursive: true })
+          const dir = mkdtempSync(join(guardRoot, 'msys2-guard'))
           const cjk = join(dir, 'MSYS2 非 ASCII 目录')
           mkdirSync(cjk, { recursive: true })
           writeFileSync(join(cjk, 'hello.txt'), 'msys2-non-ascii-ok\n')
