@@ -62,8 +62,12 @@ const {
   SHELL_EXIT_STATUS_SECTION, SHELL_FAMILY_SECTION_NAME, SHELL_FAMILY_TOOL_NAMES,
   SHELL_BACKGROUND_SECTION, SHELL_ESCALATION_SECTION, SHELL_FAMILY_ROW_SPECIFIER,
   shellFamilySectionText, shellFamilySectionOrder, composeToolDescription,
+  familyRowComposed, markFamilySectionOwner,
 } = await import(libUrl('tool-bash', 'types', 'shell-family.js'))
 const packageRow = await import(libUrl('index.js'))
+// The registry's own expectations, so the row lists below are compared with the
+// single source instead of a hand-kept literal.
+const { CLIENT_ROWS: REGISTRY_ROWS, PATCH_ROWS } = await import(libUrl('tool-bash', 'types', 'registry.js'))
 const { LocalBashExecutor } = await import('@deepseek-ai/dsh-bash-local')
 
 let passed = 0
@@ -1660,6 +1664,14 @@ const WSL_ONLY_ROWS = `${CORE_ROW_ONLY}
 - id: win-mb-tool-wsl
   name: 'dsh-win-multi-bash/tool-wsl-bash'
 `
+/** The opt-in MSYS2 row, pinned to the installation the host has. */
+const MSYS2_ROWS = (bashPath) => `${CORE_ROW_ONLY}
+- id: win-mb-tool-msys2
+  name: 'dsh-win-multi-bash/tool-msys2-bash'
+  config:
+    msys2Bash:
+      bashPath: '${bashPath.replaceAll(String.fromCharCode(92), String.fromCharCode(92) + String.fromCharCode(92))}'
+`
 
 /** The assembled prompt of a booted fixture: its sections and the rendered text. */
 async function assembledPrompt(ctx) {
@@ -1719,6 +1731,344 @@ console.log('\n[A] unit: factory workdir drive-form normalization')
     if (existsSync('Q:\\')) return
     assert.equal(toNativeWorkdir('/q/WorkSpace'), '/q/WorkSpace')
   })
+}
+
+console.log('\n[A] unit: the dialect registry is the single source (S1)')
+{
+  // Everything that used to be a hand-maintained dialect list is derived from
+  // `lib/shell-dialects.js`. These guards are what turn "someone added a dialect
+  // and forgot one of the eight places" from a silent half-working composition
+  // into a red audit: the derived surfaces must agree with each other, and the
+  // two files that cannot import the registry at runtime (cordis.patch.yml is
+  // static YAML; lib/client.js is a client module the loader resolves by bare
+  // specifier only) are compared against it byte-wise.
+  const registry = await import(libUrl('tool-bash', 'types', 'registry.js'))
+  const {
+    DIALECT_FACTS, SHELL_DIALECTS, SHELL_FAMILY_TOOL_NAMES, CLIENT_ROWS, LEAF_RULES,
+    PATCH_ROWS, EXPORT_SUBPATHS, TOOL_INSTANCES, PACKAGE_NAME, REGISTRY_ERROR_PREFIX, validateShellDialects,
+  } = registry
+  const { currentClientRegistry, renderClientRegistry } = await import(new URL('./gen-client-registry.mjs', import.meta.url).href)
+  const broken = (over) => SHELL_DIALECTS.map((dialect, index) => (index === 0 ? { ...dialect, ...over } : dialect))
+  /** Every rejection must carry the registry prefix — that is what makes it readable at boot. */
+  const rejects = (dialects, pattern) => {
+    let error
+    try {
+      validateShellDialects(dialects)
+    } catch (caught) {
+      error = caught
+    }
+    assert.ok(error !== undefined, `expected a rejection for ${pattern}`)
+    assert.ok(String(error.message).startsWith(REGISTRY_ERROR_PREFIX), String(error.message))
+    assert.match(String(error.message), pattern)
+  }
+
+  test('the shipped registry passes its own validation', () => {
+    assert.doesNotThrow(() => validateShellDialects())
+    assert.ok(SHELL_DIALECTS.length >= 2, 'the plugin ships at least the two bash dialects')
+  })
+
+  test('every dialect appears in every derived surface', () => {
+    for (const dialect of SHELL_DIALECTS) {
+      if (dialect.family.shared === true) assert.equal(DIALECT_FACTS[dialect.family.facts], dialect.facts)
+      assert.ok(SHELL_FAMILY_TOOL_NAMES.includes(dialect.toolName), `${dialect.id} missing from the family tool names`)
+      const row = CLIENT_ROWS.find((entry) => entry.rowId === dialect.rowId)
+      assert.ok(row, `${dialect.id} missing from the client rows`)
+      assert.ok(row.label.en.length > 0 && row.label.zh.length > 0)
+      // Every knob the dialect declares is on its form, in its own partition.
+      for (const own of dialect.fields) {
+        const knob = row.fields.find((entry) => entry.key === `${dialect.configKey}.${own.leaf}`)
+        assert.ok(knob, `${dialect.id}: ${own.leaf} missing from the form`)
+        assert.equal(knob.kind, own.kind)
+        if (own.rule !== undefined) assert.equal(LEAF_RULES[own.leaf], own.rule)
+      }
+      assert.deepEqual(row.fields.find((entry) => entry.key === `${dialect.configKey}.sandbox`).options, dialect.sandboxStances)
+      const patchRow = PATCH_ROWS.find((entry) => entry.id === dialect.rowId)
+      assert.equal(patchRow?.name, `${PACKAGE_NAME}/${dialect.specifier}`, `${dialect.id}: patch row name`)
+      assert.equal(patchRow?.win32Only, dialect.win32Only)
+      assert.ok(EXPORT_SUBPATHS[`./${dialect.specifier}`], `${dialect.id}: export subpath`)
+      const instance = TOOL_INSTANCES.find((entry) => entry.id === dialect.id)
+      assert.deepEqual(instance, {
+        id: dialect.id,
+        toolName: dialect.toolName,
+        rowId: dialect.rowId,
+        configKey: dialect.configKey,
+        specifier: dialect.specifier,
+        entry: dialect.entry,
+        label: dialect.label,
+        sandboxStances: dialect.sandboxStances,
+        argvStyle: dialect.argvStyle,
+        win32Only: dialect.win32Only,
+        executor: dialect.executor,
+        resolve: dialect.resolve,
+      })
+    }
+  })
+
+  test('the registry and package.json exports agree in both directions', () => {
+    const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+    assert.deepEqual(manifest.exports, EXPORT_SUBPATHS)
+    // The three subpaths a third party needs to reuse the skeleton (R1):
+    for (const subpath of ['./factory', './shell-family', './registry'])
+      assert.ok(manifest.exports[subpath], `${subpath} must be exported`)
+  })
+
+  test('cordis.patch.yml declares exactly the derived rows, in order (and the right gate)', () => {
+    const yml = readFileSync(new URL('../cordis.patch.yml', import.meta.url), 'utf8')
+    // A row is either win32-gated (enabled by default) or plain `disabled: true`
+    // (opt-in, enabled by the user in the panel) — the derived flag says which.
+    const rows = [...yml.matchAll(/^ {4}- id: ([\w-]+)\n {6}name: '([^']+)'\n(?: {6}#[^\n]*\n)* {6}disabled: ([^\n]+)$/gm)]
+      .map(([, id, name, gate]) => ({ id, name, gate }))
+    assert.deepEqual(rows.map((row) => ({ id: row.id, name: row.name })), PATCH_ROWS.map((row) => ({ id: row.id, name: row.name })))
+    for (const [index, row] of rows.entries()) {
+      const expected = PATCH_ROWS[index]
+      // A win32-only dialect is either gated by the platform expression (enabled
+      // by default) or shipped unconditionally disabled (opt-in, the user turns it
+      // on) — never enabled on a platform its executor cannot serve.
+      assert.equal(row.gate, expected.disabledByDefault ? 'true' : "!!js process.platform !== 'win32'", `${row.id}: gate`)
+      assert.ok(expected.win32Only || row.gate === "!!js process.platform !== 'win32'", `${row.id}: a non-win32 row must not be gated off on win32`)
+    }
+    assert.ok(rows.some((row) => row.gate === 'true'), 'the opt-in dialect ships disabled')
+  })
+
+  test('the browser half carries the generated dialect block byte for byte', () => {
+    const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+    // The browser half cannot import the registry (the client loader resolves
+    // bare boot-graph specifiers only), so its copy is generated; this is the
+    // guard that makes "forgot to regenerate" loud.
+    assert.equal(currentClientRegistry(source), renderClientRegistry(),
+      'lib/client.js is stale — run: node smoke/gen-client-registry.mjs --write')
+    for (const dialect of SHELL_DIALECTS) assert.ok(source.includes(`rowId: "${dialect.rowId}"`))
+  })
+
+  test('a duplicate rowId is rejected at startup, by name', () => {
+    rejects([SHELL_DIALECTS[0], { ...SHELL_DIALECTS[1], rowId: SHELL_DIALECTS[0].rowId }], /duplicate rowId/)
+  })
+
+  test('a dialect with no configKey is rejected at startup, by name', () => {
+    rejects(broken({ configKey: undefined }), /declares no configKey/)
+  })
+
+  test('a tool name inside the family section name is rejected at startup, by name', () => {
+    rejects(broken({ toolName: 'bash' }), /collides with the family section name/)
+  })
+
+  test('a stance list without auto is rejected at startup, by name', () => {
+    rejects(broken({ sandboxStances: ['none'] }), /sandboxStances must include "auto"/)
+  })
+
+  test('a family-shared dialect with no facts key is rejected at startup, by name', () => {
+    rejects(broken({ family: { shared: true } }), /family-shared but declares no facts key/)
+  })
+
+  test('a dialect with no facts block is rejected at startup, by name', () => {
+    rejects(broken({ facts: undefined }), /declares no dialect facts/)
+  })
+
+  test('an empty registry is rejected at startup, by name', () => {
+    rejects([], /non-empty list of dialect declarations/)
+  })
+}
+
+console.log('\n[A] unit: the shared executor base owns the mechanism, each dialect keeps its own rules (S2)')
+{
+  // The extraction moved ~150 duplicated lines into `lib/shell-executor.js`. Two
+  // differences are deliberate and must NOT be merged; these guards fail if
+  // either is ever unified, and the first one fails if a dialect re-implements
+  // (and so can drift from) the shared mechanism.
+  const { ShellExecutorBase, sharedStanceConfig } = await import(libUrl('shell-executor.js'))
+  const { dialectById } = await import(libUrl('tool-bash', 'types', 'registry.js'))
+  const { candidateExists: wslCandidateExists } = await import(libUrl('bash-wsl', 'index.js'))
+  const { candidateExists: gitCandidateExists } = await import(libUrl('bash-git', 'index.js'))
+  // `decorateResult` is static and asserted separately below.
+  const mechanism = ['execute', 'unconfinedRun', 'onProcessDone', 'confinedPolicy', 'warnOnce', 'effectiveDenialSignatures']
+
+  test('both executors extend the one base and re-implement none of its mechanism', () => {
+    assert.ok(GitBashExecutor.prototype instanceof ShellExecutorBase, 'git extends the base')
+    assert.ok(WslBashExecutor.prototype instanceof ShellExecutorBase, 'wsl extends the base')
+    for (const member of mechanism)
+      assert.equal(typeof ShellExecutorBase.prototype[member], 'function', `the base must own ${member}`)
+    assert.equal(typeof ShellExecutorBase.decorateResult, 'function', 'the base owns the static decorator')
+    for (const dialect of [GitBashExecutor, WslBashExecutor]) {
+      for (const member of mechanism)
+        assert.ok(!Object.hasOwn(dialect.prototype, member), `${dialect.logName} must not copy ${member}`)
+      for (const hook of ['argv', 'confinedUsable', 'sandboxUnavailableMessage', 'confinedRun'])
+        assert.equal(typeof dialect.prototype[hook], 'function', `${dialect.logName} must supply ${hook}`)
+    }
+    assert.equal(GitBashExecutor.logName, 'bash-git')
+    assert.equal(WslBashExecutor.logName, 'bash-wsl')
+  })
+
+  test('candidateExists keeps its dialect semantics: git refuses a symlink, wsl accepts it', () => {
+    // Not a defect and not a merge candidate: MSYS bash derives its own root from
+    // the real path, so a symlinked bash.exe is refused; wsl.exe is fine either
+    // way. The two live in one base class now, which is exactly why this is
+    // pinned rather than assumed.
+    const tmp = mkdtempSync(join(tmpdir(), 'dsh-wmb-s2-symlink-'))
+    try {
+      const target = join(tmp, 'target.exe')
+      writeFileSync(target, '')
+      assert.equal(gitCandidateExists(target), true)
+      assert.equal(wslCandidateExists(target), true)
+      try {
+        symlinkSync(target, join(tmp, 'bash.exe'), 'file')
+      } catch {
+        console.log('  … skipping the symlink half: creating symlinks needs admin/developer mode')
+        return
+      }
+      const link = join(tmp, 'bash.exe')
+      assert.equal(gitCandidateExists(link), false, 'git refuses a symlinked bash.exe')
+      assert.equal(wslCandidateExists(link), true, 'wsl accepts a symlinked wsl.exe')
+    } finally {
+      rmSync(tmp, { recursive: true, force: true })
+    }
+  })
+
+  test('the stance vocabularies stay per dialect and come from the registry', () => {
+    // Compared by their printed vocabulary (`"auto" | "none"`): a union keeps its
+    // member schemas in `.list`, and the printed form is what the schema means.
+    const vocabulary = (schema) => String(schema)
+    assert.equal(vocabulary(GitBashExecutor.Config.dict.sandbox), '"auto" | "none"')
+    assert.equal(vocabulary(WslBashExecutor.Config.dict.sandbox), '"auto" | "none" | "bwrap"')
+    assert.equal(vocabulary(GitBashExecutor.Config.dict.sandbox), dialectById('msys').sandboxStances.map((stance) => `"${stance}"`).join(' | '))
+    assert.equal(vocabulary(WslBashExecutor.Config.dict.sandbox), dialectById('wsl').sandboxStances.map((stance) => `"${stance}"`).join(' | '))
+    assert.notEqual(vocabulary(GitBashExecutor.Config.dict.sandbox), vocabulary(WslBashExecutor.Config.dict.sandbox),
+      'the union is never advertised by a dialect whose executor cannot honour it')
+  })
+
+  test('the shared stance fragment builds each vocabulary (and its deadline) from the declaration', () => {
+    const fragment = sharedStanceConfig(['auto', 'none'], 1234)
+    // A union built here still holds its member schemas; `deriveConfig` is what
+    // normalizes them into the plain list the two Configs expose.
+    assert.equal(String(fragment.sandbox), '"auto" | "none"')
+    assert.equal(String(sharedStanceConfig(['auto', 'none', 'bwrap'], 1).sandbox), '"auto" | "none" | "bwrap"')
+    assert.equal(fragment.sandbox.meta.default, 'auto')
+    assert.equal(fragment.sandbox.meta.volatile, true)
+    assert.equal(fragment.probeTimeoutMs.meta.default, 1234)
+    assert.equal(fragment.requireSandbox.meta.default, false)
+    assert.deepEqual(Object.keys(sharedStanceConfig(['auto'], 1)).sort(), ['probeTimeoutMs', 'requireSandbox', 'sandbox'])
+  })
+
+  test('familyRowComposed answers from the registered fact first, then the loader', () => {
+    // The gap the extensibility review named: these two were only exercised
+    // through `composeToolDescription`, so a change in the fallback could move
+    // the shared prose without a red test.
+    const withOwner = (disabled) => ({ get: () => ({ entries: () => [{ options: { name: SHELL_FAMILY_ROW_SPECIFIER }, disabled }] }) })
+    markFamilySectionOwner(true)
+    try {
+      assert.equal(familyRowComposed(withOwner(true)), true, 'the registered fact outranks the name heuristic')
+    } finally {
+      markFamilySectionOwner(false)
+    }
+    assert.equal(familyRowComposed(withOwner(false)), true, 'the owner row is composed and enabled')
+    assert.equal(familyRowComposed(withOwner(true)), false, 'the owner row is composed but switched off')
+    assert.equal(familyRowComposed({ get: () => ({ entries: () => [] }) }), false, 'no owner row declared')
+    assert.equal(familyRowComposed({ loader: { entries: () => [{ options: { name: SHELL_FAMILY_ROW_SPECIFIER } }] } }), true,
+      'a row without an explicit disabled flag counts as enabled')
+    assert.equal(familyRowComposed({}), undefined, 'an unreadable loader is "treat as composed", never a guess the other way')
+    assert.equal(familyRowComposed({ get: () => ({}) }), undefined, 'a loader without entries() is unreadable too')
+    markFamilySectionOwner(true)
+    try {
+      assert.equal(familyRowComposed({}), true, 'the registered fact is enough on its own')
+    } finally {
+      markFamilySectionOwner(false)
+    }
+    assert.equal(familyRowComposed({}), undefined, 'and clearing it restores the heuristic answer')
+  })
+}
+
+console.log('\n[A] unit + [B] boot: the MSYS2 dialect end to end (S3)')
+{
+  // The third dialect exists to prove the skeleton: one executor file plus one
+  // declaration. These guards check that every derived surface picked it up, that
+  // its facts reach the model description, that the row ships OPT-IN, and — the
+  // acceptance test the task asks for — that it really runs this machine's MSYS2
+  // (uname, $MSYSTEM, pacman, the MSYS drive form, a Windows workdir, a
+  // non-ASCII path).
+  const { CLIENT_ROWS, PATCH_ROWS, EXPORT_SUBPATHS, TOOL_INSTANCES, dialectById } = await import(libUrl('tool-bash', 'types', 'registry.js'))
+  const msys2Tool = await import(libUrl('tool-bash', 'types', 'msys2-bash.js'))
+  const { declaredBashPaths, msys2RootOf, msys2ToolPath } = await import(libUrl('bash-msys2', 'index.js'))
+  const declaration = dialectById('msys2')
+  const candidates = declaredBashPaths()
+  const MSYS2_BASH = candidates.find((candidate) => existsSync(candidate))
+
+  test('the declaration reaches every derived surface, and the name does not collide', () => {
+    assert.equal(declaration.toolName, 'msys2_bash')
+    assert.equal(msys2Tool.name, 'tool-msys2_bash')
+    assert.ok(SHELL_FAMILY_TOOL_NAMES.includes('msys2_bash'), 'it joins the shared section family')
+    assert.ok(!SHELL_FAMILY_SECTION_NAME.includes('msys2_bash'), 'the section name is not per-tool')
+    assert.ok(CLIENT_ROWS.some((row) => row.rowId === 'win-mb-tool-msys2'), 'it has a Configure page')
+    assert.equal(PATCH_ROWS.find((row) => row.id === 'win-mb-tool-msys2')?.disabledByDefault, true, 'the row ships opt-in')
+    assert.ok(EXPORT_SUBPATHS['./tool-msys2-bash'], 'its subpath is exported')
+    assert.ok(TOOL_INSTANCES.some((instance) => instance.id === 'msys2'))
+    // Its facts are what tells the model this is not Git Bash.
+    const description = shellDescription('msys2')
+    assert.match(description, /MSYS2 UCRT64/)
+    assert.match(description, /pacman/)
+    assert.match(description, /MSYS2 form/)
+    assert.doesNotMatch(description, /unknown shell dialect/)
+  })
+
+  test('its root, toolchain PATH and discovery follow the layout it declares', () => {
+    const root = msys2RootOf(MSYS2_BASH ?? `C:${String.fromCharCode(92)}msys64${String.fromCharCode(92)}usr${String.fromCharCode(92)}bin${String.fromCharCode(92)}bash.exe`)
+    assert.equal(root, (MSYS2_BASH ?? `C:${String.fromCharCode(92)}msys64${String.fromCharCode(92)}usr${String.fromCharCode(92)}bin${String.fromCharCode(92)}bash.exe`).replace(/[\\/]usr[\\/]bin[\\/]bash\.exe$/, ''))
+    assert.equal(msys2RootOf('C:' + String.fromCharCode(92) + 'other' + String.fromCharCode(92) + 'bash.exe'), undefined)
+    const path = msys2ToolPath(`${root}${String.fromCharCode(92)}usr${String.fromCharCode(92)}bin${String.fromCharCode(92)}bash.exe`, 'INHERITED')
+    assert.match(path, /usr\\bin/)
+    assert.match(path, /ucrt64\\bin/, 'the declared MSYSTEM toolchain directory is on PATH')
+    assert.ok(path.endsWith('INHERITED'), 'and the inherited PATH is preserved')
+    assert.ok(candidates.every((candidate) => candidate.endsWith(String.fromCharCode(92) + 'usr' + String.fromCharCode(92) + 'bin' + String.fromCharCode(92) + 'bash.exe')))
+  })
+
+  if (MSYS2_BASH === undefined) {
+    console.log(`  … skipping the MSYS2 round trip: no bash.exe under ${candidates.join(', ')}`)
+  } else {
+    let ctx
+    try {
+      ctx = await bootFixture(MSYS2_ROWS(MSYS2_BASH), 'msys2-roundtrip.yml')
+      await runTests(ctx, [
+        ['msys2_bash really runs this machine MSYS2 (uname, $MSYSTEM, pacman)', async () => {
+          const out = await execTool(ctx, 'msys2_bash', { command: 'uname -a; echo "MSYSTEM=$MSYSTEM"; pacman --version | head -2; echo "TOOLCHAIN=$(command -v pacman)"' })
+          // MSYS2's uname reports the subsystem `MSYSTEM` selects (UCRT64 ⇒
+          // MINGW64_NT-…, the default MSYS ⇒ MSYS_NT-…), so both are correct here;
+          // what matters is that this is the MSYS runtime, not Linux.
+          assert.match(out, /M(?:SYS|INGW64)_NT-/, out)
+          assert.doesNotMatch(out, /^Linux/m, out)
+          assert.match(out, /MSYSTEM=UCRT64/, `the declared MSYSTEM is exported: ${out}`)
+          assert.match(out, /Pacman v6\./, 'pacman is reachable — this is MSYS2, not Git Bash')
+          // MSYS2 resolves pacman through `/bin` (a symlink onto `/usr/bin`).
+          assert.match(out, /TOOLCHAIN=\/(?:usr\/)?bin\/pacman/, out)
+          assert.doesNotMatch(out, /fatal error/i)
+        }],
+        ['msys2_bash carries the MSYS drive form and converts a Windows workdir', async () => {
+          const out = await execTool(ctx, 'msys2_bash', { command: 'pwd; echo "DRIVE=$(pwd | cut -c2)"', workdir: process.cwd() })
+          assert.match(out, /^\/[a-z]\//m, `workdir must arrive in MSYS drive form: ${out}`)
+          assert.match(out, /DRIVE=[a-z]/, out)
+        }],
+        ['msys2_bash survives a non-ASCII workdir (and reads a file there)', async () => {
+          const dir = mkdtempSync(join(process.cwd(), '.temp', 'msys2-guard'))
+          const cjk = join(dir, 'MSYS2 非 ASCII 目录')
+          mkdirSync(cjk, { recursive: true })
+          writeFileSync(join(cjk, 'hello.txt'), 'msys2-non-ascii-ok\n')
+          try {
+            const out = await execTool(ctx, 'msys2_bash', { command: 'pwd; cat hello.txt', workdir: cjk })
+            assert.match(out, /msys2-non-ascii-ok/, out)
+          } finally {
+            rmSync(dir, { recursive: true, force: true })
+          }
+        }],
+        ['msys2_bash is a dialect of its own: the git facts are not what it reports', async () => {
+          const out = await execTool(ctx, 'msys2_bash', { command: 'echo "$MSYSTEM"; test -x /usr/bin/pacman && echo PACMAN=yes' })
+          assert.match(out, /UCRT64/)
+          assert.match(out, /PACMAN=yes/)
+          const schema = ctx.tools.get('msys2_bash')?.description ?? ''
+          assert.match(schema, /MSYS2 UCRT64/)
+          assert.doesNotMatch(schema, /Git Bash \(MSYS2\)/)
+        }],
+      ])
+    } finally {
+      if (ctx) await ctx.fiber.dispose()
+    }
+  }
 }
 
 console.log('\n[A] unit: shared shell prompt section (one copy, gated facts)')
@@ -1901,7 +2251,10 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
   })
 
   test('the form lists exactly the host\'s volatile projection, in schema order', () => {
-    assert.deepEqual(ROWS.map((row) => row.rowId), ['win-mb-tool-git', 'win-mb-tool-wsl'])
+    // The expected row list is the registry's (S1/S3): a dialect added without
+    // regenerating this block fails on the byte comparison, and a row order that
+    // drifted from the composition fails here.
+    assert.deepEqual(ROWS.map((row) => row.rowId), REGISTRY_ROWS.map((row) => row.rowId))
     assert.deepEqual(ROWS[0].fields.map((knob) => knob.path.join('.')), volatilePaths(gitBashTool.Config))
     assert.deepEqual(ROWS[1].fields.map((knob) => knob.path.join('.')), volatilePaths(wslBashTool.Config))
   })
@@ -2177,9 +2530,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.deepEqual(localeRegistrations.map((entry) => entry.ns), [client.NS])
     assert.ok(localeRegistrations[0].dict.en && localeRegistrations[0].dict.zh)
     const pages = slotRegistrations.filter((entry) => entry.options.name === 'plugins.row.config')
-    assert.deepEqual(pages.map((entry) => entry.options.key), [
-      rowKey('win-mb-tool-git'), rowKey('win-mb-tool-wsl'),
-    ])
+    assert.deepEqual(pages.map((entry) => entry.options.key), REGISTRY_ROWS.map((row) => rowKey(row.rowId)))
     for (const entry of pages) {
       assert.equal(entry.options.locale, client.NS)
       assert.equal(entry.component, RowConfigCard)
@@ -2233,7 +2584,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
 
   test('the slot key is the package name and the row id the patch declares', () => {
     const patch = readFileSync(join(PLUGIN, 'cordis.patch.yml'), 'utf8')
-    const rowIds = [...patch.matchAll(/- id: (win-mb-[a-z-]+)/g)].map((match) => match[1])
+    const rowIds = [...patch.matchAll(/- id: (win-mb-[\w-]+)/g)].map((match) => match[1])
     for (const rowId of ROWS.map((row) => row.rowId))
       assert.ok(rowIds.includes(rowId), `cordis.patch.yml must declare the row id "${rowId}"`)
     // Q2-G2-2: the expectation used to be a second hard-coded copy of the very
@@ -2440,9 +2791,8 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
         effect: (callback) => callback(),
       }), 'apply must not throw on a head-less host')
       const pages = slotRegistrations.filter((entry) => entry.options.name === 'plugins.row.config')
-      assert.deepEqual(pages.map((entry) => entry.options.key), [
-        rowKey('win-mb-tool-git'), rowKey('win-mb-tool-wsl'),
-      ], 'both Configure pages still registered')
+      assert.deepEqual(pages.map((entry) => entry.options.key), REGISTRY_ROWS.map((row) => rowKey(row.rowId)),
+        'every dialect row still gets its Configure page')
     } finally {
       if (had === undefined) delete globalThis.document
       else globalThis.document = had
@@ -2480,8 +2830,8 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
       return specifier.length > 0 && !specifier.includes('/') && !specifier.includes(':') ? specifier : undefined
     }
     const patch = readFileSync(join(PLUGIN, 'cordis.patch.yml'), 'utf8')
-    const rows = [...patch.matchAll(/- id: (win-mb-[a-z-]+)\n\s+name: '([^']+)'/g)].map((match) => ({ id: match[1], name: match[2] }))
-    assert.deepEqual(rows.map((row) => row.id).sort(), ['win-mb-plugin', 'win-mb-tool-git', 'win-mb-tool-wsl'], 'the core row plus one row per tool')
+    const rows = [...patch.matchAll(/- id: (win-mb-[\w-]+)\n\s+name: '([^']+)'/g)].map((match) => ({ id: match[1], name: match[2] }))
+    assert.deepEqual(rows.map((row) => row.id).sort(), PATCH_ROWS.map((row) => row.id).sort(), 'the core row plus one row per dialect')
     const carriers = rows.filter((row) => exactPackageSpecifier(row.name) === 'dsh-win-multi-bash')
     assert.equal(carriers.length, 1, 'exactly one row must name the bare package specifier')
 
@@ -3402,7 +3752,11 @@ console.log('\n[B] boot integration: REAL cordis.patch.yml applied as overlay pa
       }],
       ['the shipped patch disables no base row (no selector to make room for)', async () => {
         const raw = readFileSync(patchPath, 'utf8')
-        assert.ok(!/disabled:\s*true/.test(raw), 'no unconditional `disabled: true` row remains')
+        const unconditional = [...raw.matchAll(/- id: ([\w-]+)\n(?:(?!\s*- id:)[^\n]*\n)*?\s+disabled:\s*true/g)].map((match) => match[1])
+        const optIn = PATCH_ROWS.filter((row) => row.disabledByDefault === true).map((row) => row.id)
+        // Our own opt-in dialect ships disabled on purpose; disabling anything ELSE
+        // (a base row) is what this guard forbids.
+        assert.deepEqual(unconditional, optIn, 'only the opt-in dialect rows may be unconditionally disabled')
         assert.ok(!/shell-select/.test(raw), 'no selector row remains')
       }],
       ['the shipped patch composes the core row and only the two tool rows', async () => {
@@ -3411,9 +3765,11 @@ console.log('\n[B] boot integration: REAL cordis.patch.yml applied as overlay pa
         for (const entry of ctx.loader.entries()) rows.push({ id: entry.options.id, name: entry.options.name, enabled: !entry.disabled })
         const composed = rows.map((row) => `${String(row.id)}|${String(row.name)}|${String(row.enabled)}`).join(', ')
         const own = rows.filter((row) => String(row.name).startsWith('dsh-win-multi-bash'))
-        assert.deepEqual(own.map((row) => row.name).sort(), ['dsh-win-multi-bash', 'dsh-win-multi-bash/tool-git-bash', 'dsh-win-multi-bash/tool-wsl-bash'], `the core row merged the old prompt row away; composed rows: ${composed}`)
+        assert.deepEqual(own.map((row) => row.name).sort(), PATCH_ROWS.map((row) => row.name).sort(), `every declared row must be composed; composed rows: ${composed}`)
         const core = own.find((row) => row.name === 'dsh-win-multi-bash')
         assert.equal(core.enabled, true, 'the core row must be enabled')
+        for (const row of PATCH_ROWS.filter((entry) => entry.disabledByDefault === true))
+          assert.equal(own.find((entry) => entry.name === row.name)?.enabled, false, `${row.name} ships disabled (opt-in)`)
       }],
     ])
   } finally {

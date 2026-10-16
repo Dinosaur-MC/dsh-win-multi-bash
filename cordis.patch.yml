@@ -1,8 +1,9 @@
 # dsh-win-multi-bash — self-contained Windows multi-bash wiring.
 #
 # This patch is the whole plugin: it inserts the plugin's own rows. Every
-# inserted row loads code from THIS package (exports ., ./client,
-# ./tool-git-bash, ./tool-wsl-bash) — nothing depends on runtime packages
+# inserted row loads code from THIS package (exports ., ./client, ./factory,
+# ./shell-family, ./registry, ./tool-git-bash, ./tool-wsl-bash) — nothing
+# depends on runtime packages
 # beyond the published @deepseek-ai base packages (dsh-bash-local, dsh-sandbox,
 # dsh-tools, dsh-shell, dsh-llm, ...).
 #
@@ -47,6 +48,11 @@
 #                         C:\... paths.
 #   win-mb-tool-wsl     — the `wsl_bash` tool, owning its own WslBashExecutor;
 #                         its description carries only the WSL facts.
+#   win-mb-tool-msys2   — the `msys2_bash` tool, owning its own Msys2BashExecutor.
+#                         **Opt-in**: the row ships disabled (`disabled: true`)
+#                         and the user enables it. It exists to prove the
+#                         skeleton: adding a shell is one executor file plus one
+#                         declaration in lib/shell-dialects.js.
 #
 # All three rows are win32-only; POSIX keeps the base bundle's own bash wiring.
 # The tool rows are independent of each other and of the core row — the section
@@ -104,3 +110,17 @@
       #     wslDistro: '<发行版名，如 Ubuntu-24.04>'
       #     wslPath: 'C:\Windows\System32\wsl.exe'
       #     requireSandbox: true
+
+    - id: win-mb-tool-msys2
+      name: 'dsh-win-multi-bash/tool-msys2-bash'
+      # OPT-IN and Windows-only: the MSYS2 tool ships switched OFF, because the
+      # MSYS2 installation is a second toolchain a user may not want mounted
+      # alongside Git Bash. Enable this row in the Plugins panel to add it. Its
+      # bash.exe is discovered under the installation roots the dialect declares
+      # (on this machine the registry uninstall key HKCU ...\Uninstall\
+      # {4b1a4d1b-9712-45ad-b2cb-b1b1eaccd0ee} answers D:\Local\msys64), or it can
+      # be pinned per machine:
+      #   msys2Bash:
+      #     bashPath: '<MSYS2 安装目录>\usr\bin\bash.exe'
+      disabled: true
+

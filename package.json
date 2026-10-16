@@ -27,8 +27,12 @@
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
+    "./factory": "./lib/tool-bash/types/factory.js",
+    "./shell-family": "./lib/tool-bash/types/shell-family.js",
+    "./registry": "./lib/tool-bash/types/registry.js",
     "./tool-git-bash": "./lib/tool-bash/types/git-bash.js",
     "./tool-wsl-bash": "./lib/tool-bash/types/wsl-bash.js",
+    "./tool-msys2-bash": "./lib/tool-bash/types/msys2-bash.js",
     "./package.json": "./package.json"
   },
   "files": [
