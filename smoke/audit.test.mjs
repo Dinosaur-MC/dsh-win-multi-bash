@@ -33,7 +33,7 @@ import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 // ── helpers / imports ────────────────────────────────────────────────────────
@@ -2168,6 +2168,7 @@ console.log('\n[A] unit: runtime-editable config surface (the volatile projectio
   test('the git_bash row exposes the tool-layer switch and every executor knob', () => {
     assert.deepEqual(volatilePaths(gitBashTool.Config), [
       'enableRunInBackground',
+      'guardSandboxTemp',
       'gitBash.cwd', 'gitBash.timeoutMs', 'gitBash.maxTimeoutMs', 'gitBash.maxOutputBytes',
       'gitBash.maxSpillBytes', 'gitBash.graceMs',
       'gitBash.bashPath', 'gitBash.sandbox', 'gitBash.probeTimeoutMs', 'gitBash.requireSandbox',
@@ -2176,6 +2177,7 @@ console.log('\n[A] unit: runtime-editable config surface (the volatile projectio
   test('the wsl_bash row exposes the tool-layer switch and every executor knob', () => {
     assert.deepEqual(volatilePaths(wslBashTool.Config), [
       'enableRunInBackground',
+      'guardSandboxTemp',
       'wslBash.cwd', 'wslBash.timeoutMs', 'wslBash.maxTimeoutMs', 'wslBash.maxOutputBytes',
       'wslBash.maxSpillBytes', 'wslBash.graceMs',
       'wslBash.wslPath', 'wslBash.wslDistro', 'wslBash.sandbox', 'wslBash.probeTimeoutMs', 'wslBash.requireSandbox',
@@ -2197,6 +2199,666 @@ console.log('\n[A] unit: runtime-editable config surface (the volatile projectio
     assert.equal(wsl.wslBash.probeTimeoutMs.get(), 8000)
     assert.equal(wsl.wslBash.sandbox.get(), 'auto')
   })
+}
+
+console.log('\n[A] unit: sandbox private temp guard (self-heal for the sandbox private temp root)')
+{
+  // The defect these pin: dsh-sandbox-local caches ONE private temp root per
+  // (session, workspaceRoot) for the provider's whole lifetime
+  // (`mkdtempSync(join(tmpdir(), 'dsh-'))`), and the windows-acl runner
+  // refuses a missing `--temp` (exit 127), so deleting that directory out of
+  // band bricks every later wrapped spawn of the session. The guard reads the
+  // `--temp` the seam already handed our executor and recreates the directory
+  // plus the seam's own write grant. Pinned here: the decision table (what may
+  // be touched at all), every failure path, and both integration points.
+  const {
+    SANDBOX_TEMP_GUARD_DEFAULT, SANDBOX_TEMP_GUARD_KNOB, SANDBOX_TEMP_NAME,
+    GUARD_REASONS, HEAL_OUTCOMES, SandboxTempGuard, classifySandboxTempTarget,
+    loadAclGrantApi, missingTempDirectoryOf, sandboxTempArgument, workspaceArgument,
+  } = await import(libUrl('sandbox-temp-guard.js'))
+  const { TOOL_LAYER_FIELDS, TERMINAL_ROWS } = await import(libUrl('tool-bash', 'types', 'registry.js'))
+
+  // Scratch temp roots: real mkdtemp directories under the OS temp root, torn
+  // down by THIS block (the guard itself never deletes anything). Forward
+  // slashes keep the source free of escape surprises; path.join normalizes.
+  const guardRoots = []
+  const scratchRoot = () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-wmb-guard-'))
+    guardRoots.push(root)
+    return root
+  }
+  /** The seam's grant API, faked: only the calls and the derived SID matter. */
+  const fakeAcl = (records) => ({
+    tempWriteSid: (path) => 'SID(' + path + ')',
+    AclWriteGrant: {
+      create(sid) {
+        records.push(['create', sid])
+        return {
+          add(path, standing) { records.push(['add', path, standing === true]) },
+          dispose() { records.push(['dispose']) },
+        }
+      },
+    },
+  })
+  /** The exact shape dsh-sandbox-local hands the runner (see windowsAclRunnerArgv). */
+  const runnerArgv = (workspace, temp) => [
+    'node', 'runner.js', '--workspace', workspace, '--temp', temp,
+    '--mode', 'workspace-write', '--write-sid', 'S-1-4-1-1', '--temp-write-sid', 'S-1-4-1-1-1',
+    '--', 'bash', '-c', 'exit 0',
+  ]
+
+  test('sandboxTempArgument(): reads the runner flag, prefers it over the wrapped command, stops at --', () => {
+    const temp = join('C:/Temp', 'dsh-Ab12Cd')
+    assert.equal(sandboxTempArgument(runnerArgv('C:/ws', temp)), temp)
+    assert.equal(sandboxTempArgument(['n', 'r', '--temp=' + temp]), temp)
+    // The wrapped command's own --temp token sits AFTER the separator and must
+    // never be mistaken for the runner's flag.
+    assert.equal(sandboxTempArgument(['n', 'r', '--workspace', 'C:/ws', '--', 'bash', '-c', 'echo --temp /evil']), undefined)
+    assert.equal(sandboxTempArgument(['n', 'r', '--temp-write-sid', 'S-1-4-1-1-1', '--']), undefined)
+    assert.equal(sandboxTempArgument(['n', 'r']), undefined)
+    assert.equal(sandboxTempArgument(undefined), undefined)
+  })
+
+  test('workspaceArgument(): the runner workspace only, never the wrapped command arguments', () => {
+    assert.equal(workspaceArgument(runnerArgv('C:/ws', 'C:/Temp/dsh-Ab12Cd')), 'C:/ws')
+    assert.equal(workspaceArgument(['n', 'r', '--', '--workspace', 'C:/evil']), undefined)
+    assert.equal(workspaceArgument(undefined), undefined)
+  })
+
+  test('missingTempDirectoryOf(): finds the runner signature and ignores everything else', () => {
+    const named = join('C:/Users/x/AppData/Local/Temp', 'dsh-Ab12Cd')
+    assert.equal(missingTempDirectoryOf('windows-acl-run: --temp is not an existing directory: ' + named + '\n'), named)
+    assert.equal(missingTempDirectoryOf('bash: line 1: oops\n'), undefined)
+    assert.equal(missingTempDirectoryOf('--temp is not an existing directory: '), undefined)
+    assert.equal(missingTempDirectoryOf(undefined), undefined)
+  })
+
+  test('the accepted name shape is the one mkdtemp really produces (measured, not guessed)', () => {
+    const root = scratchRoot()
+    for (let i = 0; i < 25; i += 1) {
+      const made = mkdtempSync(join(root, 'dsh-'))
+      const name = made.slice(root.length + 1)
+      assert.ok(SANDBOX_TEMP_NAME.test(name), 'mkdtemp produced a name the guard would refuse: ' + name)
+      assert.ok(/^[A-Za-z0-9]{6}$/.test(name.slice(4)), 'mkdtemp alphabet changed: ' + name)
+    }
+    // The neighbouring private directories the seam also creates must NOT
+    // qualify: only `dsh-` + exactly six alphanumerics is a private temp root.
+    for (const other of ['dsh-acl-skill-Ab12Cd', 'dsh-Ab12C', 'dsh-Ab12Cde', 'dsh-ab12c-', 'dsh-acl-locks', 'dsh-spill-gZMl5U', 'Temp'])
+      assert.ok(!SANDBOX_TEMP_NAME.test(other), 'the guard would accept a non-private-root shape: ' + other)
+  })
+
+  test('classification: only a MISSING dsh-<6> direct child of a temp root may be healed', () => {
+    const root = 'G:/TempRoot'
+    const ws = 'G:/LAB/ws'
+    const kind = (path, options = {}) => classifySandboxTempTarget(path, {
+      tempRoots: [root], workspaceRoots: [ws], exists: () => false, ...options,
+    })
+    const target = join(root, 'dsh-Ab12Cd')
+    assert.deepEqual(kind(target), { action: 'heal', reason: 'missing', path: target, tempRoot: root })
+    assert.equal(kind(target, { exists: () => true, stat: () => ({ isDirectory: () => true }) }).reason, GUARD_REASONS.ALREADY_EXISTS)
+    assert.equal(kind(target, { exists: () => true, stat: () => ({ isDirectory: () => false }) }).reason, GUARD_REASONS.EXISTS_NOT_DIRECTORY)
+    assert.equal(kind(target, { exists: () => { throw new Error('EACCES') } }).reason, GUARD_REASONS.EXISTS_NOT_DIRECTORY)
+    assert.equal(kind('').reason, GUARD_REASONS.BAD_PATH)
+    assert.equal(kind('dsh-Ab12Cd').reason, GUARD_REASONS.NOT_ABSOLUTE)
+    assert.equal(kind(join('G:/elsewhere', 'dsh-Ab12Cd')).reason, GUARD_REASONS.OUTSIDE_TEMP_ROOT)
+    assert.equal(kind(join(root, 'sub', 'dsh-Ab12Cd')).reason, GUARD_REASONS.NOT_DIRECT_CHILD)
+    assert.equal(kind(root).reason, GUARD_REASONS.NOT_DIRECT_CHILD)
+    assert.equal(kind(join(root, 'dsh-Ab12C')).reason, GUARD_REASONS.NAME_SHAPE)
+    assert.equal(kind(join(root, 'dsh-acl-skill-Ab12Cd')).reason, GUARD_REASONS.NAME_SHAPE)
+    assert.equal(kind(join(root, 'dsh-Ab12Cd'), { workspaceRoots: [root] }).reason, GUARD_REASONS.INSIDE_WORKSPACE)
+    assert.equal(kind(join(root, 'dsh-Ab12Cd'), { workspaceRoots: [] }).action, 'heal')
+  })
+
+  test('classification: shape and scope are decided BEFORE existence', () => {
+    // An existing, wrongly-shaped path must be refused for its SHAPE — the
+    // reason a guard declines is evidence, and it has to name the real one.
+    const verdict = classifySandboxTempTarget(join('G:/TempRoot', 'not-a-private-root'), {
+      tempRoots: ['G:/TempRoot'], workspaceRoots: [],
+      exists: () => true, stat: () => ({ isDirectory: () => true }),
+    })
+    assert.equal(verdict.reason, GUARD_REASONS.NAME_SHAPE)
+  })
+
+  test('the guard can only ever create: its own fs seam has no deleting or writing operation', () => {
+    assert.deepEqual(Object.keys(new SandboxTempGuard({}).fs()).sort(), ['exists', 'mkdir', 'stat'])
+  })
+
+  test('the knob is a tool-layer field on every row, volatile, and ON by default', () => {
+    assert.deepEqual(TOOL_LAYER_FIELDS.map((knob) => knob.key), ['enableRunInBackground', SANDBOX_TEMP_GUARD_KNOB])
+    assert.equal(gitBashTool.Config({})[SANDBOX_TEMP_GUARD_KNOB].get(), SANDBOX_TEMP_GUARD_DEFAULT)
+    assert.equal(wslBashTool.Config({})[SANDBOX_TEMP_GUARD_KNOB].get(), SANDBOX_TEMP_GUARD_DEFAULT)
+    assert.equal(gitBashTool.Config({})[SANDBOX_TEMP_GUARD_KNOB].get(), true)
+    // Non-volatile would mean YAML-only: the Plugins page could never reach it.
+    assert.equal(gitBashTool.Config.dict[SANDBOX_TEMP_GUARD_KNOB].meta?.volatile, true)
+    // The switch belongs to the rows that RUN a confined command (the dialect
+    // rows). The terminal row deliberately does NOT carry it: a PTY session is
+    // never wrapped by the sandbox seam, so a switch there would be a control
+    // that cannot do anything — the opposite of what this file exists to prevent.
+    const terminalRowId = TERMINAL_ROWS[0].rowId
+    for (const row of REGISTRY_ROWS) {
+      const carries = row.fields.some((knob) => knob.key === SANDBOX_TEMP_GUARD_KNOB)
+      if (row.rowId === terminalRowId) assert.ok(!carries, row.rowId + ' must not offer a switch its PTY sessions can never use')
+      else assert.ok(carries, row.rowId + ' is missing the guard switch on its page')
+    }
+  })
+
+  test('attachToolLayer(): the row switch decides healing, and not attaching keeps the default', () => {
+    const withKnob = (value) => bareInstance(GitBashExecutor, { config: gitConfig(), toolLayer: { [SANDBOX_TEMP_GUARD_KNOB]: { get: () => value } } })
+    assert.equal(withKnob(true).sandboxTempGuardEnabled, true)
+    assert.equal(withKnob(false).sandboxTempGuardEnabled, false)
+    const bare = bareInstance(GitBashExecutor, { config: gitConfig() })
+    assert.equal(bare.sandboxTempGuardEnabled, SANDBOX_TEMP_GUARD_DEFAULT)
+    const plain = bareInstance(GitBashExecutor, { config: gitConfig() })
+    assert.equal(plain.attachToolLayer({ [SANDBOX_TEMP_GUARD_KNOB]: false }), plain)
+    assert.equal(plain.sandboxTempGuardEnabled, false)
+    plain.attachToolLayer({ [SANDBOX_TEMP_GUARD_KNOB]: true })
+    assert.equal(plain.sandboxTempGuardEnabled, true)
+    plain.attachToolLayer(undefined)
+    assert.equal(plain.sandboxTempGuardEnabled, SANDBOX_TEMP_GUARD_DEFAULT)
+  })
+
+  // These are AWAITED, unlike the (fire-and-forget) testAsync calls elsewhere in
+  // this file: the block's scratch temp roots are torn down at its end, and an
+  // unfinished heal would otherwise race that cleanup.
+  await testAsync('ensureArgvUsable(): a missing private temp root is recreated and re-granted with the seam SID', async () => {
+    const root = scratchRoot()
+    const missing = join(root, 'dsh-Ab12Cd')
+    const records = []
+    const warnings = []
+    const guard = new SandboxTempGuard({
+      tempRoots: () => [root],
+      warn: (key, message) => warnings.push(key + ': ' + message),
+      internals: { aclApi: async () => fakeAcl(records) },
+    })
+    const report = await guard.ensureArgvUsable({ argv: runnerArgv('C:/ws', missing) }, { mode: 'workspace-write', workspaceRoot: 'C:/ws' })
+    assert.equal(report.channel, 'confined-argv')
+    assert.equal(report.action, 'heal')
+    assert.equal(report.outcome, HEAL_OUTCOMES.HEALED)
+    assert.ok(existsSync(missing), 'the missing private temp root must exist before the spawn')
+    assert.deepEqual(records, [['create', 'SID(' + missing + ')'], ['add', missing, true], ['dispose']])
+    assert.equal(warnings.length, 1)
+    assert.ok(warnings[0].includes('removed out of band'))
+    // Idempotent: the very same call now sees the directory and touches nothing.
+    records.length = 0
+    const again = await guard.ensureArgvUsable({ argv: runnerArgv('C:/ws', missing) }, {})
+    assert.equal(again.action, 'skip')
+    assert.equal(again.reason, GUARD_REASONS.ALREADY_EXISTS)
+    assert.deepEqual(records, [], 'an existing directory must not be re-granted or re-touched')
+  })
+
+  await testAsync('ensureArgvUsable(): the knob off is a hard stop — no filesystem, no package load', async () => {
+    const root = scratchRoot()
+    const missing = join(root, 'dsh-Ab12Cd')
+    let existsCalls = 0
+    let mkdirCalls = 0
+    let aclLoads = 0
+    const guard = new SandboxTempGuard({
+      enabled: () => false,
+      tempRoots: () => [root],
+      internals: {
+        exists: () => { existsCalls += 1; return false },
+        mkdir: () => { mkdirCalls += 1 },
+        aclApi: async () => { aclLoads += 1; return fakeAcl([]) },
+      },
+    })
+    const report = await guard.ensureArgvUsable({ argv: runnerArgv('C:/ws', missing) }, {})
+    assert.equal(report.reason, GUARD_REASONS.DISABLED)
+    assert.equal(guard.observeRunnerStderr('windows-acl-run: --temp is not an existing directory: ' + missing), undefined)
+    assert.deepEqual(await guard.settle(), [])
+    assert.equal(existsCalls, 0)
+    assert.equal(mkdirCalls, 0)
+    assert.equal(aclLoads, 0)
+  })
+
+  await testAsync('ensureArgvUsable(): the AMBIENT temp root of a read-only run is never a target', async () => {
+    // Read-only and agentless policies hand the runner the ambient temp root
+    // (`--temp <os temp>`); it is not a mkdtemp child and must never be
+    // recreated or re-granted.
+    const root = scratchRoot()
+    const guard = new SandboxTempGuard({
+      tempRoots: () => [root],
+      internals: { mkdir: () => { throw new Error('the ambient temp root must never be created') } },
+    })
+    const report = await guard.ensureArgvUsable({ argv: runnerArgv('C:/ws', root) }, {})
+    assert.equal(report.action, 'skip')
+    assert.equal(report.reason, GUARD_REASONS.NOT_DIRECT_CHILD)
+  })
+
+  await testAsync('heal(): without the ACL package the directory is restored, existence only, and said so', async () => {
+    const root = scratchRoot()
+    const missing = join(root, 'dsh-Cd34Ef')
+    const warnings = []
+    const guard = new SandboxTempGuard({ tempRoots: () => [root], warn: (key, message) => warnings.push(message), internals: { aclApi: async () => undefined } })
+    const report = await guard.heal(missing, [])
+    assert.equal(report.outcome, HEAL_OUTCOMES.EXISTENCE_ONLY)
+    assert.equal(report.detail, 'acl-api-unavailable')
+    assert.ok(existsSync(missing))
+    assert.equal(warnings.length, 1)
+    assert.ok(warnings[0].includes('NOT restored'))
+  })
+
+  await testAsync('heal(): a grant failure is reported by name, and the directory is left in place', async () => {
+    const root = scratchRoot()
+    const missing = join(root, 'dsh-Gh56Ij')
+    const guard = new SandboxTempGuard({
+      tempRoots: () => [root],
+      internals: {
+        aclApi: async () => ({
+          tempWriteSid: (path) => 'SID(' + path + ')',
+          AclWriteGrant: { create: () => ({ add: () => { throw new Error('SetNamedSecurityInfoW 5') }, dispose: () => {} }) },
+        }),
+      },
+    })
+    const report = await guard.heal(missing, [])
+    assert.equal(report.outcome, HEAL_OUTCOMES.GRANT_FAILED)
+    assert.ok(report.detail.includes('SetNamedSecurityInfoW'))
+    assert.ok(existsSync(missing), 'nothing is ever rolled back by deleting the directory')
+  })
+
+  await testAsync('heal(): a refused mkdir is reported by name, and nothing else is attempted', async () => {
+    const root = scratchRoot()
+    const guard = new SandboxTempGuard({
+      tempRoots: () => [root],
+      internals: {
+        mkdir: () => { const error = new Error('EPERM'); error.code = 'EPERM'; throw error },
+        aclApi: async () => { throw new Error('must not be reached after a failed mkdir') },
+      },
+    })
+    const report = await guard.heal(join(root, 'dsh-Kl78Mn'), [])
+    assert.equal(report.outcome, HEAL_OUTCOMES.MKDIR_FAILED)
+    assert.equal(report.detail, 'EPERM')
+  })
+
+  await testAsync('heal(): a path that fails the gates is never created, even when asked directly', async () => {
+    const root = scratchRoot()
+    const guard = new SandboxTempGuard({ tempRoots: () => [root], internals: { mkdir: () => { throw new Error('must not be called') } } })
+    const outside = await guard.heal(join('C:/Windows', 'dsh-Ab12Cd'), [])
+    assert.equal(outside.action, 'skip')
+    assert.equal(outside.reason, GUARD_REASONS.OUTSIDE_TEMP_ROOT)
+    const shaped = await guard.heal(join(root, 'dsh-12chars'), [])
+    assert.equal(shaped.reason, GUARD_REASONS.NAME_SHAPE)
+  })
+
+  await testAsync('observeRunnerStderr(): the runner signature heals for the NEXT command, and settle() awaits it', async () => {
+    const root = scratchRoot()
+    const missing = join(root, 'dsh-Op90Qr')
+    const records = []
+    const guard = new SandboxTempGuard({ tempRoots: () => [root], internals: { aclApi: async () => fakeAcl(records) } })
+    const named = guard.observeRunnerStderr('noise\nwindows-acl-run: --temp is not an existing directory: ' + missing + '\n')
+    assert.equal(named, missing)
+    const settled = await guard.settle()
+    assert.equal(settled.length, 1)
+    assert.equal(settled[0].outcome, HEAL_OUTCOMES.HEALED)
+    assert.ok(existsSync(missing))
+    assert.deepEqual(records, [['create', 'SID(' + missing + ')'], ['add', missing, true], ['dispose']])
+  })
+
+  await testAsync('observeRunnerStderr(): unrelated stderr, and the knob off, are both no-ops', async () => {
+    const root = scratchRoot()
+    let aclLoads = 0
+    const on = new SandboxTempGuard({ tempRoots: () => [root], internals: { aclApi: async () => { aclLoads += 1; return fakeAcl([]) } } })
+    assert.equal(on.observeRunnerStderr('bash: EPERM\n'), undefined)
+    assert.deepEqual(await on.settle(), [])
+    assert.equal(aclLoads, 0)
+    const off = new SandboxTempGuard({ enabled: () => false, tempRoots: () => [root], internals: { mkdir: () => { throw new Error('must not run') } } })
+    assert.equal(off.observeRunnerStderr('windows-acl-run: --temp is not an existing directory: ' + join(root, 'dsh-St12Uv')), undefined)
+    assert.deepEqual(await off.settle(), [])
+  })
+
+  await testAsync('loadAclGrantApi(): the optional peer resolves here, or degrades to undefined without throwing', async () => {
+    const api = await loadAclGrantApi()
+    if (api === undefined) return
+    assert.equal(typeof api.tempWriteSid, 'function')
+    assert.equal(typeof api.AclWriteGrant.create, 'function')
+    // The SID is a pure function of the path, so a heal recomputes the SAME
+    // identity the seam's cached capability used.
+    assert.equal(api.tempWriteSid('C:/Temp/dsh-Ab12Cd'), api.tempWriteSid('C:/Temp/dsh-Ab12Cd'))
+    assert.match(api.tempWriteSid('C:/Temp/dsh-Ab12Cd'), /^S-1-4-\d+-\d+-1$/)
+  })
+
+  await testAsync('confineRun(): the argv the seam hands over is repaired BEFORE the runner is spawned', async () => {
+    const root = scratchRoot()
+    const missing = join(root, 'dsh-Wx34Yz')
+    const records = []
+    const guard = new SandboxTempGuard({ tempRoots: () => [root], internals: { aclApi: async () => fakeAcl(records) } })
+    const confinements = []
+    const executor = bareInstance(GitBashExecutor, {
+      config: gitConfig(),
+      tempGuardInstance: guard,
+      ctx: fakeCtx({
+        sandbox: { confine: async (argv, policy) => { confinements.push({ argv, policy }); return { argv: runnerArgv('C:/ws', missing), enforcement: 'partial', denialSignatures: [], runnerFailureRules: [] } } },
+      }),
+    })
+    const confined = await executor.confineRun(['bash', '-c', 'exit 0'], { mode: 'workspace-write', workspaceRoot: 'C:/ws' })
+    assert.equal(confinements.length, 1)
+    assert.ok(confined.argv.includes(missing), 'the seam argv is returned unchanged')
+    assert.ok(existsSync(missing), 'the guard ran before the spawn, so the runner finds its --temp')
+    assert.equal(guard.reports.at(-1).outcome, HEAL_OUTCOMES.HEALED)
+  })
+
+  await testAsync('confineRun(): a throwing guard is reported once and never replaces the run', async () => {
+    const executor = bareInstance(GitBashExecutor, {
+      config: gitConfig(),
+      tempGuardInstance: { ensureArgvUsable: async () => { throw new Error('guard exploded') } },
+      ctx: fakeCtx({ sandbox: { confine: async () => ({ argv: ['node', 'runner.js'] }) }, logger: { warn() {} } }),
+    })
+    const confined = await executor.confineRun(['bash', '-c', 'exit 0'], { mode: 'workspace-write', workspaceRoot: 'C:/ws' })
+    assert.deepEqual(confined.argv, ['node', 'runner.js'])
+  })
+
+  test('onProcessDone(): a confined settle offers its stderr to the guard; an unconfined one does not', () => {
+    const seen = []
+    const spy = { observeRunnerStderr: (stderr) => { seen.push(stderr) } }
+    const proc = { exitCode: 0, sandbox: undefined }
+    const confined = bareInstance(GitBashExecutor, { config: gitConfig(), tempGuardInstance: spy })
+    confined.processFacts.set(proc, { mode: 'workspace-write', enforcement: 'partial', denialSignatures: [], runnerFailureRules: [] })
+    confined.onProcessDone(proc, 'windows-acl-run: --temp is not an existing directory: C:/Temp/dsh-Ab12Cd\n', false)
+    assert.equal(seen.length, 1)
+    assert.ok(seen[0].includes('--temp is not an existing directory'))
+    assert.deepEqual(proc.sandbox, { mode: 'workspace-write', denied: false, enforcement: 'partial' })
+    const other = { exitCode: 0 }
+    const loose = bareInstance(GitBashExecutor, { config: gitConfig(), tempGuardInstance: spy })
+    loose.processFacts.set(other, { mode: 'workspace-write', unconfined: true })
+    loose.onProcessDone(other, 'irrelevant', false)
+    assert.equal(seen.length, 1, 'an unconfined run started no runner, so the guard must not be asked')
+    assert.deepEqual(other.sandbox, { mode: 'workspace-write', unconfined: true })
+  })
+
+  // Only this block's own scratch roots, and only after re-verifying that each
+  // one really is a mkdtemp child of the OS temp root.
+  const tempRoot = realpathSync(tmpdir()).toLowerCase()
+  for (const root of guardRoots) {
+    const resolved = realpathSync(root)
+    assert.ok(basename(resolved).startsWith('dsh-wmb-guard-'), 'refusing to clean up a path this block did not create: ' + resolved)
+    assert.ok(resolved.toLowerCase().startsWith(tempRoot), 'refusing to clean up outside the OS temp root: ' + resolved)
+    rmSync(resolved, { recursive: true, force: true })
+  }
+}
+
+console.log('\n[A] unit: the interactive terminal row (registry-derived backends, session mechanism)')
+{
+  // The registry is the single source for WHICH shells may host a session; the
+  // session mechanism's boundaries are pinned here against a fake PTY, so a real
+  // shell is only needed for the state-persistence boot test further down.
+  const { TERMINAL_BACKENDS, TERMINAL_ROWS: TERMINAL_FORM_ROWS, CLIENT_ROWS: TERMINAL_CLIENT_ROWS,
+    EXPORT_SUBPATHS: TERMINAL_EXPORTS, PATCH_ROWS: TERMINAL_PATCHES, TERMINAL_ROW, SHELL_DIALECTS: TERMINAL_DIALECTS } =
+    await import(libUrl('tool-bash', 'types', 'registry.js'))
+  const terminalTool = await import(libUrl('tool-bash', 'types', 'terminal.js'))
+  const { ShellExecutorBase } = await import(libUrl('shell-executor.js'))
+  const { Msys2BashExecutor } = await import(libUrl('bash-msys2', 'index.js'))
+  const {
+    OutputRing, TerminalSanitizer, createTerminalSessions, TERMINAL_SIGNALS, normalizeTerminalText,
+  } = await import(libUrl('terminal-session.js'))
+  const { PassThrough } = await import('node:stream')
+  /** A prototype-only instance: enough to exercise the argv hooks without a ctx. */
+  const bare = (Executor, patch) => Object.assign(Object.create(Executor.prototype), patch)
+
+  test('the shell argument is exactly the dialects that declare terminal capability', () => {
+    const declared = TERMINAL_DIALECTS.filter((dialect) => dialect.terminal === true).map((dialect) => dialect.toolName)
+    assert.deepEqual(TERMINAL_BACKENDS.map((backend) => backend.toolName), declared)
+    assert.ok(declared.length >= 2, 'a terminal that could host only one shell would not need a registry')
+    for (const dialect of TERMINAL_DIALECTS)
+      if (dialect.terminal !== true) assert.ok(!declared.includes(dialect.toolName), dialect.id + ' must not be offered')
+  })
+
+  test('the terminal row is wired like every other row, and its form is derived from the capability set', () => {
+    const patch = TERMINAL_PATCHES.find((row) => row.id === TERMINAL_ROW.rowId)
+    assert.equal(patch?.name, 'dsh-win-multi-bash/' + TERMINAL_ROW.specifier)
+    assert.equal(patch?.win32Only, true)
+    assert.equal(patch?.disabledByDefault, false, 'a capability nobody mounts is not a capability')
+    assert.equal(TERMINAL_EXPORTS['./' + TERMINAL_ROW.specifier], './lib/tool-bash/types/' + TERMINAL_ROW.entry + '.js')
+    // Last on the page on purpose: the dialect rows keep their positions, so a
+    // reader that already depends on ROWS[0]/ROWS[1] cannot be renumbered.
+    const ids = TERMINAL_CLIENT_ROWS.map((row) => row.rowId)
+    assert.equal(ids[ids.length - 1], TERMINAL_ROW.rowId)
+    assert.equal(TERMINAL_FORM_ROWS.length, 1)
+    assert.deepEqual(TERMINAL_FORM_ROWS[0].fields.map((knob) => knob.key),
+      TERMINAL_CLIENT_ROWS[TERMINAL_CLIENT_ROWS.length - 1].fields.map((knob) => knob.key))
+    assert.deepEqual(TERMINAL_FORM_ROWS[0].fields[0].options, TERMINAL_BACKENDS.map((backend) => backend.toolName))
+    // The pins are the dialects' OWN declared leaves, under their own partitions.
+    for (const backend of TERMINAL_BACKENDS)
+      for (const own of (TERMINAL_DIALECTS.find((dialect) => dialect.id === backend.dialectId)?.fields ?? []))
+        assert.ok(TERMINAL_FORM_ROWS[0].fields.some((knob) => knob.key === backend.configKey + '.' + own.leaf),
+          backend.configKey + '.' + own.leaf + ' must be pinnable from the session row too')
+  })
+
+  test('the row schema and its Plugins page address one and the same set, in one order', () => {
+    assert.deepEqual(volatilePaths(terminalTool.Config), TERMINAL_FORM_ROWS[0].fields.map((knob) => knob.path.join('.')))
+    const schema = terminalTool.Config({})
+    assert.equal(schema.terminal.defaultShell.get(), TERMINAL_BACKENDS[0].toolName, 'the default is the first capable dialect')
+    assert.equal(schema.terminal.allowUnconfined.get(), true)
+    for (const backend of TERMINAL_BACKENDS)
+      assert.ok(schema[backend.configKey] !== undefined, backend.configKey + ' must have a pin partition')
+  })
+
+  test('every capable dialect supplies the interactive argv its substrate needs', () => {
+    assert.throws(() => ShellExecutorBase.prototype.terminalArgv.call({ constructor: { logName: 'bash-x' } }),
+      /does not implement interactive terminal sessions/,
+      'a dialect without a session must refuse, never inherit a plausible argv')
+    const git = bare(GitBashExecutor, { bashPath: () => 'C:/Git/bin/bash.exe' })
+    assert.deepEqual(git.terminalArgv(), ['C:/Git/bin/bash.exe', '-i'])
+    assert.ok(!Object.hasOwn(Msys2BashExecutor.prototype, 'terminalArgv'), 'msys2 inherits the MSYS argv rather than copying it')
+    const wsl = bare(WslBashExecutor, { wslPath: () => 'wsl.exe', distro: () => 'Ubuntu-24.04' })
+    assert.deepEqual(wsl.terminalArgv({ workdir: 'C:\\ws' }), ['wsl.exe', '--cd', 'C:\\ws', '-d', 'Ubuntu-24.04', '--', 'bash', '-i'])
+    const wslBare = bare(WslBashExecutor, { wslPath: () => 'wsl.exe', distro: () => undefined })
+    assert.deepEqual(wslBare.terminalArgv({}), ['wsl.exe', '--', 'bash', '-i'], 'an unlisted distro adds no -d')
+  })
+
+  test('the ring reports truncation and a slid offset separately, and never splits a pair', () => {
+    const ring = new OutputRing(8)
+    ring.append('0123456789')
+    const whole = ring.readFrom(0)
+    assert.equal(whole.lossy, true)
+    assert.equal(whole.truncated, true)
+    assert.equal(ring.readFrom(whole.nextOffset - 3).lossy, false)
+    assert.equal(ring.readFrom(whole.nextOffset - 3).truncated, true, 'the latch still reports earlier loss')
+    const pair = new OutputRing(64 * 1024)
+    const source = 'x'.repeat(8191) + '\u{1f600}' + 'y'.repeat(4)
+    pair.append(source)
+    assert.equal(pair.readFrom(0).text, source, 'byte-identical across the 8192-unit chunk boundary')
+  })
+
+  test('the sanitizer strips escapes across chunk boundaries and normalizes line endings', () => {
+    const sanitizer = new TerminalSanitizer()
+    assert.equal(sanitizer.push('a\u001b[').text, 'a')
+    assert.equal(sanitizer.push('32mb\u0007').text, 'b')
+    assert.equal(normalizeTerminalText('x\r\ny\rz'), 'x\ny\nz')
+    const bounded = new TerminalSanitizer(16)
+    assert.equal(bounded.push('k\u001b[' + '9'.repeat(40)).text, 'k')
+    assert.equal(bounded.flush().text, '', 'a runaway carry never resurfaces as text')
+  })
+
+  /** A fake PTY service, so the registry's boundaries need no real shell. */
+  const fakePty = () => {
+    const spawned = []
+    const handles = []
+    const service = {
+      spawnTerminal: async (spec) => {
+        spawned.push(spec)
+        const output = new PassThrough()
+        let settle
+        const done = new Promise((resolve) => { settle = resolve })
+        const handle = {
+          pid: 7, output, done, writes: [], signals: [], terminated: 0,
+          write: async (data) => { handle.writes.push(data) },
+          signalForeground: async (signal) => { handle.signals.push(signal); return 3 },
+          inspectActivity: async () => ({ state: 'unknown', revision: 1 }),
+          resize: async () => {},
+          terminate: async () => { handle.terminated += 1; output.end() },
+        }
+        handle.exit = (outcome) => settle(outcome)
+        handles.push(handle)
+        return handle
+      },
+    }
+    return { spawned, handles, service }
+  }
+  const sessionRequest = (ownerKey, over = {}) => ({
+    ownerKey, shell: 'git_bash', argv: ['bash', '-i'], cwd: 'C:/ws', env: {}, name: undefined, signal: undefined,
+    maxSessions: 2, idleMs: 0, rows: 30, cols: 110, maxBufferBytes: 4096, waitMs: 300, quietMs: 60, graceMs: 1000, ...over,
+  })
+  const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+  const throwsSync = (fn, predicate, label) => {
+    let error
+    try { fn() } catch (caught) { error = caught }
+    assert.ok(error !== undefined, label + ': expected a refusal')
+    assert.ok(predicate(error), label + ': ' + String(error?.message ?? error))
+  }
+  await testAsync('the session cap, owner fence, signal set and disposal are enforced', async () => {
+    const fake = fakePty()
+    const sessions = createTerminalSessions({ subprocess: fake.service }, {})
+    const opened = await sessions.open(sessionRequest('agent-a'))
+    await sessions.open(sessionRequest('agent-a'))
+    await assert.rejects(() => sessions.open(sessionRequest('agent-a')), (error) => error.code === 'SESSION_LIMIT')
+    assert.equal(fake.spawned.length, 2, 'the refused open spawned nothing')
+    throwsSync(() => sessions.read({ ownerKey: 'agent-b', sessionId: opened.session.id }),
+      (error) => error.code === 'FOREIGN_SESSION', 'another agent')
+    assert.equal(sessions.list('agent-b').length, 0)
+    for (const signal of TERMINAL_SIGNALS)
+      assert.equal((await sessions.signal({ ownerKey: 'agent-a', sessionId: opened.session.id, signal, waitMs: 60, quietMs: 20 })).delivered, 3)
+    assert.deepEqual(fake.handles[0].signals, [...TERMINAL_SIGNALS])
+    await assert.rejects(() => sessions.signal({ ownerKey: 'agent-a', sessionId: opened.session.id, signal: 'SIGWINCH', waitMs: 60, quietMs: 20 }),
+      (error) => error.code === 'INVALID_SIGNAL')
+    await sessions.dispose()
+    assert.deepEqual(fake.handles.map((handle) => handle.terminated), [1, 1], 'disposal terminates every session once')
+  })
+  await testAsync('an old handle without resize/inspectActivity still runs, and an idled session explains itself', async () => {
+    const fake = fakePty()
+    const sessions = createTerminalSessions({ subprocess: fake.service }, {})
+    const opened = await sessions.open(sessionRequest('a'))
+    delete fake.handles[0].resize
+    delete fake.handles[0].inspectActivity
+    const sent = await sessions.send({ ownerKey: 'a', sessionId: opened.session.id, text: 'x', cols: 200, waitMs: 200, quietMs: 30 })
+    // No output was observed on this fake handle, and it cannot answer
+    // `inspectActivity`: the wait must report the cap rather than claim silence.
+    assert.equal(sent.waitReason, 'timeout', 'no observed output means no quiet, only the cap')
+    const idled = await sessions.open(sessionRequest('a', { idleMs: 40 }))
+    await settle(140)
+    assert.equal(fake.handles[1].terminated, 1)
+    throwsSync(() => sessions.read({ ownerKey: 'a', sessionId: idled.session.id }),
+      (error) => error.code === 'SESSION_GONE' && /idle reaper/.test(error.message), 'an idle-reclaimed id')
+    await sessions.dispose()
+  })
+}
+
+console.log('\n[B] boot integration: the terminal row over a REAL PTY (state must survive between calls)')
+{
+  // The acceptance test the row exists for: one live interactive shell whose
+  // cwd, exported variables and aliases outlive the call that set them. The
+  // fixture pins the probed Git Bash (never a hardcoded path) and a small output
+  // cap so truncation is observable without megabytes of output.
+  const TERMINAL_FIXTURE_ROWS = (configLines) => CORE_ROW_ONLY + [
+    '- id: win-mb-tool-terminal',
+    "  name: 'dsh-win-multi-bash/tool-terminal'",
+    '  config:',
+    '    terminal:',
+    ...configLines.map((line) => '      ' + line),
+    '    gitBash:',
+    "      bashPath: '" + GIT_BASH.replaceAll(String.fromCharCode(92), String.fromCharCode(92) + String.fromCharCode(92)) + "'",
+    '',
+  ].join('\n')
+  const runTerminal = async (ctx, args) => {
+    const result = await ctx.tools.execute({
+      signal: new AbortController().signal,
+      callId: ToolCallId('audit-terminal-' + Math.random().toString(36).slice(2)),
+      name: 'terminal',
+      arguments: args,
+    })
+    const text = (result.content ?? []).filter((entry) => entry.type === 'text').map((entry) => entry.text).join('')
+    return { text, value: result.value, isError: result.isError }
+  }
+
+  if (GIT_BASH === '') {
+    console.log('  … skipping the terminal round trip: no Git Bash was found to pin')
+  } else {
+    let ctx
+    try {
+      ctx = await bootFixture(TERMINAL_FIXTURE_ROWS([
+        'defaultShell: git_bash',
+        'maxSessions: 2',
+        'maxBufferBytes: 4096',
+        'waitMs: 6000',
+        'quietMs: 400',
+      ]), 'terminal-roundtrip.yml')
+      await testAsync('the tool is registered, the shell seat is untouched, and bad arguments are named', async () => {
+        const names = ctx.tools.schemas().map((tool) => tool.name)
+        assert.ok(names.includes('terminal'), 'terminal must be registered: ' + names.join(','))
+        assert.ok(ctx.shell !== undefined, 'the terminal row must not contend for the shell seat')
+        // Two layers answer here, and both are real: the runtime's own schema
+        // validation rejects a missing/unknown `action` (and an out-of-enum
+        // `signal`/`shell`) BEFORE the tool body runs, and the body's own checks
+        // catch everything the schema cannot (a missing sessionId, empty text, an
+        // unknown session). The patterns accept either layer by name.
+        for (const [args, pattern] of [
+          [{}, /missing required property "action"/],
+          [{ action: 'nope' }, /invalid arguments|"action" must be one of/],
+          [{ action: 'send', text: 'x' }, /"sessionId" is required/],
+          [{ action: 'send', sessionId: 'x', text: '' }, /"text" must be a non-empty string/],
+          [{ action: 'signal', sessionId: 'x', signal: 'SIGWINCH' }, /invalid arguments|"signal" must be one of/],
+          [{ action: 'open', shell: 'pwsh' }, /invalid arguments|unknown shell/],
+          [{ action: 'read', sessionId: 'no-such-session' }, /no session/],
+        ]) {
+          const refused = await runTerminal(ctx, args)
+          assert.equal(refused.isError, true, 'expected a refusal for ' + JSON.stringify(args) + ': ' + refused.text)
+          assert.match(refused.text, pattern)
+        }
+      })
+      await testAsync('a real Git Bash session keeps cwd, exported variables and aliases across calls', async () => {
+        const dir = mkdtempSync(join(process.cwd(), '.temp', 'terminal-state-'))
+        try {
+          const opened = await runTerminal(ctx, { action: 'open', name: 'roundtrip' })
+          assert.ok(!opened.isError, opened.text)
+          assert.equal(opened.value.kind, 'open')
+          assert.equal(opened.value.shell, 'git_bash')
+          assert.equal(opened.value.unconfined, true, 'a PTY session cannot be sandboxed, and the result says so')
+          const id = opened.value.sessionId
+          const send = async (text) => (await runTerminal(ctx, { action: 'send', sessionId: id, text })).value.output
+          assert.match(await send('cd "' + dir + '" && pwd'), /terminal-state-/, 'the shell moved')
+          assert.match(await send('pwd'), /terminal-state-/, 'the directory survived the next call')
+          await send('export DSH_WMB_PROBE=42')
+          assert.match(await send('echo "PROBE=$DSH_WMB_PROBE"'), /PROBE=42/, 'the exported variable survived')
+          await send("alias t='echo alias-ok'")
+          assert.match(await send('t'), /alias-ok/, 'the alias survived')
+          const listed = await runTerminal(ctx, { action: 'list' })
+          assert.equal(listed.value.kind, 'list')
+          assert.ok(listed.value.sessions.some((session) => session.sessionId === id), 'list names the live session')
+        } finally {
+          rmSync(dir, { recursive: true, force: true })
+        }
+      })
+      await testAsync('a big burst reports truncation, and SIGINT interrupts without killing the session', async () => {
+        const opened = await runTerminal(ctx, { action: 'open' })
+        const id = opened.value.sessionId
+        const big = await runTerminal(ctx, { action: 'send', sessionId: id, text: 'seq 1 20000', waitMs: 4000 })
+        assert.equal(big.value.truncated, true, 'a 29 KB burst must not vanish silently under a 4 KiB cap')
+        await runTerminal(ctx, { action: 'send', sessionId: id, text: 'sleep 30', waitMs: 300 })
+        const signalled = await runTerminal(ctx, { action: 'signal', sessionId: id, signal: 'SIGINT', waitMs: 1500 })
+        assert.ok(!signalled.isError, signalled.text)
+        // The command text is echoed, so matching the ARITHMETIC RESULT proves the
+        // shell really ran it rather than just printing what was typed.
+        const after = await runTerminal(ctx, { action: 'send', sessionId: id, text: 'echo AFTER-SIGINT-$((6*7))', waitMs: 3000 })
+        assert.match(after.value.output, /AFTER-SIGINT-42/, 'the session survives Ctrl+C')
+        const closed = await runTerminal(ctx, { action: 'close', sessionId: id })
+        assert.equal(closed.value.kind, 'closed')
+        const gone = await runTerminal(ctx, { action: 'send', sessionId: id, text: 'echo x' })
+        assert.equal(gone.isError, true)
+        assert.match(gone.text, /gone|no session/)
+      })
+    } finally {
+      if (ctx) await ctx.fiber.dispose()
+    }
+    let strict
+    try {
+      strict = await bootFixture(TERMINAL_FIXTURE_ROWS(['defaultShell: git_bash', 'allowUnconfined: false']), 'terminal-unconfined-off.yml')
+      await testAsync('allowUnconfined: false refuses to open a session instead of running one unconfined', async () => {
+        const refused = await runTerminal(strict, { action: 'open' })
+        assert.equal(refused.isError, true, refused.text)
+        assert.match(refused.text, /allowUnconfined/)
+      })
+    } finally {
+      if (strict) await strict.fiber.dispose()
+    }
+  }
 }
 
 console.log('\n[A] unit: web client half (the Plugins page row form)')
@@ -2273,7 +2935,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
       ['win-mb-tool-git', gitBashTool, 'gitBash'],
       ['win-mb-tool-wsl', wslBashTool, 'wslBash'],
     ]) {
-      assert.deepEqual(Object.keys(tool.Config.dict), ['enableRunInBackground', 'promoteOnTimeout', partition])
+      assert.deepEqual(Object.keys(tool.Config.dict), ['enableRunInBackground', 'guardSandboxTemp', 'promoteOnTimeout', partition])
       assert.equal(tool.Config.dict.promoteOnTimeout.meta?.volatile, undefined, 'promoteOnTimeout must stay plain')
       const paths = volatilePaths(tool.Config)
       assert.ok(!paths.includes('promoteOnTimeout'), `${rowId}: promoteOnTimeout must not be projected`)

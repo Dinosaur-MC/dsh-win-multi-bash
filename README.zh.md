@@ -19,6 +19,7 @@
 | --- | --- | --- | --- |
 | `git_bash` | git-bash | MSYS | 自带 `GitBashExecutor`；Git for Windows 工具链 |
 | `wsl_bash` | wsl-bash | Linux | 自带 `WslBashExecutor`；WSL 发行版内 Linux userland |
+| `terminal` | git-bash / wsl-bash / msys2-bash | MSYS / Linux / MSYS2 | 交互式 PTY 会话；后端由 `shell` 指定的方言决定 |
 | `pwsh`（dsh 自带） | pwsh | — | 由基座的 `pwsh-sandbox` 行提供，本插件完全不介入 |
 
 - 每个工具自行构建并驱动自己的执行器，都不注册为 `ctx.shell`；因此该席位——以及所有 inject `shell` 的插件（dsh 的 `tool-pwsh`、`permission-presets` 等）——不受本插件加载影响。
@@ -63,6 +64,8 @@
 
 > 注意：`requireSandbox` 与 `sandbox: none` 互斥使用——显式 `none` 是用户主动放弃沙箱，保持放行；`requireSandbox` 只管「想沙箱但探针失败」的情形。
 
+- **windows-acl 后端对「恰好一个目录」是有状态的。** 它按 (会话, 工作区根) 只物化**一个**私有临时根 —— `%TEMP%\dsh-<6 个字母数字>` —— 并在整个会话里复用这个缓存路径；其 runner 把 `--temp` 当作「必须已存在」的入参，所以路径缺失就是硬失败（`windows-acl-run: --temp is not an existing directory: <路径>`，退出码 127），而且该会话之后**每一次被包裹的 spawn** 都会失败，直到它回来。手工重建该目录只恢复**存在性**：seam 的写授权（`tempWriteSid` 的 ACE）不会回来，受限子进程写自己的 `%TEMP%` 仍然被拒。因此本插件在 `git_bash` / `msys2_bash` 行下一条被包裹的命令上**重建该目录并重新施加 seam 自己的写授权** —— 这就是 `guardSandboxTemp`（默认开，见「运行时配置」）。本机 2026-10-16 实测（装置 `.temp/guard/device.mjs`）：没有授权时被包裹的 `cmd.exe` 写自己的 `%TEMP%` 报「拒绝访问。」；有授权时写入成功；删掉私有根后 runner 以 127 退出并打出上面那条签名；自愈之后同一条被包裹的写再次成功。
+
 ### 为 `wsl_bash` 启用 bwrap 沙箱
 
 `wsl_bash` 的沙箱需要发行版内有 bubblewrap。Ubuntu/Debian 系安装：
@@ -105,6 +108,30 @@ wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"   # 验
 
 两点注意：**运行时**关掉某行对小节立即生效（每次装配都重新解析），但已加载的工具行仍保留它注册时的描述，因此"关掉核心行→兜底接管"要等该工具行重载或重启才发生。另外，启动期经 cordis logger 发出的警告，会被 app-boot 的收集器留着用于失败报告、但在成功启动且默认日志级别下丢弃——所以**真正保证模型不丢指导的是兜底文本，而不是那条日志**。
 
+## 交互式终端会话（`terminal`）
+
+`terminal` 运行**持久 PTY 会话** —— 一个真正活着的交互式 shell，跨调用保持，因此当前目录、导出的变量、别名、函数与后台作业都留得住。适合 REPL、调试器、`ssh`、数据库客户端、TUI 程序，或任何依赖 shell 状态的工作流。
+
+| action | 作用 |
+|---|---|
+| `open` | 开启会话，返回 `sessionId`、pid、cwd 与启动输出。 |
+| `send` | 写入 `text`（默认补回车，除 `submit: false`）并返回回复。 |
+| `read` | 只读新输出；`offset` 可按全流字节偏移重读。 |
+| `signal` | 向前台进程组投递 `SIGINT` / `SIGTERM` / `SIGKILL` / `SIGTSTP` / `SIGHUP`。 |
+| `close` | 结束会话并等待其会话树静默。 |
+| `list` | 你拥有的会话。 |
+
+- **后端就是方言注册表。** `shell` 取自声明了交互会话能力的方言 —— `git_bash`、`wsl_bash`、`msys2_bash` —— 每个执行器自己给出交互 argv（`bash.exe -i`，或 `wsl.exe --cd <目录> [-d <发行版>] -- bash -i`）。`terminal.defaultShell` 决定默认值；没声明会话能力的方言永不会被列出。
+- **每个会话一条交互 shell，并用用户自己的启动文件。** 只加 `-i`，**不**加 `--noprofile --norc` —— 会话存在的意义就是留住那些启动文件设的别名与导出函数。
+- **"停顿即结束"是错的。** `send`/`signal` 在输出安静 `quietMs` 后返回，并报 `waitReason: "quiet"`；tty 会在毫秒级回显输入，所以安静往往在命令结束前很久就开始。`timeout` 表示等待撞到 `waitMs` 且会话仍在运行。两种情况都请再 `read`；`quiet` **故意不**声称"已完成"。
+- **输出是流，所以有上限、且如实上报。** 每个会话保留最近 `maxBufferBytes`（默认 1 MiB）的**已清洗**文本，并分开报两件事：`truncated`（该会话某刻丢过输出）与 `lossy`（本次读取要的偏移已经滑出窗口，于是返回的是整段保留尾而不是增量）。ANSI 转义会被剥离；这里没有终端模拟器，所以用回车重绘一行的程序会变成多行。
+- **会话有上限、会被回收、且是进程内的。** `maxSessions`（默认 8）会具名拒绝下一次 `open`；`idleMs`（默认 10 分钟）内没有 `send`/`read`/`signal` 的会话会被终止，之后用它的 id 会被告知"已被空闲回收"，而不是含糊的 unknown。会话**不**跨 `dsh` 重启存活。
+- **会话不是作业。** 它不注册进 `ctx.jobs`，`job_kill` 够不到它：`close` 是唯一的结束方式，空闲回收兜底。
+- **PTY 会话未包裹运行，并且会说。** 文件沙箱包裹的是被 spawn 命令的 argv；终端会话由另一条 provider 调用分配，而在 Windows 上 windows-acl runner 根本起不了 MSYS bash（见上），因此没有诚实的办法去包裹它。每次 `open` 都携带该事实；`terminal.allowUnconfined: false` 会让 `open` 直接拒绝而不是无保护运行。
+- **信号原样透传。** Windows provider 支持 `SIGINT`（Ctrl+C）、`SIGTERM`、`SIGKILL`；它会拒绝 `SIGTSTP`/`SIGHUP`，该拒绝会原样转达而不是假装成功。
+- **两个 provider 事实值得知道。** Windows 上 `pid` 是 `0`（ConPTY），仅供展示；`inspectActivity()` 在那里恒为 `unknown`，所以就绪判定回落到"输出静默" —— 在能作答的 provider 上，`idle` 立即结算，`busy` 会继续等。
+- **默认值是测出来的，不是猜的。** `quietMs` 500 ms 相对实测最坏块间间隔（216 ms，`ls -la /usr/bin | head -80` 跑 18 次）留了约 2.3 倍余量；1 MiB 正是单条 `seq 1 200000`（1.42 MiB）越过的边界，这也让 `truncated` 可被观察到；`waitMs` 10 秒用 40×200 ms 的 ticker 验证过（返回部分输出且会话存活）；启动预算覆盖实测约 460 ms 到首提示符。以上每一项都能在插件面板的行上即时改。
+
 ## 运行时配置（插件管理面板）
 
 两个工具行各自携带配置，且每个可配置项都声明了 `.volatile()`——这正是运行时设置服务能够寻址它们的条件。因此 Web 侧栏 **插件** 页可以直接编辑：侧栏打开 **插件** → 打开 `dsh-win-multi-bash` 包 → 每个行都有 **配置** 页。该页由浏览器半边（`lib/client.js`，通过 `dsh.client` 与 `./client` 导出声明）注册进页面的 `plugins.row.config` 槽位，key 为 `dsh-win-multi-bash#<行 id>`；保存经 `settings` / `ctx.configForms` 写入 profile 的 Cordis patch——与手改落点相同，没有自建 HTTP 路由、没有第二份设置文件，也不用碰 YAML。
@@ -113,14 +140,17 @@ wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"   # 验
 
 | 行 | 可配置项（按页面顺序） |
 |---|---|
-| `git_bash` | 后台任务（`enableRunInBackground`）；`cwd`、`timeoutMs`、`maxTimeoutMs`、`maxOutputBytes`、`maxSpillBytes`、`graceMs`；`bashPath`；沙箱立场（`auto` / `none`）；`probeTimeoutMs`；`requireSandbox` |
-| `wsl_bash` | `wslBash` 下同一组，外加 `wslPath`、`wslDistro`，且沙箱立场多一个 `bwrap` |
+| `git_bash` | 后台任务（`enableRunInBackground`）；沙箱临时目录自愈（`guardSandboxTemp`，默认开）；`cwd`、`timeoutMs`、`maxTimeoutMs`、`maxOutputBytes`、`maxSpillBytes`、`graceMs`；`bashPath`；沙箱立场（`auto` / `none`）；`probeTimeoutMs`；`requireSandbox` |
+| `wsl_bash` | 同两个**工具层**开关（`enableRunInBackground`、`guardSandboxTemp` —— 后者在该行无效，见下），外加 `wslBash` 下同一组、`wslPath`、`wslDistro`，且沙箱立场多一个 `bwrap` |
+| `terminal` | 交互会话：`defaultShell`（`open` 默认用哪个方言）、`maxSessions`、`idleMs`、`rows` / `cols`、`maxBufferBytes`、`waitMs` / `quietMs` / `maxWaitMs`、`allowUnconfined`，外加每方言一个可执行文件钉定（`gitBash.bashPath`、`wslBash.wslPath` / `wslDistro`、`msys2Bash.bashPath`） |
 
 该列表就是每个行 `Config` schema 的 volatile 投影——审计把两侧对齐（主机 config 的 `volatilePaths` 对浏览器半边的字段表），所以给后端加了字段却忘了 `.volatile()` 不会悄悄只留在 YAML，页面也不可能提供 Host 会拒绝的字段。
 
 - **活引用**：volatile 字段是活引用，执行器在使用时通过 `.get()` 读取。路径、发行版、沙箱立场、超时与强化开关的改动对下一条命令即生效，无需重载该行。
 - **两项需要该行下次加载**（因为它们塑造的是工具 **schema** 而不是单次调用）：`enableRunInBackground`（对外广告的 `run_in_background` 参数）与升级面（`sandbox_permissions`，加载时按探针结论广告）。
 - **另有一个行为开关刻意不上页面。** `promoteOnTimeout`（默认开）让到达超时的前台命令继续作为后台任务运行——在任务工具里可见、可 kill——而不是把它杀掉，与 dsh 自带 bash 工具一致。它是非 volatile 的，因为它属于部署立场而非活旋钮：写在行的 YAML 里，在该行下次加载时生效。若 `enableRunInBackground: false`，或组合里没有 job registry，超时仍与以前一样直接杀掉命令。
+- **被带外删除的沙箱私有临时目录会自愈（`guardSandboxTemp`，默认开）。** `git_bash` / `msys2_bash` 行每一条被包裹的命令都会读取 seam 即将交给 windows-acl runner 的 `--temp` —— 即后端为这个 (会话, 工作区根) 缓存的路径 —— 当这个私有根确实缺失时，重建它并重新施加 seam 自己的写授权（`tempWriteSid` + `AclWriteGrant`，与 `dsh-sandbox-local` 自己的调用相同）。它**幂等、即时生效、且不删除任何东西**：唯一接受的目标是「不存在的、绝对的、位于某个 OS 临时根本身之下、且不在任何工作区根内的 `dsh-<6 个字母数字>` **直接子目录**」；其它一切——环境临时根本身、嵌套路径、锁目录、转存目录、形状不符的名字、已存在的目录——都会具名拒绝。`AclWriteGrant` 来自 `@deepseek-ai/dsh-sandbox-windows-acl`，通过 lazy import 获取（声明为 optional peer，**无新增运行期依赖**）；解析不到时仍然只重建目录（仅存在性），插件会告警说明授权**没有**恢复。把该开关在行上关掉，即从该行下一条命令起停止自愈。
+- **该开关属于工具层，所以每个工具行上都有**（`enableRunInBackground` 与 `guardSandboxTemp` 是 `gitBash` / `wslBash` / `msys2Bash` 分区之外的两个旋钮）。两条如实限制：`wsl_bash` 走 bwrap，从不物化 `--temp` 目录，所以该旋钮在那一行无效；自愈只在真的发生「被包裹的运行」的地方才可能发生 —— 在 windows-acl runner 无法启动 MSYS bash 的宿主机上（本机实测：`git_bash` 每次调用都返回 `sandbox.unconfined: true`），git 行根本到不了 runner，既不会因此变砖、也无法在那里自愈。
 - **没被沙箱包裹的运行会明说。** 命令未被沙箱包裹时，结果带 `sandbox.unconfined: true`。若原因是 `sandbox: auto` 的探针失败（我们替你降级），每一条这类结果都会带一句短的 `[sandbox: not applied — ran unconfined under <mode> mode; reason and fix stated once per plugin load]`；而**该行每次加载后第一条真正送达模型的结果**（前景结果、promoted 结果、或真后台 job 的终态 detail，谁先被读到算谁）换成完整说明：`[sandbox: not applied — the confinement probe found no usable sandbox, so this command ran unconfined under <mode> mode; repair the sandbox or set sandbox: none on this tool row to accept unconfined runs]`。显式 `sandbox: none` 只带事实、不发任何提示；`danger-full-access` 两者都不带——它的 `mode` 已经说明了它是什么。
 - **第三个方言默认关闭。** `msys2_bash`（MSYS2 自带的 `usr/bin/bash.exe`，与 Git Bash 并列的第二套工具链）是**可选启用**的：在 Plugins 面板开启 `win-mb-tool-msys2` 行即可挂载；若 MSYS2 装在非默认位置，用 `msys2Bash.bashPath` 固定。它**继承** MSYS 机制而不是复制一份，并且报告**自己的**事实（`$MSYSTEM`、`pacman`）而不是 Git Bash 的。
 - **文本旋钮保存时 trim，不可用的值只告警、绝不改写。** 文本字段（路径、发行版名）保存前会 trim，并把 trim 后的值回显出来，做到所见即所存；清空字段表示清除该值。若值不满足**页面能做的语法判断**（路径非绝对、发行版名含空格或引号、数字非有限），页面会给出告警，但**仍然按你输入的原样保存**：插件**从不改写或删除你的配置**。这个值到底能不能用，由**运行时**判断：执行器告警一次，回退到默认（shell 路径回退自动发现；\`wslDistro\` 回退第一个可用发行版），并且**存储里的原值一直不动**，直到你自己再次保存。
@@ -153,6 +183,8 @@ lib/
 ├── bash-wsl/       WslBashExecutor（WSL，base64 载荷）
 ├── tool-bash/      工具工厂 + git_bash / wsl_bash 实例、
 │                   后端持有逻辑（types/backend.js）
+├── terminal-session.js  PTY 会话注册表（有界输出、就绪判定、回收）
+├── sandbox-temp-guard.js 沙箱私有临时目录自愈
 └── vendor/         运行器失败分类与 bwrap 配置辅助模块
 ```
 
@@ -206,8 +238,13 @@ powershell -ExecutionPolicy Bypass -File .\smoke\audit.ps1
 | `wsl_bash` 报 `bwrap was not found` | 已配置 `sandbox: bwrap` 但发行版内没有 bubblewrap：按上方「沙箱行为 → 为 `wsl_bash` 启用 bwrap 沙箱」安装（`sudo apt-get install -y bubblewrap`）并重启 `dsh web`，或改用 `sandbox: auto` / `none` |
 | `wsl_bash` 沙箱报 bwrap runner 失败 | bwrap 的工作区根取 Windows 盘符路径的 Linux 侧（`/mnt/<盘符>/...`）：UNC 工作区根会响亮报错；发行版自定义了 automount 根（wsl.conf `automount.root`）时需要相应配置 |
 | `git_bash` 里调 `wsl.exe` 等原生程序传 POSIX 路径报 `No such file or directory` | MSYS 把 `/root` 等改写成 `<Git 根目录>\root`：加 `MSYS_NO_PATHCONV=1` / `MSYS2_ARG_CONV_EXCL="*"`，或用 `//` 前缀；WSL 操作直接改用 `wsl_bash` 工具 |
+| 被包裹的命令突然报 `windows-acl-run: --temp is not an existing directory: …`（或 `sandbox-unavailable`），且之后每次调用都失败 | 该会话的沙箱私有临时根被带外删掉了——系统临时文件清理器、手工 `rmdir`、崩溃的同族进程。只要 `guardSandboxTemp` 开着（默认），一条 `git_bash` / `msys2_bash` 命令就会重建它并重新施加写授权；重试一次即可。若该行报告 `sandbox.unconfined: true`，说明它在本机根本到不了 ACL runner、无法自愈：重启 `dsh web` 以取得新的私有根。手工重建目录只恢复存在性（受限子进程写自己的 `%TEMP%` 仍被拒） |
 | 安装 bubblewrap 后 `wsl_bash` 仍无沙箱 | bwrap 探针结果在宿主进程生命周期内缓存：重启 `dsh web`，或编辑 profile patch 触发工具行重载后再试 |
 | 启动告警 `win-mb-tool-git … waiting for service: shell`（或 dsh 自带的 `tool-pwsh` / `permission-presets` 如此） | 没有任何行提供 `ctx.shell`。本插件已不提供该席位：检查基座的 `pwsh-sandbox` 行是否被别的 patch 禁用了 |
+| `terminal` 说某会话「gone — closed by the idle reaper」 | 该会话在 `terminal.idleMs`（默认 10 分钟）内没有 `send`/`read`/`signal`，已被终止。开一个新会话，或在终端行上把 `idleMs` 调大。 |
+| `terminal` 报 `waitReason: "quiet"`，而命令明显还没结束 | 这正是 `quiet` 的含义：输出安静了，而**不是**「命令结束了」（tty 会在毫秒级回显输入）。再 `read` 一次，或在终端行上把 `waitMs` / `quietMs` 调大。 |
+| `terminal` 报 `truncated: true` | 该会话产生的输出超过了 `terminal.maxBufferBytes`（默认 1 MiB），最旧的输出已被丢弃。调大上限，或更频繁地 `read`。 |
+| `terminal` 以 `allowUnconfined` 为由拒绝开启会话 | 该行被设为 `terminal.allowUnconfined: false`；PTY 会话无法被文件沙箱包裹，因此它宁可拒绝也不无保护运行。改回 `true` 即可接受未包裹会话。 |
 
 ## 文件布局
 

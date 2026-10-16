@@ -101,6 +101,15 @@
       # is danger-full-access:
       #   gitBash:
       #     requireSandbox: true
+      #
+      # Optional: turn the sandbox private-temp self-heal off for this row
+      # (default ON). With it on, a confined run whose `--temp` private root
+      # (%TEMP%\dsh-<6 alphanumerics>) was removed out of band recreates that
+      # directory and re-applies the seam's write grant before the runner is
+      # spawned; with it off the command fails exactly as upstream does. It is a
+      # TOOL-LAYER knob (a sibling of enableRunInBackground), not a gitBash one:
+      #   config:
+      #     guardSandboxTemp: false
 
     - id: win-mb-tool-wsl
       name: 'dsh-win-multi-bash/tool-wsl-bash'
@@ -123,4 +132,29 @@
       #   msys2Bash:
       #     bashPath: '<MSYS2 安装目录>\usr\bin\bash.exe'
       disabled: true
+
+    # The interactive-session row: it registers the model-facing `terminal`
+    # tool (open / send / read / signal / close / list). ONE row serves every
+    # terminal-capable dialect — the `shell` argument enumerates the dialects
+    # that declare the capability (git_bash, wsl_bash, msys2_bash) — because a
+    # session is a host-level resource: one registry, one session cap, one idle
+    # reaper. Each dialect's interactive argv comes from its own executor
+    # (`terminalArgv()`), so adding a dialect still changes nothing here.
+    #
+    # Sessions run UNCONFINED on purpose: the terminal primitive is a different
+    # provider call than `spawn`, and the windows-acl runner cannot start MSYS
+    # bash at all on this host, so there is no honest way to wrap one. Every
+    # `open` reports that fact; set `terminal.allowUnconfined: false` to refuse
+    # opening a session instead.
+    - id: win-mb-tool-terminal
+      name: 'dsh-win-multi-bash/tool-terminal'
+      disabled: !!js process.platform !== 'win32'
+      # Session shape — every knob below is live-editable on the Plugins page:
+      #   config:
+      #     terminal:
+      #       defaultShell: wsl_bash
+      #       maxSessions: 8
+      #       idleMs: 600000
+      #       maxBufferBytes: 1048576
+      #       allowUnconfined: true
 
