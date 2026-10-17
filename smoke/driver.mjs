@@ -74,7 +74,19 @@ try {
     report.runs.pwsh = { ok: false, error: String(error?.message ?? error).slice(0, 300) }
   }
 
+  // A report is not a verdict. This entry point is what `npm test` runs, so a missing
+  // tool or a failed command has to FAIL it: otherwise a plugin whose rows never
+  // registered still exits 0 and the default entry point proves nothing. The JSON is
+  // printed first so the diagnosis is still there for a human.
   console.log(JSON.stringify(report, null, 2))
+  const failures = []
+  if (!report.gitBashPresent) failures.push('git_bash is not registered')
+  if (!report.wslBashPresent) failures.push('wsl_bash is not registered')
+  if (!report.gitBashDescriptionHasMsys) failures.push('the git_bash description is missing its own facts')
+  if (!report.wslBashDescriptionHasWsl) failures.push('the wsl_bash description is missing its own facts')
+  if (!report.shellSeatPresent) failures.push("the base bundle's ctx.shell seat is gone")
+  for (const [name, run] of Object.entries(report.runs)) if (run.ok !== true) failures.push(name + ': ' + (run.error ?? 'failed'))
+  if (failures.length > 0) throw new Error('smoke driver failed: ' + failures.join('; '))
 } finally {
   await ctx.fiber.dispose()
 }

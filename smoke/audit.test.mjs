@@ -73,12 +73,49 @@ const {
 const packageRow = await import(libUrl('index.js'))
 // The registry's own expectations, so the row lists below are compared with the
 // single source instead of a hand-kept literal.
-const { CLIENT_ROWS: REGISTRY_ROWS, PATCH_ROWS } = await import(libUrl('tool-bash', 'types', 'registry.js'))
+const { CLIENT_ROWS: REGISTRY_ROWS, PATCH_ROWS, TOOL_INSTANCES } = await import(libUrl('tool-bash', 'types', 'registry.js'))
 const { LocalBashExecutor } = await import('@deepseek-ai/dsh-bash-local')
 
 let passed = 0
+/** Wall-clock attribution, printed when DSH_AUDIT_TIMING=1 (see the summary). */
+const TIMING = process.env.DSH_AUDIT_TIMING === '1'
+const STARTED_AT = Date.now()
+const timing = { boots: 0, bootMs: 0, calls: 0, callMs: 0 }
+const timed = async (bucket, run) => {
+  if (!TIMING) return run()
+  const began = Date.now()
+  try { return await run() } finally {
+    timing[bucket + 'Ms'] += Date.now() - began
+    timing[bucket + 's'] += 1
+  }
+}
 let failed = 0
 const failures = []
+let skipped = 0
+/**
+ * Report one failure that escaped a test and end the run with a summary anyway.
+ *
+ * A thrown assertion used to be able to kill the process mid-suite, which reported NOTHING
+ * — no ✓/✗ line for the case that threw and no summary at all (measured while mutating a
+ * value a later test compares against). A suite that can end without a verdict is not a gate.
+ */
+const reportAndExit = (label, error) => {
+  failed += 1
+  failures.push({ name: label, error })
+  console.log(`  ✗ ${label}\n      ${String(error?.message ?? error).split('\n').slice(0, 6).join('\n      ')}`)
+console.log(`\n==== audit summary: ${passed} passed, ${failed} failed, ${skipped} skipped ====`)
+  process.exit(1)
+}
+process.on('uncaughtException', (error) => reportAndExit('uncaught exception', error))
+process.on('unhandledRejection', (error) => reportAndExit('unhandled rejection', error))
+/**
+ * Announce a case this host cannot exercise — and COUNT it: a skip that only prints is a
+ * hole in the totals, and one that stays silent (two of them did) is invisible entirely.
+ */
+const skip = (message) => {
+  skipped += 1
+  console.log(message)
+}
 
 function test(name, fn) {
   try {
@@ -643,7 +680,7 @@ console.log('\n[A] unit: GitBashExecutor (internals hooks)')
     assert.equal(await ex.resolveSandboxMode(), 'read-only', 'escalation must stay advertised so it can be refused')
   })
   if (!HAS_GIT_BASH) {
-    console.log('  … skipping real-spawn execute() tests: no Git Bash probed on this host')
+    skip('  … skipping real-spawn execute() tests: no Git Bash probed on this host')
   } else {
   testAsync('execute(): an explicitly unconfined git run reports the fact (sandbox: none)', async () => {
     const ex = bareInstance(GitBashExecutor, {
@@ -870,7 +907,7 @@ console.log('\n[A] unit: bash resolution (git-path inference, never the WSL laun
       try {
         symlinkSync(target, join(tmp, 'bash.exe'), 'file')
       } catch {
-        console.log('  … skipping symlink case: creating symlinks needs admin/developer mode')
+        skip('  … skipping symlink case: creating symlinks needs admin/developer mode')
         return
       }
       assert.equal(candidateExists(join(tmp, 'bash.exe')), false)
@@ -1122,7 +1159,7 @@ console.log('\n[A] unit: WslBashExecutor (internals hooks)')
     }), /unsupported Windows path/)
   })
   if (!HAS_WSL) {
-    console.log('  … skipping real-spawn WSL tests: no wsl.exe on this host')
+    skip('  … skipping real-spawn WSL tests: no wsl.exe on this host')
   } else {
   testAsync('execute(): an explicitly unconfined wsl run reports the fact (sandbox: none)', async () => {
     const ex = bareInstance(WslBashExecutor, {
@@ -1640,7 +1677,7 @@ async function bootFixture(extraRows, name = 'fixture.yml', patches = undefined)
   const path = join(FIXTURE_DIR, name)
   writeFileSync(path, BASE_ROWS + extraRows)
   writtenFixtures.push(path)
-  return boot('dsh-wmb-audit', resolveConfigPath(path, undefined), patches)
+  return timed('boot', () => boot('dsh-wmb-audit', resolveConfigPath(path, undefined), patches))
 }
 
 /**
@@ -1732,12 +1769,12 @@ async function execTool(ctx, name, args) {
 
 /** Execute a tool and return { text, isError, error } for error-path assertions. */
 async function execToolResult(ctx, name, args) {
-  const result = await ctx.tools.execute({
+  const result = await timed('call', () => ctx.tools.execute({
     signal: new AbortController().signal,
     callId: ToolCallId(`audit-${name}-${Math.random().toString(36).slice(2)}`),
     name,
     arguments: { description: `audit ${name}`, ...args },
-  })
+  }))
   const text = (result.content ?? [])
     .filter((b) => b.type === 'text')
     .map((b) => b.text)
@@ -1773,7 +1810,10 @@ console.log('\n[A] unit: factory workdir drive-form normalization')
     assert.equal(toNativeWorkdir('\\\\server\\share'), '\\\\server\\share')
   })
   test('toNativeWorkdir: a letter with no such drive is left alone', () => {
-    if (existsSync('Q:\\')) return
+    if (existsSync('Q:\\')) {
+      skip('  … skipping: this host has a Q: drive, so the "no such drive" case cannot be exercised')
+      return
+    }
     assert.equal(toNativeWorkdir('/q/WorkSpace'), '/q/WorkSpace')
   })
 }
@@ -1959,7 +1999,7 @@ console.log('\n[A] unit: the shared executor base owns the mechanism, each diale
       try {
         symlinkSync(target, join(tmp, 'bash.exe'), 'file')
       } catch {
-        console.log('  … skipping the symlink half: creating symlinks needs admin/developer mode')
+        skip('  … skipping the symlink half: creating symlinks needs admin/developer mode')
         return
       }
       const link = join(tmp, 'bash.exe')
@@ -2165,7 +2205,7 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
   const sshTool = await import(libUrl('tool-bash', 'types', 'ssh-bash.js'))
   const terminalTool = await import(libUrl('tool-bash', 'types', 'terminal.js'))
   const {
-    DEFAULT_CONNECT_TIMEOUT_MS, SshBashExecutor, assertSshPort, assertSshTarget, buildSshArgv,
+    DEFAULT_CONNECT_TIMEOUT_MS, SshBashExecutor, assertConnectTimeoutMs, assertSshPort, assertSshTarget, buildSshArgv,
     candidateSshPaths, connectTimeoutSeconds, declaredSshPaths, resolveSshPath,
   } = await import(libUrl('bash-ssh', 'index.js'))
   const { SHELL_REMOTE_SCOPE_SECTION, shellFamilySectionTextFor } =
@@ -2253,7 +2293,7 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
       acceptNewHostKeys: false, command: 'echo \"$HOME\"; ls -l', interactive: false,
     })
     assert.deepEqual(argv, [
-      'ssh.exe', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', '--', 'u@h', 'echo \"$HOME\"; ls -l',
+      'ssh.exe', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', '-o', 'StrictHostKeyChecking=yes', '--', 'u@h', 'echo \"$HOME\"; ls -l',
     ])
     // ssh joins its own remaining arguments and hands the result to the REMOTE login
     // shell, so passing the command as one element is exactly right — and no local
@@ -2263,21 +2303,39 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     // Every option is a declared field or a constant, so nothing in configuration can
     // inject an argv element; the pins only ever become their own elements.
     assert.deepEqual(buildSshArgv({
-      sshPath: 'ssh.exe', target: 'h', port: 2222, connectTimeoutMs: 900,
+      sshPath: 'ssh.exe', target: 'h', port: 2222, connectTimeoutMs: 1500,
       acceptNewHostKeys: true, command: 'id', interactive: false,
     }), [
       'ssh.exe', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=1',
       '-o', 'StrictHostKeyChecking=accept-new', '-p', '2222', '--', 'h', 'id',
     ])
-    // Trust-on-first-use is OPT-IN: the default adds no such option at all.
-    assert.ok(!buildSshArgv({
-      sshPath: 's', target: 'h', connectTimeoutMs: 1000, command: 'x', interactive: false,
-    }).includes('StrictHostKeyChecking=accept-new'))
+    // The host-key policy is emitted in BOTH states, shaped per FORM: leaving the option
+    // out would let a user or system ssh_config answer instead (a `Host *` line saying
+    // `no` would then silently accept a changed key for a one-shot call).
+    const oneShot = (acceptNewHostKeys) => buildSshArgv({
+      sshPath: 's', target: 'h', connectTimeoutMs: 1000, acceptNewHostKeys, command: 'x', interactive: false,
+    })
+    const sessionArgv = (acceptNewHostKeys) => buildSshArgv({
+      sshPath: 's', target: 'h', connectTimeoutMs: 1000, acceptNewHostKeys, interactive: true,
+    })
+    assert.ok(oneShot(false).includes('StrictHostKeyChecking=yes'), 'a one-shot call refuses an unknown host even where the config would ask')
+    assert.ok(!oneShot(false).includes('StrictHostKeyChecking=accept-new'))
+    assert.ok(oneShot(true).includes('StrictHostKeyChecking=accept-new'))
+    assert.ok(!oneShot(true).includes('StrictHostKeyChecking=yes'))
+    // The SESSION keeps the inherited `ask` when the knob is off: a first-connect
+    // question is the reason the persistent form exists at all.
+    assert.ok(!sessionArgv(false).some((entry) => entry.startsWith('StrictHostKeyChecking')), 'a session must still be able to ask')
+    assert.ok(sessionArgv(true).includes('StrictHostKeyChecking=accept-new'))
     // The connection bound is whole seconds, rounded DOWN so the ssh-side bound stays
-    // inside the configured one, and never below one second.
+    // inside the configured one; a pin under one second is refused at route time
+    // instead of being rounded UP into a bound nobody asked for.
     assert.equal(connectTimeoutSeconds(15000), 15)
     assert.equal(connectTimeoutSeconds(1999), 1)
-    assert.equal(connectTimeoutSeconds(900), 1)
+    assert.equal(connectTimeoutSeconds(900), 1, 'the pure floor, which a sub-second pin never reaches')
+    assert.equal(assertConnectTimeoutMs(1000), 1000)
+    assert.equal(assertConnectTimeoutMs(15000), 15000)
+    for (const bad of [0, 999, 500, -1, Number.NaN, 'x'])
+      assert.throws(() => assertConnectTimeoutMs(bad), /at least 1000 ms/, JSON.stringify(bad))
   })
 
   test('the session argv asks for a remote tty and passes no command', () => {
@@ -2300,6 +2358,8 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     assert.throws(() => assertSshTarget('h' + String.fromCharCode(9), 'sshBash.sshHost'), /whitespace or a control character/)
     assert.throws(() => assertSshTarget('h' + String.fromCharCode(0), 'sshBash.sshHost'), /whitespace or a control character/)
     assert.throws(() => assertSshTarget('', 'sshBash.sshHost'), /is not configured/)
+    assert.throws(() => assertSshTarget(undefined, 'sshBash.sshHost'),
+      /ssh_bash row OR on the terminal row/, 'the refusal must name BOTH rows: a session reads the terminal row')
     assert.throws(() => assertSshTarget(undefined, 'sshBash.sshHost'), /is not configured/)
     assert.equal(assertSshPort(22), 22)
     assert.equal(assertSshPort(65535), 65535)
@@ -2405,6 +2465,10 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
         stderr: { text: 'ssh: connect to host blackhole.invalid port 22: Connection timed out', truncated: false },
       })
       onStarted?.(proc)
+      // The fact a PROMOTED (timed-out) call reads BEFORE settlement: it is stamped on the
+      // handle itself, not only in the executor's private map.
+      assert.deepEqual(proc.sandbox, { mode: 'workspace-write', remote: true },
+        'the remote fact must be on the handle before `done` settles')
       return proc
     }
     const handle = await executor.remoteRun({ command: 'uname -a', workdir: winPath('C:', 'ws') },
@@ -2416,7 +2480,7 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     assert.deepEqual(Object.keys(result.sandbox).sort(), ['mode', 'remote'], 'and nothing else either')
     // The argv it really used is the one-shot shape, with the command as one element.
     assert.deepEqual(spawned, [['C:' + BS + 'OpenSSH' + BS + 'ssh.exe', '-T', '-o', 'BatchMode=yes',
-      '-o', 'ConnectTimeout=15', '--', 'blackhole.invalid', 'uname -a']])
+      '-o', 'ConnectTimeout=15', '-o', 'StrictHostKeyChecking=yes', '--', 'blackhole.invalid', 'uname -a']])
   })
 
   testAsync('requireSandbox fails closed on a remote dialect, and danger-full-access is the way out', async () => {
@@ -2533,7 +2597,7 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     assert.ok(!fallback.includes(LOCAL_SANDBOX_PHRASE))
   })
   if (localSsh === undefined) {
-    console.log('  … skipping the SSH boot cases: no ssh client found on this machine')
+    skip('  … skipping the SSH boot cases: no ssh client found on this machine')
   } else {
     /**
      * The one-shot row against TEST-NET-1 (RFC 5737, guaranteed unroutable), so the
@@ -2592,7 +2656,7 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     //   DSH_AUDIT_SSH_HOST=ubuntu_tx node smoke/prepare.mjs audit
     const liveHost = process.env.DSH_AUDIT_SSH_HOST
     if (liveHost === undefined || liveHost.length === 0) {
-      console.log('  … skipping the live SSH round trip: set DSH_AUDIT_SSH_HOST to run it')
+      skip('  … skipping the live SSH round trip: set DSH_AUDIT_SSH_HOST to run it')
     } else {
       const LIVE_ROWS = CORE_ROW_ONLY + `
 - id: win-mb-tool-ssh
@@ -3389,7 +3453,10 @@ console.log('\n[A] unit: sandbox private temp guard (self-heal for the sandbox p
 
   await testAsync('loadAclGrantApi(): the optional peer resolves here, or degrades to undefined without throwing', async () => {
     const api = await loadAclGrantApi()
-    if (api === undefined) return
+    if (api === undefined) {
+      skip('  … skipping: the optional ACL peer is not resolvable here, so only the degradation is covered')
+      return
+    }
     assert.equal(typeof api.tempWriteSid, 'function')
     assert.equal(typeof api.AclWriteGrant.create, 'function')
     // The SID is a pure function of the path, so a heal recomputes the SAME
@@ -3596,13 +3663,91 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
     throwsSync(() => sessions.read({ ownerKey: 'agent-b', sessionId: opened.session.id }),
       (error) => error.code === 'FOREIGN_SESSION', 'another agent')
     assert.equal(sessions.list('agent-b').length, 0)
-    for (const signal of TERMINAL_SIGNALS)
+    // Three of the five declared signals can reach this platform's provider at all; the
+    // other two are refused by name (see the zero-pid case below).
+    for (const signal of ['SIGINT', 'SIGTERM', 'SIGKILL'])
       assert.equal((await sessions.signal({ ownerKey: 'agent-a', sessionId: opened.session.id, signal, waitMs: 60, quietMs: 20 })).delivered, 3)
-    assert.deepEqual(fake.handles[0].signals, [...TERMINAL_SIGNALS])
+    assert.deepEqual(fake.handles[0].signals, ['SIGINT', 'SIGTERM', 'SIGKILL'])
+    for (const signal of ['SIGTSTP', 'SIGHUP'])
+      await assert.rejects(() => sessions.signal({ ownerKey: 'agent-a', sessionId: opened.session.id, signal, waitMs: 60, quietMs: 20 }),
+        (error) => error.code === 'SIGNAL_UNREACHABLE', signal + ' is not deliverable here')
+    assert.deepEqual(fake.handles[0].signals, ['SIGINT', 'SIGTERM', 'SIGKILL'], 'and it never reaches the provider either')
     await assert.rejects(() => sessions.signal({ ownerKey: 'agent-a', sessionId: opened.session.id, signal: 'SIGWINCH', waitMs: 60, quietMs: 20 }),
       (error) => error.code === 'INVALID_SIGNAL')
     await sessions.dispose()
     assert.deepEqual(fake.handles.map((handle) => handle.terminated), [1, 1], 'disposal terminates every session once')
+  })
+  await testAsync('a provider with no addressable pid refuses every signal it cannot deliver, by name', async () => {
+    // win32 ConPTY reports pid 0 for the whole session. Only SIGINT reaches the shell
+    // (the provider delivers it as a Ctrl+C byte); the other four DECLARED signals are
+    // refused here, with this plugin's own code, instead of reaching the provider and
+    // surfacing its raw message — which contradicts both this tool's description and
+    // the refusal right below it.
+    const fake = fakePty()
+    const spawn = fake.service.spawnTerminal
+    fake.service.spawnTerminal = async (spec) => {
+      const handle = await spawn(spec)
+      handle.pid = 0
+      return handle
+    }
+    const zero = createTerminalSessions({ subprocess: fake.service }, {})
+    const opened = await zero.open(sessionRequest('agent-a', { maxSessions: 1 }))
+    assert.equal(opened.view.pid, 0, 'the fixture really has no addressable pid')
+    for (const signal of ['SIGTERM', 'SIGKILL', 'SIGTSTP', 'SIGHUP']) {
+      await assert.rejects(
+        () => zero.signal({ ownerKey: 'agent-a', sessionId: opened.session.id, signal, waitMs: 60, quietMs: 20 }),
+        (error) => error.code === 'SIGNAL_UNREACHABLE' && /SIGINT is the only signal/.test(error.message),
+        signal + ' must be refused by name',
+      )
+    }
+    assert.deepEqual(fake.handles[0].signals, [], 'a refused signal never reaches the provider')
+    assert.equal((await zero.signal({ ownerKey: 'agent-a', sessionId: opened.session.id, signal: 'SIGINT', waitMs: 60, quietMs: 20 })).delivered, 3,
+      'SIGINT still reaches it')
+    await zero.dispose()
+  })
+  await testAsync('close reports the exit status its terminator produces, not the race', async () => {
+    // `close` used to read `session.exitCode` the instant `terminate()` resolved, while the
+    // outcome is assigned by the `done` continuation: a session that had exited could still
+    // be reported as `exitCode: null`. This fake publishes its outcome a tick after
+    // terminating, like a provider that observes the exit slightly later.
+    const fake = fakePty()
+    const spawn = fake.service.spawnTerminal
+    fake.service.spawnTerminal = async (spec) => {
+      const handle = await spawn(spec)
+      handle.terminate = async () => {
+        handle.terminated += 1
+        handle.output.end()
+        setTimeout(() => handle.exit({ exitCode: 7, signal: null }), 20)
+      }
+      return handle
+    }
+    const sessions = createTerminalSessions({ subprocess: fake.service }, {})
+    const opened = await sessions.open(sessionRequest('agent-a', { maxSessions: 1, startupWaitMs: 0 }))
+    const closed = await sessions.close({ ownerKey: 'agent-a', sessionId: opened.session.id, graceMs: 500 })
+    assert.equal(closed.exitCode, 7, 'the terminator\'s outcome is reported, not lost to the race')
+    assert.equal(closed.shell, 'git_bash', 'and the result still names its shell')
+    await sessions.dispose()
+  })
+
+  await testAsync('two concurrent opens cannot both pass a session cap of one', async () => {
+    // The cap has to count a session that is still STARTING: the spawn and the startup
+    // settle are awaited, so counting only the published map lets both opens through.
+    const fake = fakePty()
+    const spawn = fake.service.spawnTerminal
+    fake.service.spawnTerminal = async (spec) => {
+      await settle(30)
+      return spawn(spec)
+    }
+    const sessions = createTerminalSessions({ subprocess: fake.service }, {})
+    const results = await Promise.allSettled([
+      sessions.open(sessionRequest('agent-a', { maxSessions: 1, startupWaitMs: 0 })),
+      sessions.open(sessionRequest('agent-a', { maxSessions: 1, startupWaitMs: 0 })),
+    ])
+    const refused = results.filter((result) => result.status === 'rejected')
+    assert.equal(refused.length, 1, 'exactly one of two concurrent opens may start')
+    assert.equal(refused[0].reason.code, 'SESSION_LIMIT')
+    assert.equal(fake.spawned.length, 1, 'the refused open spawned nothing')
+    await sessions.dispose()
   })
   await testAsync('an old handle without resize/inspectActivity still runs, and an idled session explains itself', async () => {
     const fake = fakePty()
@@ -3695,7 +3840,7 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
   })
 
   if (GIT_BASH === '') {
-    console.log('  … skipping the terminal round trip: no Git Bash was found to pin')
+    skip('  … skipping the terminal round trip: no Git Bash was found to pin')
   } else {
     let ctx
     try {
@@ -3755,8 +3900,10 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
           assert.ok(['quiet', 'idle', 'timeout'].includes(opened.value.waitReason), String(opened.value.waitReason))
           const drained = await runTerminal(ctx, { action: 'read', sessionId: id })
           assert.equal(drained.value.kind, 'session')
-          assert.deepEqual(Object.keys(drained.value).sort(), ['kind', 'lossy', 'nextOffset', 'output', 'truncated'],
+          assert.deepEqual(Object.keys(drained.value).sort(), ['kind', 'lossy', 'nextOffset', 'output', 'remote', 'shell', 'truncated'],
             'read must return exactly the declared fields')
+          assert.equal(drained.value.shell, 'git_bash', 'a session result names the shell it belongs to')
+          assert.equal(drained.value.remote, false, 'and whether that shell runs its effects on another host')
         } finally {
           // The shell's cwd is INSIDE this directory: close the session before deleting it.
           if (id !== undefined) await runTerminal(ctx, { action: 'close', sessionId: id }).catch(() => {})
@@ -3799,6 +3946,65 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
     } finally {
       if (strict) await strict.fiber.dispose()
     }
+    // OPT-IN, like the SSH row's own live round trip: a real session needs a reachable host
+    // and a credential, so it is NEVER part of the gate. Run it with
+    //   DSH_AUDIT_SSH_HOST=ubuntu_tx node smoke/prepare.mjs audit
+    // This is the only coverage of the PERSISTENT remote form — the form that exists so a
+    // fingerprint, a password or a passphrase can be answered at all (a remote tty).
+    const liveSshHost = process.env.DSH_AUDIT_SSH_HOST
+    const liveSshPath = (await import(libUrl('bash-ssh', 'index.js'))).resolveSshPath(undefined)
+    if (liveSshHost === undefined || liveSshHost.length === 0) {
+      skip('  … skipping the live SSH terminal session: set DSH_AUDIT_SSH_HOST to run it')
+    } else if (liveSshPath === undefined) {
+      skip('  … skipping the live SSH terminal session: no ssh client was found')
+    } else {
+      const LIVE_SESSION_ROWS = CORE_ROW_ONLY + [
+        '- id: win-mb-tool-terminal',
+        "  name: 'dsh-win-multi-bash/tool-terminal'",
+        '  config:',
+        '    terminal:',
+        '      defaultShell: ssh_bash',
+        '      maxSessions: 1',
+        '      waitMs: 12000',
+        '      quietMs: 600',
+        '      idleMs: 120000',
+        '    sshBash:',
+        "      sshPath: '" + liveSshPath.replaceAll(String.fromCharCode(92), String.fromCharCode(92) + String.fromCharCode(92)) + "'",
+        "      sshHost: '" + liveSshHost + "'",
+        '      connectTimeoutMs: 15000',
+        '',
+      ].join('\n')
+      let live
+      try {
+        live = await bootFixture(LIVE_SESSION_ROWS, 'terminal-ssh-live.yml')
+        await testAsync('a real SSH session reaches ' + liveSshHost + ', keeps remote state, and is reaped on close', async () => {
+          const opened = await runTerminal(live, { action: 'open' })
+          assert.ok(!opened.isError, opened.text)
+          assert.equal(opened.value.kind, 'open')
+          assert.equal(opened.value.shell, 'ssh_bash')
+          assert.equal(opened.value.remote, true, 'a session on another host must say so, not carry a local sandbox sentence')
+          const id = opened.value.sessionId
+          const sent = async (text, waitMs) => (await runTerminal(live, { action: 'send', sessionId: id, text, waitMs })).value.output
+          assert.match(await sent('echo SSH-PTY-OK; uname -sr', 12000), /SSH-PTY-OK/, 'the remote login shell ran the command')
+          const probe = await runTerminal(live, { action: 'send', sessionId: id, text: 'uname -sr', waitMs: 12000 })
+          assert.match(probe.value.output, /Linux/, "the remote kernel is not this host's")
+          assert.equal(probe.value.remote, true, 'a later result repeats the remote fact, not just `open`')
+          assert.equal(probe.value.shell, 'ssh_bash')
+          // State across calls is the reason a session exists; the echoed command text
+          // cannot satisfy either match on its own.
+          await sent('export WMB_PTY_PROBE=42', 8000)
+          assert.match(await sent('echo "PROBE=$WMB_PTY_PROBE"', 8000), /PROBE=42/, 'an exported variable survived the next call')
+          await sent('cd /tmp', 8000)
+          assert.match(await sent('pwd', 8000), /^[^\n]*\/tmp/m, 'the remote working directory survived too')
+          const listed = await runTerminal(live, { action: 'list' })
+          assert.ok(listed.value.sessions.some((session) => session.sessionId === id && session.shell === 'ssh_bash'), 'list names the remote session')
+          const closed = await runTerminal(live, { action: 'close', sessionId: id })
+          assert.equal(closed.value.kind, 'closed')
+        })
+      } finally {
+        if (live) await live.fiber.dispose()
+      }
+    }
   }
 }
 
@@ -3824,12 +4030,12 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
   })
 
   const client = registrations[0].factory((id) => {
-    if (id === 'react') return { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }) }
+    if (id === 'react') return { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }), useState: (initial) => [initial, () => {}] }
     if (id === '@deepseek-ai/dsh-client-ui-primitives')
-      return { SettingsForm: 'SettingsForm', SettingsValueField: 'SettingsValueField', Checkbox: 'Checkbox', SegmentedControl: 'SegmentedControl', Button: 'Button' }
+      return { SettingsForm: 'SettingsForm', SettingsValueField: 'SettingsValueField', Checkbox: 'Checkbox', SegmentedControl: 'SegmentedControl', Button: 'Button', DisclosureRow: 'DisclosureRow', TextShimmer: 'TextShimmer', IconApiOutlineRegular: 'IconApiOutlineRegular', IconInspectOutlineRegular: 'IconInspectOutlineRegular', TerminalBlock: 'TerminalBlock' }
     throw new Error(`unexpected client require: "${id}"`)
   })
-  const { ROWS, rowKey, planOps, RowConfigForm, RowConfigCard, en, zh } = client.__internals
+  const { ROWS, rowKey, planOps, RowConfigForm, RowConfigCard, en, zh, SHELL_TOOL_NAMES, TERMINAL_TOOL_NAME, ToolCard, toolCardBody, toolCardIo, terminalBody, terminalLabels, cardTitle, shellCard, shellStatus, cardSummary, cardState, cardOutput, cardInput } = client.__internals
 
   test('it declares the client services the page needs', () => {
     assert.equal(client.NS, 'settings.win-mb-bash')
@@ -3858,13 +4064,32 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     }
   })
 
-  test('the form lists exactly the host\'s volatile projection, in schema order', () => {
+  test('every row\'s page lists exactly the host\'s volatile projection, in schema order', async () => {
     // The expected row list is the registry's (S1/S3): a dialect added without
     // regenerating this block fails on the byte comparison, and a row order that
     // drifted from the composition fails here.
     assert.deepEqual(ROWS.map((row) => row.rowId), REGISTRY_ROWS.map((row) => row.rowId))
-    assert.deepEqual(ROWS[0].fields.map((knob) => knob.path.join('.')), volatilePaths(gitBashTool.Config))
-    assert.deepEqual(ROWS[1].fields.map((knob) => knob.path.join('.')), volatilePaths(wslBashTool.Config))
+    // EVERY dialect, not the first two: the page is the editable projection of the row's
+    // `Config`, so a knob added on either side without the other is a control the Host
+    // would refuse or a knob the page silently cannot reach. (msys2 and ssh used to have
+    // no comparison at all, and the ssh row's schema was pinned against a literal.)
+    const { SHELL_DIALECTS, TERMINAL_ROW } = await import(libUrl('tool-bash', 'types', 'registry.js'))
+    const packageRow = await import(libUrl('index.js'))
+    const rows = [
+      ...SHELL_DIALECTS.map((dialect) => ({ rowId: dialect.rowId, entry: dialect.entry })),
+      { rowId: TERMINAL_ROW.rowId, entry: TERMINAL_ROW.entry },
+    ]
+    assert.equal(rows.length, ROWS.length, 'every carried row is checked')
+    for (const { rowId, entry } of rows) {
+      const row = ROWS.find((candidate) => candidate.rowId === rowId)
+      assert.ok(row !== undefined, `no page for ${rowId}`)
+      const schema = (await import(libUrl('tool-bash', 'types', entry + '.js'))).Config
+      assert.deepEqual(row.fields.map((knob) => knob.path.join('.')), volatilePaths(schema),
+        rowId + ': the page must list exactly the knobs the Host serves, in schema order')
+    }
+    // The core row's two switches are the same contract — they are what the bundle card edits.
+    const { CORE_ROW } = client.__internals
+    assert.deepEqual(CORE_ROW.fields.map((knob) => knob.path.join('.')), volatilePaths(packageRow.Config))
   })
 
   test('a non-volatile tool knob changes behaviour, not the editable surface (Q1-G1)', () => {
@@ -4019,6 +4244,29 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     form.dispose()
   })
 
+  await testAsync('A3: a numeric spelling that names different text is WARNED about, not rewritten', async () => {
+    // `0x10`, `1e3`, `007`: the save writes the NUMBER (16/1000/7) while the box shows what
+    // was typed, so the mismatch is reported instead of being silent. It is still only a
+    // warning: the value written is the number the text names, and the box keeps the text
+    // until the user changes it (the A3 rule: the user's input wins, nothing is rewritten).
+    const scope = fakeScope()
+    const form = new RowConfigForm(scope, gitRow)
+    const fieldOf = () => form.project().fields.find((k) => k.key === 'gitBash.probeTimeoutMs')
+    for (const [draft, value] of [['0x10', 16], ['1e3', 1000], ['007', 7]]) {
+      form.edit('gitBash.probeTimeoutMs', draft)
+      assert.equal(fieldOf().text, draft, 'the box shows what was typed: ' + draft)
+      assert.equal(fieldOf().invalid, true, draft + ' names different text, so it is flagged')
+      assert.equal(fieldOf().invalidReason, 'numberFormat', draft)
+      await form.save()
+      assert.equal(scope.calls.at(-1).ops[0].value, value, draft + ' is stored as the number it names')
+    }
+    // Exactly-what-it-names spellings are not flagged.
+    form.edit('gitBash.probeTimeoutMs', '1500.5')
+    assert.equal(fieldOf().invalidReason, undefined, 'a decimal fraction is exactly what it names')
+    form.edit('gitBash.probeTimeoutMs', '10000')
+    assert.equal(fieldOf().invalidReason, undefined)
+    form.dispose()
+  })
   await testAsync('A3: a blank text control is a CLEAR, never an error', async () => {
     const scope = fakeScope({ user: { gitBash: { bashPath: win('C:', 'old', 'bash.exe') } } })
     const form = new RowConfigForm(scope, gitRow)
@@ -4150,7 +4398,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
       assert.equal(typeof entry.options.inject().hooks.rowForm.getSnapshot, 'function')
     }
     // The bundle page also gets the core-row label and note, on their own slots.
-    const detail = slotRegistrations.filter((entry) => entry.options.name !== 'plugins.row.config')
+    const detail = slotRegistrations.filter((entry) => entry.options.name !== 'plugins.row.config' && entry.options.name !== 'tool.call.toolview')
     // The bundle seat comes first, under both candidate keys; then the badge/note. No
     // `settings.section` entry: that surface showed the same form a second time.
     assert.deepEqual(detail.map((entry) => entry.options.name), ['plugins.bundle.config', 'plugins.bundle.config', 'plugins.detail.badge', 'plugins.detail.section'])
@@ -4163,6 +4411,271 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     }
   })
 
+  test('the conversation rows cover exactly the dialect tools, keyed by wire name', () => {
+    const slotRegistrations = []
+    client.apply({
+      locale: { register: () => () => {}, bind: () => (key) => key },
+      configForms: { get: () => fakeScope(), whileServed: (names, callback) => { callback(new Set(names)); return () => {} } },
+      slots: { inject: (_name, register) => register(), register: (options, component) => { slotRegistrations.push({ options, component }); return () => {} } },
+      effect: (callback) => callback(),
+    })
+    // The card list is derived from the terminal row's own capability list, so a dialect
+    // added to the host registry cannot keep the generic `Tool call · <name>` row.
+    assert.deepEqual(SHELL_TOOL_NAMES, TOOL_INSTANCES.map((instance) => instance.toolName))
+    assert.equal(TERMINAL_TOOL_NAME, 'terminal')
+    const rows = slotRegistrations.filter((entry) => entry.options.name === 'tool.call.toolview')
+    assert.deepEqual(rows.map((entry) => entry.options.key), [...SHELL_TOOL_NAMES, TERMINAL_TOOL_NAME])
+    for (const entry of rows) {
+      assert.equal(entry.options.locale, client.NS)
+      assert.equal(entry.options.priority, undefined, 'a key nobody else registers needs no priority')
+      assert.equal(entry.component, ToolCard)
+    }
+    // Additive: every Configure page is still registered alongside the card.
+    const pages = slotRegistrations.filter((entry) => entry.options.name === 'plugins.row.config')
+    assert.deepEqual(pages.map((entry) => entry.options.key), REGISTRY_ROWS.map((row) => rowKey(row.rowId)))
+  })
+
+  test('a deployment without the card primitives gets no row at all, not a broken one', () => {
+    const slotRegistrations = []
+    const bare = registrations[0].factory((id) => {
+      if (id === 'react') return { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }), useState: (initial) => [initial, () => {}] }
+      if (id === '@deepseek-ai/dsh-client-ui-primitives')
+        return { SettingsForm: 'SettingsForm', SettingsValueField: 'SettingsValueField', Checkbox: 'Checkbox', SegmentedControl: 'SegmentedControl', Button: 'Button' }
+      throw new Error('unexpected client require: "' + id + '"')
+    })
+    assert.doesNotThrow(() => bare.apply({
+      locale: { register: () => () => {}, bind: () => (key) => key },
+      configForms: { get: () => fakeScope(), whileServed: (names, callback) => { callback(new Set(names)); return () => {} } },
+      slots: { inject: (_name, register) => register(), register: (options, component) => { slotRegistrations.push({ options, component }); return () => {} } },
+      effect: (callback) => callback(),
+    }), 'the platform\'s own generic row is the fallback, never a crash')
+    assert.deepEqual(slotRegistrations.filter((entry) => entry.options.name === 'tool.call.toolview'), [])
+    assert.equal(slotRegistrations.filter((entry) => entry.options.name === 'plugins.row.config').length, REGISTRY_ROWS.length)
+  })
+
+  test('the row summary follows the platform shell rule', () => {
+    assert.equal(cardSummary('shell', JSON.stringify({ command: 'run\nmore', description: 'first' }), 'c'), 'first')
+    assert.equal(cardSummary('shell', JSON.stringify({ command: 'run\nmore' }), 'c'), 'run', 'the command is read one line deep')
+    assert.equal(cardSummary('shell', '{"command": "broken', 'c'), '{"command": "broken', 'partial JSON is shown raw')
+    assert.equal(cardSummary('shell', JSON.stringify({ timeoutMs: 5 }), 'c'), '{"timeoutMs":5}', 'no readable argument: the raw text')
+    assert.equal(cardSummary('shell', '', 'c9'), 'c9', 'nothing yet: the call id, never a blank row')
+    assert.equal(cardSummary('terminal', JSON.stringify({ action: 'open', sessionId: 's1' }), 'c'), 'open')
+  })
+
+  test('the row state and body follow the platform stage contract', () => {
+    assert.equal(cardState('preparing', undefined), 'preparing')
+    assert.equal(cardState('start', { phase: 'start', argsRaw: '{}' }), 'running')
+    assert.equal(cardState('result', { kind: 'result', content: [], isError: false }), 'ok')
+    assert.equal(cardState('result', { kind: 'result', content: [], isError: true }), 'error')
+    assert.equal(cardState('result', { kind: 'result', content: [], error: { code: 'interrupted' } }), 'stopped')
+    assert.equal(cardOutput({ kind: 'result', content: [{ type: 'image' }] }), JSON.stringify({ type: 'image' }, null, 2), 'a non-text block is shown as JSON')
+    assert.equal(cardOutput({ kind: 'result', content: [], error: { name: 'E', code: 'C' } }), 'E: C')
+    assert.equal(cardInput('{"a":1}'), '{\n  "a": 1\n}')
+    assert.equal(cardInput('not json'), 'not json')
+  })
+
+  test('every tool this bundle renders a row for has its own title, in both languages', () => {
+    for (const name of [...SHELL_TOOL_NAMES, TERMINAL_TOOL_NAME]) {
+      for (const [language, dict] of [['en', en], ['zh', zh]]) {
+        const title = dict[`tool.title.${name}`]
+        assert.equal(typeof title, 'string', `${language} has no tool.title.${name}`)
+        assert.ok(title.length > 0, `${language} tool.title.${name} is empty`)
+      }
+      // The shells read the SAME in every language: a reader tells git_bash from wsl_bash
+      // from msys2_bash from ssh_bash at a glance, whatever the UI language is.
+      if (SHELL_TOOL_NAMES.includes(name)) assert.equal(en[`tool.title.${name}`], zh[`tool.title.${name}`])
+    }
+    assert.equal(cardTitle({ toolName: 'git_bash' }, (key) => en[key] ?? key), 'Git Bash')
+    assert.equal(cardTitle({ toolName: 'ssh_bash' }, (key) => zh[key] ?? key), 'SSH remote shell')
+    assert.equal(cardTitle({ toolName: 'not_ours' }, (key) => key), 'tool.title.other', 'an unlisted name falls back instead of showing a raw locale key')
+  })
+
+  test('the shell result markers are parsed the way the platform parses its own', () => {
+    assert.deepEqual(shellStatus('out\n[exit code: 3]'), { output: 'out', exitCode: 3 })
+    assert.deepEqual(shellStatus('out\n[killed by signal: SIGINT]'), { output: 'out', signal: 'SIGINT' })
+    assert.deepEqual(shellStatus('out'), { output: 'out', exitCode: 0 }, 'this renderer writes the exit marker only when the code is non-zero')
+  })
+
+  test('the terminal card is used exactly where a settled shell command is', () => {
+    const argsRaw = JSON.stringify({ command: 'ls', description: 'list' })
+    const settled = (text, over = {}) => ({ kind: 'result', call: { argsRaw }, content: [{ type: 'text', text }], isError: false, ...over })
+    const card = (block, raw = argsRaw, output = 'out') => shellCard({ toolName: 'git_bash', block }, raw, output)
+    assert.deepEqual(card(settled('out')), { command: 'ls', cwd: undefined, output: 'out', exitCode: 0, signal: undefined, running: false })
+    assert.equal(card(settled('o\n[exit code: 2]'), argsRaw, 'o\n[exit code: 2]').exitCode, 2)
+    assert.deepEqual(card({ phase: 'start', argsRaw }, argsRaw, null), { command: 'ls', cwd: undefined, output: undefined, exitCode: undefined, signal: undefined, running: true }, 'a running call already shows the command line')
+    for (const [what, block, raw, output] of [
+      ['a background call', settled('out'), JSON.stringify({ command: 'ls', run_in_background: true }), 'out'],
+      ['a failed call', settled('boom', { isError: true }), argsRaw, 'boom'],
+      ['a spill preview', settled('o\n[output truncated; full output: p]'), argsRaw, 'o\n[output truncated; full output: p]'],
+      ['a promotion still running in the background', settled('o\n[still running after 5ms; moved to background job j1]'), argsRaw, 'o\n[still running after 5ms; moved to background job j1]'],
+      ['a job read that dropped output', settled('o\n[some output was dropped from memory; full output: p]'), argsRaw, 'o\n[some output was dropped from memory; full output: p]'],
+      ['a call with no command', settled('out'), JSON.stringify({ description: 'd' }), 'out'],
+    ]) assert.equal(card(block, raw, output), null, `${what} must stay on the generic body`)
+    assert.equal(shellCard({ toolName: TERMINAL_TOOL_NAME, block: settled('out') }, argsRaw, 'out'), null, 'the terminal tool names an action, not a command line')
+  })
+
+  test('the terminal labels fill the tokens the primitive hands back', () => {
+    const labels = terminalLabels((key) => zh[key] ?? key)
+    assert.equal(labels.exitCode(3), '退出码 3')
+    assert.equal(labels.signal('SIGINT'), '信号 SIGINT')
+    assert.equal(labels.expandAria(7), '展开其余 7 行输出')
+    assert.equal(labels.expand(7), '… 其余 7 行', "the folded control reads copy.expand(hidden)")
+    assert.equal(labels.copy, '复制')
+    // The WHOLE surface the platform's own `terminalBlockLabels` carries
+    // (dsh-client-ui-tool), not a hand-picked subset: a missing member is a render
+    // that throws the moment the card caps its lines.
+    const PLATFORM_LABELS = ['signal', 'exitCode', 'noExitCode', 'running', 'failed', 'done', 'copy', 'copied', 'noOutput', 'collapseAria', 'collapse', 'expandAria', 'expand']
+    assert.deepEqual(Object.keys(labels).sort(), [...PLATFORM_LABELS].sort())
+    for (const key of PLATFORM_LABELS) assert.ok(labels[key] !== undefined, `TerminalBlock needs ${key}`)
+  })
+
+  test('the card renders the platform shell look, its own title, and the terminal body', () => {
+    const argsRaw = JSON.stringify({ command: 'ls', description: 'list' })
+    const block = { kind: 'result', call: { argsRaw }, content: [{ type: 'text', text: 'out' }], isError: false }
+    // A locale seat resolves a missing key to the key itself (and to the `common`
+    // namespace before that), which is exactly what `cardTitle`'s fallback detects.
+    const t = (key) => en[key] ?? key
+    const tree = ToolCard({ toolName: 'git_bash', callId: 'c1', phase: 'result', cwd: 'C:/ws', t, block })
+    const row = tree.children.find((child) => child && child.type === 'DisclosureRow')
+    assert.ok(row, 'the row IS the platform primitive, so the chrome is the platform\'s')
+    assert.equal(row.props.icon.type, 'IconApiOutlineRegular', 'the icon the platform uses for bash/pwsh')
+    assert.equal(row.props.title, 'Git Bash', 'the title is the tool\'s own name, in every language')
+    assert.equal(row.props.expandable, true)
+    assert.equal(row.props.open, false)
+    assert.equal(row.props.collapsedContent[1].type, 'TextShimmer')
+    assert.equal(row.props.collapsedContent[1].children[0].children[0], 'list')
+    // The expanded body: the platform's terminal card, then the seat's inspect button.
+    const body = toolCardBody({ t, inspect: () => {} }, terminalBody(shellCard({ toolName: 'git_bash', block }, argsRaw, 'out'), t))
+    assert.deepEqual(body.children.map((child) => child.type), ['TerminalBlock', 'button'])
+    assert.equal(body.children[0].props.command, 'ls')
+    assert.equal(body.children[0].props.output, 'out')
+    assert.equal(body.children[0].props.exitCode, 0)
+    assert.equal(body.children[0].props.maxLines, Infinity, 'the platform expands its terminal card in full')
+    assert.equal(body.children[0].props.labels.exitCode(2), 'exit code 2', 'the labels are localized AND filled')
+    // The generic body keeps its INPUT/OUTPUT card and its error tone.
+    const io = toolCardIo({ t: (key) => key }, 'error', 'IN', 'OUT')
+    assert.deepEqual(io.children.map((child) => child.type), ['div', 'span', 'div'], 'input, divider, output')
+    assert.equal(io.children[2].children[1].props['data-error'], '', 'a failed call paints its output in the error tone')
+    assert.deepEqual(toolCardBody({ t: (key) => key, inspect: () => {} }, io).children.map((child) => child.type), ['div', 'button'])
+    const preparing = ToolCard({ toolName: 'git_bash', callId: 'c1', phase: 'preparing', t: (key) => key, block: { phase: 'preparing' } })
+    const preparingRow = preparing.children.find((child) => child && child.type === 'DisclosureRow')
+    assert.equal(preparingRow.props.expandable, false, 'no arguments exist yet, so there is nothing to expand')
+    assert.equal(preparingRow.props.running, true)
+  })
+
+  test('each card primitive on its own is load-bearing: omit one and no row is registered', () => {
+    // The README says "a deployment missing any of them registers no row at all", so the
+    // gate is pinned per member, not once with all four absent: a check weakened to one
+    // name would otherwise pass and then render h(undefined, …) at run time.
+    const CARD = ['DisclosureRow', 'TextShimmer', 'IconApiOutlineRegular', 'IconInspectOutlineRegular']
+    for (const missing of CARD) {
+      const slotRegistrations = []
+      const partial = registrations[0].factory((id) => {
+        if (id === 'react') return { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }), useState: (initial) => [initial, () => {}] }
+        if (id === '@deepseek-ai/dsh-client-ui-primitives')
+          return Object.fromEntries([...CARD, 'SettingsForm', 'SettingsValueField', 'Checkbox', 'SegmentedControl', 'Button']
+            .filter((name) => name !== missing)
+            .map((name) => [name, name]))
+        throw new Error('unexpected client require: ' + id)
+      })
+      partial.apply({
+        locale: { register: () => () => {}, bind: () => (key) => key },
+        configForms: { get: () => fakeScope(), whileServed: (names, callback) => { callback(new Set(names)); return () => {} } },
+        slots: { inject: (_name, register) => register(), register: (options, component) => { slotRegistrations.push({ options, component }); return () => {} } },
+        effect: (callback) => callback(),
+      })
+      assert.deepEqual(slotRegistrations.filter((entry) => entry.options.name === 'tool.call.toolview'), [],
+        `without ${missing} not one conversation row may be registered`)
+      // The Configure pages do not depend on these primitives, so they stay.
+      assert.equal(slotRegistrations.filter((entry) => entry.options.name === 'plugins.row.config').length, REGISTRY_ROWS.length)
+    }
+    // A NULL member is as unusable as a missing one: the gate and the card body shared one
+    // test for it, so a deployment exposing `null` cannot register a row that renders
+    // `h(null, …)`. (The undefined-only filter this replaces passed that case.)
+    for (const nulled of CARD) {
+      const slotRegistrations = []
+      const partial = registrations[0].factory((id) => {
+        if (id === 'react') return { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }), useState: (initial) => [initial, () => {}] }
+        if (id === '@deepseek-ai/dsh-client-ui-primitives')
+          return Object.fromEntries([...CARD, 'SettingsForm', 'SettingsValueField', 'Checkbox', 'SegmentedControl', 'Button']
+            .map((name) => [name, name === nulled ? null : name]))
+        throw new Error('unexpected client require: ' + id)
+      })
+      partial.apply({
+        locale: { register: () => () => {}, bind: () => (key) => key },
+        configForms: { get: () => fakeScope(), whileServed: (names, callback) => { callback(new Set(names)); return () => {} } },
+        slots: { inject: (_name, register) => register(), register: (options, component) => { slotRegistrations.push({ options, component }); return () => {} } },
+        effect: (callback) => callback(),
+      })
+      assert.deepEqual(slotRegistrations.filter((entry) => entry.options.name === 'tool.call.toolview'), [],
+        `with ${nulled} present but null not one conversation row may be registered`)
+    }
+  })
+
+  test('a deployment with the card primitives but no TerminalBlock keeps the generic body', () => {
+    const slotRegistrations = []
+    const partial = registrations[0].factory((id) => {
+      if (id === 'react') return { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }), useState: (initial) => [initial, () => {}] }
+      if (id === '@deepseek-ai/dsh-client-ui-primitives')
+        return { DisclosureRow: 'DisclosureRow', TextShimmer: 'TextShimmer', IconApiOutlineRegular: 'IconApiOutlineRegular', IconInspectOutlineRegular: 'IconInspectOutlineRegular' }
+      throw new Error('unexpected client require: ' + id)
+    })
+    partial.apply({
+      locale: { register: () => () => {}, bind: () => (key) => key },
+      configForms: { get: () => fakeScope(), whileServed: (names, callback) => { callback(new Set(names)); return () => {} } },
+      slots: { inject: (_name, register) => register(), register: (options, component) => { slotRegistrations.push({ options, component }); return () => {} } },
+      effect: (callback) => callback(),
+    })
+    assert.equal(slotRegistrations.filter((entry) => entry.options.name === 'tool.call.toolview').length, SHELL_TOOL_NAMES.length + 1, 'the rows are still registered')
+    const argsRaw = JSON.stringify({ command: 'ls' })
+    const block = { kind: 'result', call: { argsRaw }, content: [{ type: 'text', text: 'out' }], isError: false }
+    assert.equal(partial.__internals.shellCard({ toolName: 'git_bash', block }, argsRaw, 'out'), null, 'without the primitive the body falls back to the ioCard')
+  })
+
+  test('with the Host serving nothing, no Configure page is registered (the gate itself is pinned)', () => {
+    // The claim is the GATE, not the card: the page exists while the Host serves that row's
+    // namespace. Every other stub in this block calls back immediately, so deleting the
+    // `whileServed` wrapper used to keep them all green.
+    const slotRegistrations = []
+    client.apply({
+      locale: { register: () => () => {}, bind: () => (key) => key },
+      configForms: { get: () => fakeScope(), whileServed: () => () => {} },
+      slots: { inject: (_name, register) => register(), register: (options, component) => { slotRegistrations.push({ options, component }); return () => {} } },
+      effect: (callback) => callback(),
+    })
+    assert.deepEqual(slotRegistrations.filter((entry) => entry.options.name === 'plugins.row.config'), [],
+      'a row the Host does not serve shows no Configure control')
+    // Registered independently of any row namespace, and therefore still here.
+    const names = slotRegistrations.map((entry) => entry.options.name)
+    assert.ok(names.includes('plugins.bundle.config'), 'the switch card is not gated on a row namespace')
+    assert.equal(names.filter((name) => name === 'tool.call.toolview').length, SHELL_TOOL_NAMES.length + 1)
+  })
+
+  test('one unserviceable row cannot take the rest of the page with it', () => {
+    // `apply` isolates each contribution now: before that, a throw inside the row loop
+    // skipped every contribution registered after it (the bundle card, the labels) while
+    // the comment promised the rest kept working.
+    const slotRegistrations = []
+    const warnings = []
+    const broken = REGISTRY_ROWS[0].rowId
+    client.apply({
+      logger: { warn: (message) => warnings.push(String(message)) },
+      locale: { register: () => () => {}, bind: () => (key) => key },
+      configForms: {
+        get: (rowId) => { if (rowId === broken) throw new Error('no config editor for ' + rowId); return fakeScope() },
+        whileServed: (names, callback) => { callback(new Set(names)); return () => {} },
+      },
+      slots: { inject: (_name, register) => register(), register: (options, component) => { slotRegistrations.push({ options, component }); return () => {} } },
+      effect: (callback) => callback(),
+    })
+    const pages = slotRegistrations.filter((entry) => entry.options.name === 'plugins.row.config')
+    assert.deepEqual(pages.map((entry) => entry.options.key), REGISTRY_ROWS.slice(1).map((row) => rowKey(row.rowId)),
+      'every OTHER row keeps its page')
+    assert.ok(warnings.some((message) => message.includes(broken) && message.includes('failed')), JSON.stringify(warnings))
+    const names = slotRegistrations.map((entry) => entry.options.name)
+    assert.ok(names.includes('plugins.bundle.config'), 'the contributions after the loop still registered')
+    assert.equal(names.filter((name) => name === 'tool.call.toolview').length, SHELL_TOOL_NAMES.length + 1)
+  })
   test('the detail label and note speak only for this bundle and its core row', () => {
     const slotRegistrations = []
     client.apply({
@@ -4544,7 +5057,7 @@ console.log('\n[A] unit: a subset without the prompt row keeps the guidance (com
 console.log('\n[B] boot integration: default fixture (pinned via probed bash)')
 {
   if (!HAS_GIT_BASH) {
-    console.log('  … skipping pinned fixture: no Git Bash probed on this host')
+    skip('  … skipping pinned fixture: no Git Bash probed on this host')
   } else {
     let ctx
     try {
@@ -4563,6 +5076,18 @@ console.log('\n[B] boot integration: default fixture (pinned via probed bash)')
           assert.deepEqual(Object.keys(schema.parameters.properties).slice(0, 2), ['description', 'command'], name)
           assert.deepEqual(schema.parameters.required.slice(0, 2), ['description', 'command'], name)
         }
+      }],
+      ['boot: the promoted and background values carry no `sandbox` field, like the base tools', async () => {
+        // The base bundle's own `pwsh`/`bash` tools shape these two branches as
+        // `{kind, jobId, timeoutMs, output}` and `{kind, jobId}` — no `sandbox` field —
+        // and a promotion states the fact it can state inside its TEXT. This plugin
+        // FOLLOWS that shape on purpose: adding a field here would also mean adding it
+        // to `output.schema`, since a value key the schema does not declare makes the
+        // runtime drop the whole value.
+        const branches = ctx.tools.get('git_bash').output.schema.oneOf
+        const keys = (kind) => Object.keys(branches.find((branch) => branch.properties?.kind?.const === kind).properties).sort()
+        assert.deepEqual(keys('promoted'), ['cwd', 'jobId', 'kind', 'output', 'timeoutMs'])
+        assert.deepEqual(keys('background'), ['cwd', 'jobId', 'kind'], 'the base handle plus the cwd this plugin reports')
       }],
       ['boot: the assembled prompt carries the ordering sentence exactly once', async () => {
         const { prompt } = await assembledPrompt(ctx)
@@ -4749,7 +5274,7 @@ console.log('\n[B] boot integration: default fixture (pinned via probed bash)')
 console.log('\n[B] boot integration: promote-on-timeout (shipped default, SERIAL ctx)')
 {
   if (!HAS_GIT_BASH) {
-    console.log('  … skipping promote fixture: no Git Bash probed on this host')
+    skip('  … skipping promote fixture: no Git Bash probed on this host')
   } else {
     let ctx
     try {
@@ -4808,7 +5333,7 @@ console.log('\n[B] boot integration: promote-on-timeout (shipped default, SERIAL
 console.log('\n[B] boot integration: a promoted call whose read lost output reports it (S1)')
 {
   if (!HAS_GIT_BASH) {
-    console.log('  … skipping lossy-promote fixture: no Git Bash probed on this host')
+    skip('  … skipping lossy-promote fixture: no Git Bash probed on this host')
   } else {
     let ctx
     try {
@@ -4883,7 +5408,7 @@ console.log('\n[B] boot integration: an auto-degraded sandbox reports `unconfine
     .filter((block) => block.type === 'text').map((block) => block.text).join('').replace(/\r\n/g, '\n')
 
   if (!HAS_WSL) {
-    console.log('  … skipping unconfined fixture: no wsl.exe on this host')
+    skip('  … skipping unconfined fixture: no wsl.exe on this host')
   } else {
     let ctx
     try {
@@ -4929,7 +5454,7 @@ console.log('\n[B] boot integration: an auto-degraded sandbox reports `unconfine
     }
 
     if (!WSL_BWRAP_OK) {
-      console.log('  … skipping wrapped-shape case: this host\'s WSL has no usable bwrap')
+      skip('  … skipping wrapped-shape case: this host\'s WSL has no usable bwrap')
     } else {
       let wrapped
       try {
@@ -4981,7 +5506,7 @@ console.log('\n[B] boot integration: an auto-degraded BACKGROUND job says so in 
   })).value
 
   if (!HAS_WSL) {
-    console.log('  … skipping background-unconfined fixture: no wsl.exe on this host')
+    skip('  … skipping background-unconfined fixture: no wsl.exe on this host')
   } else {
     // Each fixture below is used by ONE test that sequences its own calls: the
     // row-scoped first-time latch makes call ORDER observable, and `runTests`
@@ -5112,7 +5637,7 @@ console.log('\n[B] boot integration: an auto-degraded BACKGROUND job says so in 
     }
 
     if (!HAS_GIT_BASH) {
-      console.log('  … skipping the wrapped/danger-full-access regression: no Git Bash probed on this host')
+      skip('  … skipping the wrapped/danger-full-access regression: no Git Bash probed on this host')
     } else {
       let wrapped
       try {
@@ -5144,7 +5669,7 @@ console.log('\n[B] boot integration: dialect discovery learns this host\'s refus
   const leftovers = () => readdirSync(labParent).filter((name) => name.startsWith('.dsh-denial-probe-'))
 
   if (!HAS_WSL) {
-    console.log('  … skipping discovery fixture: no wsl.exe on this host')
+    skip('  … skipping discovery fixture: no wsl.exe on this host')
   } else {
     let ctx
     try {
@@ -5197,7 +5722,7 @@ console.log('\n[B] boot integration: a background job records the tool call that
   })()
 
   if (!HAS_GIT_BASH) {
-    console.log('  … skipping M1 fixture: no Git Bash probed on this host')
+    skip('  … skipping M1 fixture: no Git Bash probed on this host')
   } else {
     const callOf = (ctx, name, args, callId) => ctx.tools.execute({
       signal: new AbortController().signal,
@@ -5317,7 +5842,7 @@ console.log('\n[B] boot integration: a background job records the tool call that
 console.log('\n[B] boot integration: no job registry — config decides the schema, the call fails loud')
 {
   if (!HAS_GIT_BASH) {
-    console.log('  … skipping no-registry fixture: no Git Bash probed on this host')
+    skip('  … skipping no-registry fixture: no Git Bash probed on this host')
   } else {
     let ctx
     try {
@@ -5594,7 +6119,7 @@ console.log('\n[B] boot integration: dsh-settings projection of the two rows (re
   name: '@deepseek-ai/dsh-settings'
 `, 'settings-rows.yml')
     if (ctx.settings === undefined) {
-      console.log('  … skipping: this composition provides no configEditor/profileContext, so dsh-settings never activates')
+      skip('  … skipping: this composition provides no configEditor/profileContext, so dsh-settings never activates')
       console.log('    (the schema contract it projects is pinned by the unit section above)')
     } else {
       const forms = new Map(ctx.settings.describe({ redactSecrets: true }).map((form) => [form.ns, form]))
@@ -5638,7 +6163,7 @@ console.log('\n[B] boot integration: a subset without the prompt row keeps the g
   // The tool's own description then carries the shared facts, the prompt still
   // states them exactly once, and the tool row warns at load.
   if (!HAS_GIT_BASH) {
-    console.log('  … skipping: no Git Bash probed on this host')
+    skip('  … skipping: no Git Bash probed on this host')
   } else {
     let ctx
     try {
@@ -5832,10 +6357,44 @@ console.log('\n[A] unit: repository records (bilingual pair, LF discipline, publ
     assert.ok(existsSync(join(PLUGIN, 'lib/client.js')), 'the browser half must exist for that glob to cover it')
     for (const excluded of ['smoke', '.temp', 'RELEASE_NOTES.md'])
       assert.ok(!manifest.files.some((entry) => entry.startsWith(excluded)), `the tarball must not ship ${excluded}`)
+
+    // A release condition that used to be uncaught: the notes must DOCUMENT the version this
+    // tree declares, or a publish ships an artifact nobody wrote down (the version cannot be
+    // published twice, so this is the last moment the mismatch is cheap).
+    const notes = readFileSync(join(PLUGIN, 'RELEASE_NOTES.md'), 'utf8')
+    assert.equal(notes.split('\n')[0], `# ${manifest.name} v${manifest.version}`,
+      'RELEASE_NOTES.md must open with the version package.json declares')
+    const section = notes.slice(0, notes.indexOf('\n# ', 1))
+    for (const heading of ['## New', '## Improvements', '## Bug fixes'])
+      assert.ok(section.includes(heading), `the newest section must carry ${heading}`)
+    // ...and the globs are checked against the files they must actually cover: the
+    // assertions above only compare their STRINGS, so a file the tarball would drop
+    // (the way `lib/bash-ssh/index.js` was missing from a stale pack) stayed invisible.
+    const covered = (rel) => manifest.files.some((entry) => {
+      if (entry === rel) return true
+      // Only the shape this manifest uses: `lib/**/*.js` (root + suffix). A new glob
+      // shape shows up here as a loud failure naming the export it would drop.
+      const at = entry.indexOf('/**/*')
+      if (at < 0) return false
+      const root = entry.slice(0, at + 1)
+      return rel.startsWith(root) && rel.endsWith(entry.slice(at + 5))
+    })
+    for (const [subpath, target] of Object.entries(manifest.exports)) {
+      if (!target.startsWith('./')) continue
+      const rel = target.slice(2)
+      // npm includes package.json whatever `files` says; everything else must be named.
+      if (rel === 'package.json') continue
+      assert.ok(existsSync(join(PLUGIN, rel)), `${subpath} exports ${rel}, which does not exist`)
+      assert.ok(covered(rel), `${subpath} exports ${rel}, which the published file list would drop`)
+    }
   })
 }
 
-console.log(`\n==== audit summary: ${passed} passed, ${failed} failed ====`)
+if (TIMING) {
+  const total = Date.now() - STARTED_AT
+  console.log(`[timing] boots ${timing.boots} = ${(timing.bootMs / 1000).toFixed(1)} s, tool calls ${timing.calls} = ${(timing.callMs / 1000).toFixed(1)} s, suite total ${(total / 1000).toFixed(1)} s`)
+}
+console.log(`\n==== audit summary: ${passed} passed, ${failed} failed, ${skipped} skipped ====`)
 if (failed > 0) {
   console.log('\nFailures:')
   for (const { name, error } of failures) console.log(`  - ${name}: ${error?.message ?? error}`)
