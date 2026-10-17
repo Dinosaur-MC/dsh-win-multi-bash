@@ -20,7 +20,7 @@
 | `git_bash` | git-bash | MSYS | 自带 `GitBashExecutor`；Git for Windows 工具链 |
 | `wsl_bash` | wsl-bash | Linux | 自带 `WslBashExecutor`；WSL 发行版内 Linux userland |
 | `msys2_bash` | msys2-bash | MSYS2 | **按需开启**：自带 `Msys2BashExecutor`；MSYS2 自己的 bash（`$MSYSTEM`、`pacman`）——与 Git Bash 并列的第二套工具链 |
-| `ssh_bash` | ssh-bash | 远端（SSH） | **按需开启**：自带 `SshBashExecutor`；每次调用经 OpenSSH 客户端执行一条命令。它的效果发生在另一台主机上，因此本地文件沙箱不适用：每条结果都带 `sandbox: { mode, remote: true }` |
+| `ssh_bash` | ssh-bash | 远端（SSH） | **按需开启**：自带 `SshBashExecutor`；每次调用经 OpenSSH 客户端执行一条命令。它的效果发生在另一台主机上，因此本地文件沙箱不适用：**前台**结果带 `sandbox: { mode, remote: true }`；超时后被提升为后台的调用在它返回的文本里说明同一件事；后台受理回执不带任何 `sandbox` 字段——这正是基座自带 `pwsh`/`bash` 工具对这两个分支的形态，所以本行跟随它，而不是自创一套 schema |
 | `terminal` | git-bash / wsl-bash / msys2-bash / ssh-bash | MSYS / Linux / MSYS2 / SSH | 交互式 PTY 会话；后端由 `shell` 指定的方言决定 |
 | `pwsh`（dsh 自带） | pwsh | — | 由基座的 `pwsh-sandbox` 行提供，本插件完全不介入 |
 
@@ -31,6 +31,8 @@
 - 沙箱 `auto`：Git Bash 探测 windows-acl runner，WSL 探测发行版内 `bwrap`；探测失败如实降级为无限制运行并如实报告。显式 `sandbox: bwrap` 而发行版缺少 bubblewrap 时，在首次执行 `wsl_bash` 命令时响亮报错（不会拖垮启动），其余后端不受影响。
 - 所有行在 host 平面注册：无论会话使用哪个 agent preset，都能看到这些工具。
 - `ssh_bash` 是家族里唯一的**远端**方言。它驱动 OpenSSH 客户端（`ssh <host> <command>`），命令在另一台主机上执行，因此它是本地文件沙箱唯一无法代为表态的方言（见「沙箱行为」）。目标属于**部署配置**——`sshHost` / `sshUser` / `sshPort`，绝不是工具参数——所以模型永远无法把工具指向部署没有钉定的主机；客户端按 Windows OpenSSH 位置（`%SystemRoot%\System32\OpenSSH\ssh.exe`）优先、其次 PATH（Git for Windows 自带的客户端就在 PATH 上）解析。
+
+- **主机密钥策略属于本行，不属于 `ssh_config`。** 默认关闭 `acceptNewHostKeys` 时，一次性形态发送 `-o StrictHostKeyChecking=yes`：未知主机会失败，**密钥变更**时也会失败——哪怕用户或系统 `ssh_config` 里的某行本来允许；而 `terminal` 会话刻意保留继承来的 `ask`，因为「首次连接可以提问」正是那个形态存在的理由。打开该开关则两种形态都发 `accept-new`：某主机首次出现的密钥会被记住，变更的密钥仍然失败。`connectTimeoutMs` 有 **1000 ms 下限**——ssh 的 `ConnectTimeout` 以整秒计，更小的钉定会被具名拒绝，而不是被抬成更长的上限。
 
 ## 沙箱行为（重要，请先阅读 ⚠️）
 
@@ -43,7 +45,7 @@
 | `git_bash` | windows-acl runner 包 MSYS bash | partial（探针通过时） | 探针失败则无沙箱运行，结果不携带沙箱事实 |
 | `ssh_bash` | 不适用——命令在另一台主机上执行 | n/a | 无探针也无包裹：这里没有任何东西能管住远端的文件效果 |
 
-> ⚠️ **`ssh_bash` 不在 DSH 文件沙箱之内，而且会如实说明，而不是含糊其辞。** 文件沙箱约束的是**本机所跑命令的本地效果**；SSH 命令的效果在另一台主机上。因此该行**完全不包裹**——包裹 `ssh.exe` 只能限制客户端可读哪些本地密钥与 `known_hosts`（那是另一根轴），而且实际上会弄坏客户端：它必须读工作区根之外的 `~/.ssh/*`——每条结果都带 `sandbox: { mode, remote: true }`。`denied`、`enforcement`、`runnerFailed`、`unconfined` 在这类结果上**全部缺席**：前三个会是在描述一个从未运行过的沙箱，而 `unconfined` 的含义是「要过沙箱但没能施加」，这里并没有发生这种事。模型只会读到一句话：`[sandbox: not applicable — this command runs on a remote host, so the local file sandbox (<mode> mode) was not applied and no verdict is claimed for its effects]`。由此，该行的 `requireSandbox: true` 会**拒绝每一条命令**（文档给出的出路是针对单次调用显式升级 `danger-full-access`）；并且当组合里没有任何本地可沙箱的家族工具时，家族提示词小节会撤掉它那句文件沙箱承诺。
+> ⚠️ **`ssh_bash` 不在 DSH 文件沙箱之内，而且会如实说明，而不是含糊其辞。** 文件沙箱约束的是**本机所跑命令的本地效果**；SSH 命令的效果在另一台主机上。因此该行**完全不包裹**——包裹 `ssh.exe` 只能限制客户端可读哪些本地密钥与 `known_hosts`（那是另一根轴），而且实际上会弄坏客户端：它必须读工作区根之外的 `~/.ssh/*`——**前台**结果带 `sandbox: { mode, remote: true }`；超时后被提升为后台的调用在它返回的文本里说明同一件事；后台受理回执不带任何 `sandbox` 字段——这正是基座自带 `pwsh`/`bash` 工具对这两个分支的形态，所以本行跟随它，而不是自创一套 schema。`denied`、`enforcement`、`runnerFailed`、`unconfined` 在这类结果上**全部缺席**：前三个会是在描述一个从未运行过的沙箱，而 `unconfined` 的含义是「要过沙箱但没能施加」，这里并没有发生这种事。模型只会读到一句话：`[sandbox: not applicable — this command runs on a remote host, so the local file sandbox (<mode> mode) was not applied and no verdict is claimed for its effects]`。由此，该行的 `requireSandbox: true` 会**拒绝每一条命令**（文档给出的出路是针对单次调用显式升级 `danger-full-access`）；并且当组合里没有任何本地可沙箱的家族工具时，家族提示词小节会撤掉它那句文件沙箱承诺。
 >
 > ⚠️ **停掉一次 SSH 调用停掉的是客户端，不是远端命令（本机 2026-10-17 实测）。** `ssh -T host 'sleep N'` 在本机客户端被 `kill -9` 之后**依然活着**：没有远端 tty 时 sshd 只会关闭通道、从不给该命令发信号（连「忽略 SIGHUP」都不需要）。真正会回收远端进程组的是 PTY 形态——`terminal` 加 `shell: ssh_bash`——在会话结束时。因此长期远端任务请在远端自己设上限（`timeout`、`systemd-run`），或用会话去打断它。
 >
@@ -143,6 +145,16 @@ wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"   # 验
 - **SSH 会话是能回答首次连接提问的地方，也是唯一会回收远端的形态。** 用 `shell: ssh_bash` 调 `open`，跑的是 `ssh.exe -t … -- <主机>`、不带 `BatchMode`：真正的 PTY 正是让 ssh 敢于询问未知主机指纹、密码或密钥短语的条件——用 `send` 回答即可。同一个 PTY 也是会话结束时 sshd 回收远端进程组的原因，而单次 `ssh -T` 命令会在客户端被杀之后继续活着（实测，见「沙箱行为」）。两条如实限制：凡经 `send` 键入的内容都会进入工具调用记录，因此请用密钥认证而不是直接敲密码；会话的 `cwd` 是 `ssh.exe` 在本机运行的目录，绝不是远端目录。
 - **默认值是测出来的，不是猜的。** `quietMs` 500 ms 相对实测最坏块间间隔（216 ms，`ls -la /usr/bin | head -80` 跑 18 次）留了约 2.3 倍余量；1 MiB 正是单条 `seq 1 200000` 越过的边界（原生 1,489,391 B；经本插件的转义剥离后剩 1,289,146 B = 1.229 MiB，而环形缓冲计的就是后者），这也让 `truncated` 可被观察到；`waitMs` 10 秒用 40×200 ms 的 ticker 验证过（返回部分输出且会话存活）；启动预算覆盖实测约 460 ms 到首提示符。以上每一项都能在插件面板的行上即时改。
 
+## 会话行（一次调用在对话里长什么样）
+
+本插件的调用渲染成平台自己的 shell 卡片，而不是通用的 `Tool call · <名字>` 行：平台给 `bash`/`pwsh` 画的那个图标、**以工具自己的名字作标题**（`Git Bash`、`WSL Bash`、`MSYS2 Bash`、`SSH remote shell`——两种语言用同一个字符串，四个 shell 一眼可辨；会话工具则是 `Terminal` /「终端」）、以命令（或它的 `description`）作折叠摘要，以及平台自己的终端卡作展开体。
+
+- **机制**：平台把每一次原子调用按**线名**派发到 keyed 槽 `tool.call.toolview`，注册了同名的行就**替换**通用行。这是官方文档写明的扩展点——平台自己的首方行就住在那里（`@deepseek-ai/dsh-client-ui-tool`：「由拥有该工具的业务包注册其线名」）。
+- **覆盖哪些名字**：本插件注册的每个工具各一行——终端行 `defaultShell` 列表里的方言（当前 `git_bash`、`wsl_bash`、`msys2_bash`、`ssh_bash`）加上 `terminal`。审计把这份列表钉在宿主注册表的工具实例上，所以那边新增方言不可能悄悄留着通用行。
+- **全有或全无**：这张行由四个客户端 primitive 拼成（`DisclosureRow`、`TextShimmer`、`IconApiOutlineRegular`、`IconInspectOutlineRegular`）。缺任何一个，本部署就**不注册**任何行、保留平台的通用卡片：朴素，但绝不会是坏掉的卡片。`TerminalBlock` 是可选项而非必需：缺了它行照旧注册，只是每个展开体回落到平台的 输入/输出 卡片。
+- **展开体是平台自己的终端卡**：一次前台 `*_bash` 一次性调用，只要结果落在单个文本块、不是错误、且不含本插件的**未结算**提示（仍在后台跑的提升、溢出预览、丢弃过输出的任务读取），就用平台的 `TerminalBlock` 渲染——与 `bash`/`pwsh` 完全一样：命令行、输出、退出码或信号。状态解析用的是本插件宿主渲染器写下的同一批尾部标记 `[exit code: N]` / `[killed by signal: X]`；没有标记即成功，因为该渲染器只在非零时才写退出码标记。其余调用一律保留通用 输入/输出 卡片——包括单工具的 `terminal`：它的调用给出的是 action 而不是命令行，与平台自己的 `terminal_open`/`terminal_read` 行一样。
+- **仍属平台的一件事**：轮次顶部那一行活动摘要由 `dsh-client-ui-chat` 按**硬编码名单**决定——`bash`、`pwsh`、`exec_command`、`write_stdin`，以及任何以 `terminal_` 开头的名字——没有可扩展的槽，所以第三方线名在那里一律算作「调用工具」，与它自己的行长什么样无关。
+
 ## 运行时配置（插件管理面板）
 
 两个工具行各自携带配置，且每个可配置项都声明了 `.volatile()`——这正是运行时设置服务能够寻址它们的条件。因此 Web 侧栏 **插件** 页可以直接编辑：侧栏打开 **插件** → 打开 `dsh-win-multi-bash` 包 → 每个行都有 **配置** 页。该页由浏览器半边（`lib/client.js`，通过 `dsh.client` 与 `./client` 导出声明）注册进页面的 `plugins.row.config` 槽位，key 为 `dsh-win-multi-bash#<行 id>`；保存经 `settings` / `ctx.configForms` 写入 profile 的 Cordis patch——与手改落点相同，没有自建 HTTP 路由、没有第二份设置文件，也不用碰 YAML。
@@ -164,10 +176,10 @@ wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"   # 验
 - **另有一个行为开关刻意不上页面。** `promoteOnTimeout`（默认开）让到达超时的前台命令继续作为后台任务运行——在任务工具里可见、可 kill——而不是把它杀掉，与 dsh 自带 bash 工具一致。它是非 volatile 的，因为它属于部署立场而非活旋钮：写在行的 YAML 里，在该行下次加载时生效。若 `enableRunInBackground: false`，或组合里没有 job registry，超时仍与以前一样直接杀掉命令。
 - **被带外删除的沙箱私有临时目录会自愈（`guardSandboxTemp`，默认开）。** `git_bash` / `msys2_bash` 行每一条被包裹的命令都会读取 seam 即将交给 windows-acl runner 的 `--temp` —— 即后端为这个 (会话, 工作区根) 缓存的路径 —— 当这个私有根确实缺失时，重建它并重新施加 seam 自己的写授权（`tempWriteSid` + `AclWriteGrant`，与 `dsh-sandbox-local` 自己的调用相同）。它**幂等、即时生效、且不删除任何东西**：唯一接受的目标是「不存在的、绝对的、位于某个 OS 临时根本身之下、且不在任何工作区根内的 `dsh-<6 个字母数字>` **直接子目录**」；其它一切——环境临时根本身、嵌套路径、锁目录、转存目录、形状不符的名字、已存在的目录——都会具名拒绝。`AclWriteGrant` 来自 `@deepseek-ai/dsh-sandbox-windows-acl`，通过 lazy import 获取（声明为 optional peer，**无新增运行期依赖**）；解析不到时仍然只重建目录（仅存在性），插件会告警说明授权**没有**恢复。该开关**只在插件自己那一页列出一次**（`dsh-win-multi-bash`），不在各个工具行上；关掉它即从下一条命令起停止一切自愈。
 - **自愈开关只在插件自己那一页列出一次**（`dsh-win-multi-bash`），绝不在工具行上：一个部署级取值同时管住守护、每行的内联执行前检查与所有行；`enableRunInBackground` 仍属工具层，所以那一个确实每行都有。两条如实限制：`wsl_bash` 走 bwrap，从不物化 `--temp` 目录，所以该旋钮在那一行无效；自愈只在真的发生「被包裹的运行」的地方才可能发生 —— 在 windows-acl runner 无法启动 MSYS bash 的宿主机上（本机实测：`git_bash` 每次调用都返回 `sandbox.unconfined: true`），git 行根本到不了 runner，既不会因此变砖、也无法在那里自愈。
-- **没被沙箱包裹的运行会明说——默认每行只说一次。** 命令未被沙箱包裹时，结果带 `sandbox.unconfined: true`。若原因是 `sandbox: auto` 的探针失败（我们替你降级），该行的**第一条**这类运行会带完整说明：`[sandbox: not applied — the confinement probe found no usable sandbox, so this command ran unconfined under <mode> mode; repair the sandbox or set sandbox: none on this tool row to accept unconfined runs]`。之后的行为由该行的 `sandboxNotice` 旋钮决定：`once`（默认）保持安静——结构化事实仍在每条结果里，什么都没藏，只是不再让同一句话把真正的输出挤出上下文；`always` 则在每条降级运行上保留那句短标记 `[sandbox: not applied — ran unconfined under <mode> mode; reason and fix stated once per plugin load]`。无论哪种形态，这条提示都发给模型最先读到的那条通道：前景结果、promoted 结果、或真后台 job 的终态 detail。显式 `sandbox: none` 只带事实、不发任何提示；`danger-full-access` 两者都不带——它的 `mode` 已经说明了它是什么。
+- **没被沙箱包裹的运行会明说——默认每行只说一次。** 命令未被沙箱包裹时，**前台**结果带 `sandbox.unconfined: true`（被提升的调用在文本里说明；后台受理回执不带 `sandbox` 字段——与基座自带形态一致）。若原因是 `sandbox: auto` 的探针失败（我们替你降级），该行的**第一条**这类运行会带完整说明：`[sandbox: not applied — the confinement probe found no usable sandbox, so this command ran unconfined under <mode> mode; repair the sandbox or set sandbox: none on this tool row to accept unconfined runs]`。之后的行为由该行的 `sandboxNotice` 旋钮决定：`once`（默认）保持安静——结构化事实仍在每条结果里，什么都没藏，只是不再让同一句话把真正的输出挤出上下文；`always` 则在每条降级运行上保留那句短标记 `[sandbox: not applied — ran unconfined under <mode> mode; reason and fix stated once per plugin load]`。无论哪种形态，这条提示都发给模型最先读到的那条通道：前景结果、promoted 结果、或真后台 job 的终态 detail。显式 `sandbox: none` 只带事实、不发任何提示；`danger-full-access` 两者都不带——它的 `mode` 已经说明了它是什么。
 - **两个方言默认关闭。** `msys2_bash`（MSYS2 自带的 `usr/bin/bash.exe`，与 Git Bash 并列的第二套工具链）是**可选启用**的：在 Plugins 面板开启 `win-mb-tool-msys2` 行即可挂载；若 MSYS2 装在非默认位置，用 `msys2Bash.bashPath` 固定。它**继承** MSYS 机制而不是复制一份，并且报告**自己的**事实（`$MSYSTEM`、`pacman`）而不是 Git Bash 的。
 - **`ssh_bash` 也默认关闭，而且有它自己的理由：必须由部署来指定主机。** 开启 `win-mb-tool-ssh` 行并钉定 `sshBash.sshHost`（当用户/端口不是客户端默认值时再加 `sshUser` / `sshPort`）；没填主机的行会拒绝每一次调用并点名该字段。该行自己的旋钮是：目标、客户端钉定、首次即信任开关（`acceptNewHostKeys`，默认 **false**）与连接阶段上限（`connectTimeoutMs`，默认 15000 ms，按整秒作为 `ConnectTimeout` 发送）。`sshPath` 在存在时按原样信任，否则告警一次并回退到自动发现——与 `bashPath` 完全一致。只有在 `requireSandbox` 打开时才会广告升级面：不打开时该行不会广告它兑现不了的限制，因此也就不存在可被误用的 `sandbox_permissions` 参数。
-- **文本旋钮保存时 trim，不可用的值只告警、绝不改写。** 文本字段（路径、发行版名）保存前会 trim，并把 trim 后的值回显出来，做到所见即所存；清空字段表示清除该值。若值不满足**页面能做的语法判断**（路径非绝对、发行版名含空格或引号、数字非有限），页面会给出告警，但**仍然按你输入的原样保存**：插件**从不改写或删除你的配置**。这个值到底能不能用，由**运行时**判断：执行器告警一次，回退到默认（shell 路径回退自动发现；\`wslDistro\` 回退第一个可用发行版），并且**存储里的原值一直不动**，直到你自己再次保存。
+- **文本旋钮保存时 trim，不可用的值只告警、绝不改写。** 文本字段（路径、发行版名）保存前会 trim，并把 trim 后的值回显出来，做到所见即所存；清空字段表示清除该值。若值不满足**页面能做的语法判断**（路径非绝对、发行版名含空格或引号、数字非有限），页面会给出告警，但**仍然按你输入的原样保存**：插件**从不改写或删除你的配置**。这个值到底能不能用，由**运行时**判断：执行器告警一次，回退到默认（shell 路径回退自动发现；\`wslDistro\` 回退第一个可用发行版），并且**存储里的原值一直不动**，直到你自己再次保存。**数字**字段按它命名的数值保存，因此「写法和它命名的值不同」也会告警（`0x10`、`1e3`、`007`）——这种不一致不会悄悄发生。
 - **拒绝方言按主机学一次。** 受限探针成功后，该行会在工作区根之外做**一次注定被拒的无害写**，把这次拒绝文本留作**额外签名**（与后端自带的签名表取并集），这样后端没枚举到的本地化拒绝也能被判出来。探针目标事后必须不存在；万一存在，该行会删掉它并弃用这次发现。学不到就静默退化，**绝不影响该行加载** —— 而在 runner 根本无法启动 shell 的宿主机上，既不会发生限制也不会发生发现。本机实测成本：WSL/bwrap 路径约 **+321 ms**，每次行加载一次。
 - **Windows 上 workspace-write 的边界是「对象」形状的，而且在某些宿主机上根本不可用。** 本机 win32 实测（2026-10-14）：ACL 后端的授权跟随**对象**而不是路径 —— 在**工作区内创建**的文件即使随后被链到**界外**的名字上，仍然保留授权（经界外名字写入会落到区内那个文件），而在**界外创建**的对象永远不会获得授权（两个方向都对着 `icacls` 实测过），且读取完全不受限。同一台宿主上 runner **无法启动 MSYS bash**（`0xc0000142`、`NtCreateDirectoryObject(\BaseNamedObjects\…) : 0xC0000022`），于是 `sandbox: auto` **每一次调用**都降级、`git_bash` 始终无沙箱运行 —— 这件事由结构化事实在**每条结果**上如实上报，正文里则每行说一次，**后台 job 的终态 detail 里也有那句提示**（基座 job view 没有 sandbox 字段，那句提示是后台路径唯一的通道）。请把 `sandbox: auto` 当护栏而非绝对边界，把 `requireSandbox: true` 当 fail-closed 立场：在那样的宿主上它会**拒绝每一条命令**而不是降级 —— 在 runner 能启动 shell 之前，`git_bash` 在那里不可用。
 - **后台参数的广告只跟配置走，不跟注册表走**：只要 `enableRunInBackground` 开着，`run_in_background`（以及跟随它的家族段那句后台指导）就会出现；在没有任务注册表的组合里调用它会**响亮失败**（`background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs`）。dsh 自带工具的做法是重注册自己、在注册表缺席时把这个参数撤掉。本工厂不重注册：**「随 boot 顺序静默消失的参数」比「带着理由拒绝的参数」更糟**，因此这里选择确定性广告 + 调用期响亮失败。
@@ -236,7 +248,7 @@ dsh plugin --profile web remove dsh-win-multi-bash
 pnpm test
 ```
 
-在 profile 运行时上 boot 真实组合（不修改任何 profile），验证 `git_bash` / `wsl_bash` 注册并真实执行（含显式 `bashPath` 变体），并断言 `ctx.shell` 仍由基座自带的行提供——这正是本插件曾经弄坏的那一点。需要 node `^22.19.0 || >=24.0.0`——即本包声明的 `engines.node` 范围。
+在 profile 运行时上 boot 真实组合（不修改任何 profile），验证 `git_bash` / `wsl_bash` 注册并真实执行（含显式 `bashPath` 变体），并断言 `ctx.shell` 仍由基座自带的行提供——这正是本插件曾经弄坏的那一点。需要 node `^22.19.0 || >=24.0.0`——即本包声明的 `engines.node` 范围。 **需在 checkout 中运行**：发布的 tarball 不包含 `smoke/`（清单里写明了原因），因此这个入口是开发工具。它是**判定**而不是报告——工具缺失、描述不对、`ctx.shell` 座位丢失或任一命令失败，都会让本次运行失败。
 
 ```bash
 pnpm run test:audit
