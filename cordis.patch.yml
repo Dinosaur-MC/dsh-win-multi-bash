@@ -1,8 +1,9 @@
 # dsh-win-multi-bash — self-contained Windows multi-bash wiring.
 #
 # This patch is the whole plugin: it inserts the plugin's own rows. Every
-# inserted row loads code from THIS package (exports ., ./client, ./factory,
-# ./shell-family, ./registry, ./tool-git-bash, ./tool-wsl-bash) — nothing
+# inserted row loads code from THIS package through its BARE package name (the core
+# row, which serves ./client and ./factory) or through ./tool-{git,wsl,msys2,ssh}-bash
+# and ./tool-terminal — nothing
 # depends on runtime packages
 # beyond the published @deepseek-ai base packages (dsh-bash-local, dsh-sandbox,
 # dsh-tools, dsh-shell, dsh-llm, ...).
@@ -60,7 +61,7 @@
 #                         name. Nothing local bounds its file effects, so it reports
 #                         `sandbox: { mode, remote: true }` rather than a verdict.
 #
-# All four rows are win32-only; POSIX keeps the base bundle's own bash wiring.
+# Every inserted row is win32-only; POSIX keeps the base bundle's own bash wiring.
 # The tool rows are independent of each other and of the core row — the section
 # follows whichever subset is mounted, and the core row's absence degrades to
 # the fallback described above rather than to a broken prompt.
@@ -99,14 +100,16 @@
       # probe automatically (git.exe layout inference → well-known Program
       # Files on every fixed drive → PATH, with the WSL launcher and
       # WindowsApps aliases excluded):
-      #   gitBash:
-      #     bashPath: '<Git 安装目录>\usr\bin\bash.exe'
+      #   config:
+      #     gitBash:
+      #       bashPath: '<Git 安装目录>\usr\bin\bash.exe'
       #
       # Optional sandbox hardening: when the windows-acl probe fails (it cannot
       # confine MSYS bash), refuse to run unconfined unless the effective mode
       # is danger-full-access:
-      #   gitBash:
-      #     requireSandbox: true
+      #   config:
+      #     gitBash:
+      #       requireSandbox: true
       #
       # Optional: turn the sandbox private-temp self-heal off for this row
       # (default ON). With it on, a confined run whose `--temp` private root
@@ -145,8 +148,11 @@
       # tool can do anything, so the row ships switched OFF and the user enables
       # it in the panel. It drives a remote shell through the OpenSSH client, and
       # it is the family's only REMOTE dialect: its file effects are on the other
-      # host, so no local file sandbox is applied to it and every result carries
-      # `sandbox: { mode, remote: true }` instead of a sandbox verdict. The
+      # host, so no local file sandbox is applied to it: every FOREGROUND result
+      # carries `sandbox: { mode, remote: true }` instead of a sandbox verdict, a
+      # promoted (timed-out) call says it inside the returned text, and a background
+      # acknowledgement carries no `sandbox` field — the same two branches the base
+      # bundle's `pwsh`/`bash` tools shape that way. The
       # `terminal` row offers the same dialect for a PERSISTENT session (a real
       # PTY is what lets ssh ask for a fingerprint, a password or a passphrase).
       # Pin the target (and the client, when it is not the Windows OpenSSH one):
@@ -162,7 +168,7 @@
     # The interactive-session row: it registers the model-facing `terminal`
     # tool (open / send / read / signal / close / list). ONE row serves every
     # terminal-capable dialect — the `shell` argument enumerates the dialects
-    # that declare the capability (git_bash, wsl_bash, msys2_bash) — because a
+    # that declare the capability, derived from the registry — because a
     # session is a host-level resource: one registry, one session cap, one idle
     # reaper. Each dialect's interactive argv comes from its own executor
     # (`terminalArgv()`), so adding a dialect still changes nothing here.
