@@ -545,9 +545,12 @@ console.log('\n[A] unit: config schemas')
       assert.equal(typeof t.apply, 'function')
       assert.ok(t.Config)
       // The owned executor's own requirements must be injected by the tool.
-      for (const s of ['tools', 'shellEnv', 'subprocess', 'sandbox', 'sandboxPolicy']) {
+      for (const s of ['tools', 'subprocess', 'sandbox', 'sandboxPolicy']) {
         assert.ok(t.inject.includes(s), `${t.name} must inject ${s}`)
       }
+      // `shellEnv` is probed per call instead: a deployment without it must lose
+      // the managed `$DSH_*` facts, not the whole tool row.
+      assert.ok(!t.inject.includes('shellEnv'), `${t.name} must probe shellEnv, not inject it`)
       assert.ok(!t.inject.includes('shell'), `${t.name} must NOT contend for the ctx.shell seat`)
       // The family's shared prompt section is owned by the package row (the
       // plugin's core row), so a tool row registers no section and needs no
@@ -1599,6 +1602,18 @@ console.log('\n[A] unit: job reads carry their loss/sandbox notices; the exporte
     assert.deepEqual(calls, [[agent, signal]], 'ensure takes exactly (agent, signal)')
   })
   // T3: the ordering sentence and the schema order it describes are one fact.
+  // T3b: the `$DSH_*` sentence is a claim about what the child actually receives.
+  test('the family section states the managed-facts sentence only when they are forwarded', () => {
+    const section = (harnessFacts) => shellFamilySectionText({ background: false, escalation: false, harnessFacts })
+    const withFacts = section(true)
+    const withoutFacts = section(false)
+    const FACTS = 'Current harness environment facts are exposed through managed `$DSH_*` variables; inspect them when needed.'
+    assert.ok(withFacts.includes(FACTS), 'the default composition keeps the sentence')
+    assert.ok(!withoutFacts.includes(FACTS), 'a composition without shellEnv must not promise the variables')
+    assert.equal(withoutFacts.length, withFacts.length - FACTS.length - 1, 'dropping the sentence changes nothing else')
+    // The default stays `true`: a caller that says nothing keeps today's text.
+    assert.equal(shellFamilySectionText({ background: false, escalation: false }), withFacts)
+  })
   test('the ordering sentence lives in the family section exactly once', () => {
     assert.equal(SHELL_ARGUMENT_ORDER_SECTION, 'Provide `description` before `command` in the arguments.')
     assert.equal(shellFamilySectionText({ background: true, escalation: true }).split(SHELL_ARGUMENT_ORDER_SECTION).length - 1, 1)
@@ -4045,11 +4060,25 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
       return { SettingsForm: 'SettingsForm', SettingsValueField: 'SettingsValueField', Checkbox: 'Checkbox', SegmentedControl: 'SegmentedControl', Button: 'Button', DisclosureRow: 'DisclosureRow', TextShimmer: 'TextShimmer', IconApiOutlineRegular: 'IconApiOutlineRegular', IconInspectOutlineRegular: 'IconInspectOutlineRegular', TerminalBlock: 'TerminalBlock' }
     throw new Error(`unexpected client require: "${id}"`)
   })
+  /**
+   * A stand-in for the platform context: every service is reachable through
+   * `ctx.get(name)`, which is the probe API the browser half uses for the one
+   * service it does not inject. The mocks below declare services as plain
+   * properties, so this adds the probe and leaves their shape untouched.
+   */
+  const applyWithProbes = (ctx) => client.apply(Object.assign({ get: (name) => ctx[name] }, ctx))
+
   const { ROWS, rowKey, planOps, RowConfigForm, RowConfigCard, en, zh, SHELL_TOOL_NAMES, TERMINAL_TOOL_NAME, ToolCard, toolCardBody, toolCardIo, terminalBody, terminalLabels, cardTitle, shellCard, shellStatus, cardSummary, cardState, cardOutput, cardInput } = client.__internals
 
   test('it declares the client services the page needs', () => {
     assert.equal(client.NS, 'settings.win-mb-bash')
     assert.ok(Array.isArray(client.inject))
+    // `configForms` stays injected. Probing it was tried and reverted: the only
+    // provider of `locale` (dsh-client-locale) itself injects configForms before
+    // providing locale, so a deployment that lacked configForms would lack locale
+    // too — the tool cards would be parked either way, while the probe lost
+    // cordis' dependency edge and made a late-arriving service permanently miss
+    // its pages.
     for (const service of ['slots', 'locale', 'configForms'])
       assert.ok(client.inject.includes(service), `must inject ${service}`)
     assert.equal(typeof client.apply, 'function')
@@ -4132,6 +4161,40 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.deepEqual(Object.keys(en).sort(), Object.keys(zh).sort(), 'en/zh must carry the same key set')
   })
 
+  test('the boot-path probe contracts the refactor introduced', () => {
+    // Pins the invariants a later edit must not silently undo. Two of them are
+    // checked on a comment/string-stripped copy of the source, because the naive
+    // regexes this test used to carry were measured to pass on a trailing comment,
+    // on a deadline smuggled into the 4th argument, and on a double-quoted module
+    // name — a guard that can be satisfied without the code being right is not a
+    // guard.
+    const strip = (source) => source
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      .replace(/\/\/[^\n]*/g, ' ')
+      .replace(/'(?:[^'\\]|\\.)*'/g, "''")
+      .replace(/"(?:[^"\\]|\\.)*"/g, '""')
+      .replace(/`(?:[^`\\]|\\.)*`/g, '``')
+    const raw = (rel) => readFileSync(join(PLUGIN, 'lib', rel), 'utf8')
+    const executor = strip(raw('shell-executor.js'))
+    const git = strip(raw('bash-git/index.js'))
+    const factory = strip(raw('tool-bash/types/factory.js'))
+    const terminal = strip(raw('tool-bash/types/terminal.js'))
+    // 1. Confinement is the THIRD argument, spelled with a deadline expression.
+    assert.match(executor, /confine\(\[process\.execPath[^\]]*\],\s*policy,\s*probeDeadline\(/, 'the temp-root probe must pass a deadline as confine()\'s third argument')
+    assert.equal((git.match(/probeDeadline\(\(\) => this\.probeTimeoutMs\)/g) || []).length, 2, 'both git-bash probe confines must be bounded')
+    assert.ok(!/confine\([^)]*\bundefined\s*,/.test(git), 'a deadline must not be separated from the argv by an undefined signal')
+    // 2. shellEnv is probed: the row lists, and both direct-read spellings.
+    assert.ok(!/inject:\s*\[[^\]]*\bshellEnv\b/.test(factory), 'tool rows must probe shellEnv, not inject it')
+    assert.ok(!/inject:\s*\[[^\]]*\bshellEnv\b/.test(terminal), 'the terminal row must probe shellEnv, not inject it')
+    assert.ok(!/ctx\.shellEnv\b/.test(factory) && !/ctx\.shellEnv\b/.test(terminal), 'shellEnv must be reached through the probe API, never as a property')
+    // 3. sandboxPolicy is injected, so it is never re-read as an optional service.
+    assert.ok(!/ctx\.get\(\s*['\"]?sandboxPolicy/.test(factory), 'sandboxPolicy is injected: no second optional read')
+    assert.ok(!/ctx\.get\(\s*['\"]?sandboxPolicy/.test(terminal), 'sandboxPolicy is injected: no second optional read')
+    // 4. The browser half's inject list is asserted on the module object itself
+    //    ('it declares the client services the page needs'), not on the source:
+    //    dsh-client-locale (the only provider of `locale`) injects configForms
+    //    before providing locale, so configForms stays injected here.
+  })
   test('the sandbox choices match the stance each backend accepts', () => {
     const options = (rowId) => ROWS.find((row) => row.rowId === rowId).fields.find((knob) => knob.key.endsWith('sandbox')).options
     assert.deepEqual(options('win-mb-tool-git'), unionOptions(gitBashTool.Config.dict.gitBash.dict.sandbox))
@@ -4397,7 +4460,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
       },
       effect: (callback) => callback(),
     }
-    client.apply(ctx)
+    applyWithProbes(ctx)
     assert.deepEqual(localeRegistrations.map((entry) => entry.ns), [client.NS])
     assert.ok(localeRegistrations[0].dict.en && localeRegistrations[0].dict.zh)
     const pages = slotRegistrations.filter((entry) => entry.options.name === 'plugins.row.config')
@@ -4423,7 +4486,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
 
   test('the conversation rows cover exactly the dialect tools, keyed by wire name', () => {
     const slotRegistrations = []
-    client.apply({
+    applyWithProbes({
       locale: { register: () => () => {}, bind: () => (key) => key },
       configForms: { get: () => fakeScope(), whileServed: (names, callback) => { callback(new Set(names)); return () => {} } },
       slots: { inject: (_name, register) => register(), register: (options, component) => { slotRegistrations.push({ options, component }); return () => {} } },
@@ -4647,7 +4710,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     // namespace. Every other stub in this block calls back immediately, so deleting the
     // `whileServed` wrapper used to keep them all green.
     const slotRegistrations = []
-    client.apply({
+    applyWithProbes({
       locale: { register: () => () => {}, bind: () => (key) => key },
       configForms: { get: () => fakeScope(), whileServed: () => () => {} },
       slots: { inject: (_name, register) => register(), register: (options, component) => { slotRegistrations.push({ options, component }); return () => {} } },
@@ -4668,7 +4731,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     const slotRegistrations = []
     const warnings = []
     const broken = REGISTRY_ROWS[0].rowId
-    client.apply({
+    applyWithProbes({
       logger: { warn: (message) => warnings.push(String(message)) },
       locale: { register: () => () => {}, bind: () => (key) => key },
       configForms: {
@@ -4688,7 +4751,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
   })
   test('the detail note speaks only for this bundle and its core row', () => {
     const slotRegistrations = []
-    client.apply({
+    applyWithProbes({
       locale: { register: () => {}, bind: () => (key) => key },
       configForms: { get: () => fakeScope(), whileServed: (names, callback) => { callback(new Set(names)); return () => {} } },
       slots: { inject: (_name, register) => register(), register: (options, component) => slotRegistrations.push({ options, component }) },
@@ -4812,7 +4875,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     globalThis.document = documentStub
     try {
       const effects = []
-      client.apply({
+      applyWithProbes({
         locale: { register: () => () => {}, bind: () => (key) => key },
         configForms: { get: () => fakeScope(), whileServed: (names, callback) => { callback(new Set(names)); return () => {} } },
         slots: { inject: (_name, register) => register(), register: () => {} },
@@ -4921,7 +4984,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
       assert.equal(typeof installStyles(), 'function', 'the installer still answers with a disposer')
       assert.equal(head.children.length, 0, 'and appends nothing')
       const slotRegistrations = []
-      assert.doesNotThrow(() => client.apply({
+      assert.doesNotThrow(() => applyWithProbes({
         locale: { register: () => () => {}, bind: () => (key) => key },
         configForms: { get: () => fakeScope(), whileServed: (names, callback) => { callback(new Set(names)); return () => {} } },
         slots: { inject: (_name, register) => register(), register: (options, component) => { slotRegistrations.push({ options, component }); return () => {} } },
