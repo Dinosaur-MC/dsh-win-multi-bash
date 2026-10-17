@@ -21,7 +21,7 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { CLIENT_ROWS, LEAF_RULES } from '../lib/tool-bash/types/registry.js';
+import { CLIENT_ROWS, LEAF_RULES, TERMINAL_ROW } from '../lib/tool-bash/types/registry.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CLIENT_PATH = join(HERE, '..', 'lib', 'client.js');
@@ -66,6 +66,15 @@ export function renderClientRegistry() {
     lines.push('\t\tconst ROWS = [');
     for (const row of CLIENT_ROWS) lines.push(...renderRow(row));
     lines.push('\t\t];');
+    lines.push('\t\t/**');
+    lines.push('\t\t * The interactive session tool\'s three literals, from the registry: the wire');
+    lines.push('\t\t * name its keyed row is registered under, the row that carries its config, and');
+    lines.push('\t\t * the config partition the shell list is read from. Hand-keeping them here was');
+    lines.push('\t\t * the last place a rename could drift without a red.');
+    lines.push('\t\t */');
+    lines.push(`\t\tconst TERMINAL_ROW_ID = ${JSON.stringify(TERMINAL_ROW.rowId)};`);
+    lines.push(`\t\tconst TERMINAL_TOOL_NAME = ${JSON.stringify(TERMINAL_ROW.toolName)};`);
+    lines.push(`\t\tconst TERMINAL_CONFIG_KEY = ${JSON.stringify(TERMINAL_ROW.configKey)};`);
     return `${lines.join('\n')}\n`;
 }
 
