@@ -4068,7 +4068,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
    */
   const applyWithProbes = (ctx) => client.apply(Object.assign({ get: (name) => ctx[name] }, ctx))
 
-  const { ROWS, rowKey, planOps, RowConfigForm, RowConfigCard, en, zh, SHELL_TOOL_NAMES, TERMINAL_TOOL_NAME, ToolCard, toolCardBody, toolCardIo, terminalBody, terminalLabels, cardTitle, shellCard, shellStatus, cardSummary, cardState, cardOutput, cardInput } = client.__internals
+  const { ROWS, rowKey, planOps, RowConfigForm, RowConfigCard, en, zh, SHELL_TOOL_NAMES, TERMINAL_TOOL_NAME, ToolCard, toolCardBody, toolCardIo, terminalBody, terminalLabels, cardTitle, shellCard, shellExitLabel, shellStatus, displayCwd, normalizeSegments, cardSummary, cardState, cardOutput, cardInput } = client.__internals
 
   test('it declares the client services the page needs', () => {
     assert.equal(client.NS, 'settings.win-mb-bash')
@@ -4576,28 +4576,71 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.deepEqual(card(settled('out')), { command: 'ls', cwd: undefined, output: 'out', exitCode: 0, signal: undefined, running: false })
     assert.equal(card(settled('o\n[exit code: 2]'), argsRaw, 'o\n[exit code: 2]').exitCode, 2)
     assert.deepEqual(card({ phase: 'start', argsRaw }, argsRaw, null), { command: 'ls', cwd: undefined, output: undefined, exitCode: undefined, signal: undefined, running: true }, 'a running call already shows the command line')
+    // The platform renders a background shell call as the same card with `background: true`:
+    // header only, no status and no output. It is not the generic INPUT/OUTPUT body.
+    const bgRaw = JSON.stringify({ command: 'ls', run_in_background: true })
+    assert.deepEqual(card(settled('out'), bgRaw, 'out'), { command: 'ls', cwd: undefined, running: false, background: true })
+    assert.deepEqual(card({ phase: 'start', argsRaw: bgRaw }, bgRaw, null), { command: 'ls', cwd: undefined, output: undefined, exitCode: undefined, signal: undefined, running: true, background: true })
     for (const [what, block, raw, output] of [
-      ['a background call', settled('out'), JSON.stringify({ command: 'ls', run_in_background: true }), 'out'],
       ['a failed call', settled('boom', { isError: true }), argsRaw, 'boom'],
       ['a spill preview', settled('o\n[output truncated; full output: p]'), argsRaw, 'o\n[output truncated; full output: p]'],
-      ['a promotion still running in the background', settled('o\n[still running after 5ms; moved to background job j1]'), argsRaw, 'o\n[still running after 5ms; moved to background job j1]'],
+      ['a promotion still running in the background', settled('o\n[still running after 5ms; moved to background job j1]\nThe command keeps running in the background.'), argsRaw, 'o\n[still running after 5ms; moved to background job j1]\nThe command keeps running in the background.'],
       ['a job read that dropped output', settled('o\n[some output was dropped from memory; full output: p]'), argsRaw, 'o\n[some output was dropped from memory; full output: p]'],
       ['a call with no command', settled('out'), JSON.stringify({ description: 'd' }), 'out'],
     ]) assert.equal(card(block, raw, output), null, `${what} must stay on the generic body`)
+    // A source listing (or a command) that merely NAMES the notice strings is still a
+    // shell card: only a whole marker LINE means "not one settled foreground command".
+    const namesTheNotices = 'const UNSETTLED_NOTICES = ["[still running after ", "[output truncated;", "[some output was dropped from memory;"];'
+    assert.notEqual(card(settled(namesTheNotices), argsRaw, namesTheNotices), null, 'inline notice names are not a marker line')
+    const spillBeforeExit = 'o\n[output truncated; full output: p]\n[exit code: 2]'
+    assert.equal(card(settled(spillBeforeExit), argsRaw, spillBeforeExit), null, 'a marker line still counts before a trailing exit marker')
+    // The collapsed-row failure capsule is the platform's `terminalExitLabel`: only a
+    // settled FOREGROUND call with a non-zero exit or a signal carries one.
+    const zhT = (key) => zh[key] ?? key
+    assert.equal(shellExitLabel(card(settled('o\n[exit code: 2]'), argsRaw, 'o\n[exit code: 2]'), zhT), '退出码 2')
+    assert.equal(shellExitLabel(card(settled('o\n[killed by signal: SIGINT]'), argsRaw, 'o\n[killed by signal: SIGINT]'), zhT), '信号 SIGINT')
+    assert.equal(shellExitLabel(card(settled('out')), zhT), null)
+    assert.equal(shellExitLabel(card(settled('out'), bgRaw, 'out'), zhT), null, 'a background ack carries no exit capsule')
+    assert.equal(shellExitLabel(card({ phase: 'start', argsRaw }, argsRaw, null), zhT), null, 'a running call carries no exit capsule')
+    // The platform passes the host home so TerminalBlock labels the home directory `~`.
+    const homeArgs = JSON.stringify({ command: 'ls', workdir: '/home/u' })
+    assert.equal(shellCard({ toolName: 'git_bash', home: '/home/u', block: settled('out') }, homeArgs, 'out').home, '/home/u')
     assert.equal(shellCard({ toolName: TERMINAL_TOOL_NAME, block: settled('out') }, argsRaw, 'out'), null, 'the terminal tool names an action, not a command line')
+  })
+
+  test('the prompt cwd resolves relative, . and .. exactly like the platform', () => {
+    assert.equal(normalizeSegments('/w/app/..'), '/w')
+    assert.equal(normalizeSegments('/w/./x/../y'), '/w/y')
+    assert.equal(normalizeSegments('C:\\ws\\sub\\..'), 'C:\\ws')
+    assert.equal(normalizeSegments('C:\\ws\\..\\..\\x'), 'C:\\x')
+    assert.equal(displayCwd(undefined, '/w/app'), '/w/app')
+    assert.equal(displayCwd('', '/w/app'), '/w/app')
+    assert.equal(displayCwd('..', '/w/app'), '/w')
+    assert.equal(displayCwd('./x', '/w/app'), '/w/app/x')
+    assert.equal(displayCwd('/abs/./x', '/w/app'), '/abs/x')
+    assert.equal(displayCwd('sub\\..', 'C:\\ws'), 'C:\\ws')
+    assert.equal(displayCwd('sub/..', 'C:\\ws'), 'C:/ws', 'the platform preserves the authored separator style')
+    const relRaw = JSON.stringify({ command: 'ls', workdir: 'sub\\..' })
+    const relBlock = { kind: 'result', call: { argsRaw: relRaw }, content: [{ type: 'text', text: 'out' }], isError: false }
+    assert.equal(shellCard({ toolName: 'git_bash', cwd: 'C:\\ws', block: relBlock }, relRaw, 'out').cwd, 'C:\\ws')
+    const recordedBlock = { ...relBlock, meta: { cwd: '/actual' } }
+    assert.equal(shellCard({ toolName: 'git_bash', cwd: 'C:\\ws', block: recordedBlock }, relRaw, 'out').cwd, '/actual', 'a recorded absolute cwd wins')
   })
 
   test('the terminal labels fill the tokens the primitive hands back', () => {
     const labels = terminalLabels((key) => zh[key] ?? key)
+    assert.equal(labels.commandLine(2), '命令第 2 行')
     assert.equal(labels.exitCode(3), '退出码 3')
     assert.equal(labels.signal('SIGINT'), '信号 SIGINT')
     assert.equal(labels.expandAria(7), '展开其余 7 行输出')
     assert.equal(labels.expand(7), '… 其余 7 行', "the folded control reads copy.expand(hidden)")
     assert.equal(labels.copy, '复制')
+    assert.equal(terminalLabels((key) => en[key] ?? key).commandLine(1), 'Command line 1')
     // The WHOLE surface the platform's own `terminalBlockLabels` carries
-    // (dsh-client-ui-tool), not a hand-picked subset: a missing member is a render
-    // that throws the moment the card caps its lines.
-    const PLATFORM_LABELS = ['signal', 'exitCode', 'noExitCode', 'running', 'failed', 'done', 'copy', 'copied', 'noOutput', 'collapseAria', 'collapse', 'expandAria', 'expand']
+    // (dsh-client-ui-tool), not a hand-picked subset: `commandLine` is read by
+    // `TerminalBlock`'s HEADER on every render, so a missing member is a render that
+    // throws the moment the card renders — not only when it caps its lines.
+    const PLATFORM_LABELS = ['commandLine', 'signal', 'exitCode', 'noExitCode', 'running', 'failed', 'done', 'copy', 'copied', 'noOutput', 'collapseAria', 'collapse', 'expandAria', 'expand']
     assert.deepEqual(Object.keys(labels).sort(), [...PLATFORM_LABELS].sort())
     for (const key of PLATFORM_LABELS) assert.ok(labels[key] !== undefined, `TerminalBlock needs ${key}`)
   })
@@ -4617,6 +4660,32 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.equal(row.props.open, false)
     assert.equal(row.props.collapsedContent[1].type, 'TextShimmer')
     assert.equal(row.props.collapsedContent[1].children[0].children[0], 'list')
+    // The slot's own `useDisclosure` is the state model: the open state comes from the
+    // owner's hook, not from a private `useState` that survives the Turn. A unit call
+    // without the hook uses the module's fallback shape.
+    let toggled = false
+    const official = ToolCard({ toolName: 'git_bash', callId: 'c1', phase: 'result', cwd: 'C:/ws', t, block, useDisclosure: () => ({ expanded: true, setExpanded: () => {}, toggle: () => { toggled = true } }) })
+    const officialRow = official.children.find((child) => child && child.type === 'DisclosureRow')
+    assert.equal(officialRow.props.open, true, 'the seat hook decides the open state')
+    officialRow.props.onToggle()
+    assert.equal(toggled, true, 'the row toggles the seat hook')
+    assert.equal(officialRow.props.children.type, 'div', 'the expanded body is rendered')
+    assert.equal(officialRow.props.children.children[0].type, 'TerminalBlock', 'the expanded body is the platform terminal card')
+    // Every registered shell shares this one component and one label set: the fix that
+    // makes git_bash render must hold for the other dialects too.
+    for (const name of SHELL_TOOL_NAMES) {
+      const one = ToolCard({ toolName: name, callId: 'c3', phase: 'result', cwd: 'C:/ws', t, block, useDisclosure: () => ({ expanded: true, setExpanded: () => {}, toggle: () => {} }) })
+      const oneRow = one.children.find((child) => child && child.type === 'DisclosureRow')
+      assert.equal(oneRow.props.children.children[0].type, 'TerminalBlock', `${name} renders the platform terminal card`)
+    }
+    // A settled foreground call with a non-zero exit carries the platform's failure
+    // capsule in the COLLAPSED row, not only inside the expanded terminal body.
+    const failedArgs = JSON.stringify({ command: 'false', description: 'fail' })
+    const failedBlock = { kind: 'result', call: { argsRaw: failedArgs }, content: [{ type: 'text', text: 'o\n[exit code: 3]' }], isError: false }
+    const failedTree = ToolCard({ toolName: 'git_bash', callId: 'c4', phase: 'result', cwd: 'C:/ws', t, block: failedBlock })
+    const failedRow = failedTree.children.find((child) => child && child.type === 'DisclosureRow')
+    assert.equal(failedRow.props.collapsedContent[2].props.className, 'dshwmb-tool-exit', 'a non-zero exit carries the collapsed capsule')
+    assert.equal(failedRow.props.collapsedContent[2].children[1], 'exit code 3')
     // The expanded body: the platform's terminal card, then the seat's inspect button.
     const body = toolCardBody({ t, inspect: () => {} }, terminalBody(shellCard({ toolName: 'git_bash', block }, argsRaw, 'out'), t))
     assert.deepEqual(body.children.map((child) => child.type), ['TerminalBlock', 'button'])
