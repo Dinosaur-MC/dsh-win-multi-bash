@@ -4407,11 +4407,11 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
       assert.equal(entry.component, RowConfigCard)
       assert.equal(typeof entry.options.inject().hooks.rowForm.getSnapshot, 'function')
     }
-    // The bundle page also gets the core-row label and note, on their own slots.
+    // The bundle page also gets the core-row note, on its own slot.
     const detail = slotRegistrations.filter((entry) => entry.options.name !== 'plugins.row.config' && entry.options.name !== 'tool.call.toolview')
-    // The bundle seat comes first, under both candidate keys; then the badge/note. No
+    // The bundle seat comes first, under both candidate keys; then the note. No
     // `settings.section` entry: that surface showed the same form a second time.
-    assert.deepEqual(detail.map((entry) => entry.options.name), ['plugins.bundle.config', 'plugins.bundle.config', 'plugins.detail.badge', 'plugins.detail.section'])
+    assert.deepEqual(detail.map((entry) => entry.options.name), ['plugins.bundle.config', 'plugins.bundle.config', 'plugins.detail.section'])
     assert.deepEqual(detail.slice(0, 2).map((entry) => entry.options.key), [client.__internals.CORE_ROW_ID, 'dsh-win-multi-bash'])
     assert.equal(detail[0].component, RowConfigCard)
     assert.equal(typeof detail[0].options.inject().hooks.rowForm.getSnapshot, 'function')
@@ -4686,7 +4686,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.ok(names.includes('plugins.bundle.config'), 'the contributions after the loop still registered')
     assert.equal(names.filter((name) => name === 'tool.call.toolview').length, SHELL_TOOL_NAMES.length + 1)
   })
-  test('the detail label and note speak only for this bundle and its core row', () => {
+  test('the detail note speaks only for this bundle and its core row', () => {
     const slotRegistrations = []
     client.apply({
       locale: { register: () => {}, bind: () => (key) => key },
@@ -4695,7 +4695,6 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
       effect: (callback) => callback(),
     })
     const component = (name) => slotRegistrations.find((entry) => entry.options.name === name).component
-    const badge = component('plugins.detail.badge')
     const note = component('plugins.detail.section')
     const props = (subject) => ({ subject, t: (key) => `t:${key}` })
     const self = { name: 'dsh-win-multi-bash', installed: true, enabled: true }
@@ -4704,22 +4703,19 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     const toolRow = props({ kind: 'row', pkg: self, row: { rowId: 'win-mb-tool-git', moduleName: 'dsh-win-multi-bash/tool-git-bash', enabled: true } })
     const foreignBundle = props({ kind: 'bundle', pkg: { name: 'dsh-free-search', installed: true, enabled: true } })
     const foreignItem = props({ kind: 'item', id: 'dsh-tool-jobs' })
-    for (const rendered of [badge, note]) {
-      assert.ok(rendered(bundle) !== null, 'the bundle page carries the label')
-      assert.ok(rendered(coreRow) !== null, 'so does the core row\'s own page')
-      assert.equal(rendered(toolRow), null, 'a tool row has nothing to say here')
-      assert.equal(rendered(foreignBundle), null, 'another package renders nothing')
-      assert.equal(rendered(foreignItem), null, 'an official plugin entry renders nothing')
-      assert.equal(rendered({}), null, 'a subject-less render renders nothing')
-    }
-    assert.equal(badge(bundle).children[0], 't:coreBadge')
+    assert.ok(note(bundle) !== null, 'the bundle page carries the note')
+    assert.ok(note(coreRow) !== null, 'so does the core row\'s own page')
+    assert.equal(note(toolRow), null, 'a tool row has nothing to say here')
+    assert.equal(note(foreignBundle), null, 'another package renders nothing')
+    assert.equal(note(foreignItem), null, 'an official plugin entry renders nothing')
+    assert.equal(note({}), null, 'a subject-less render renders nothing')
     assert.equal(note(bundle).children[0].children[0], 't:coreNote')
-    // Both pages are the bundle speaking about itself: the copy is localized.
+    // The note is the bundle speaking about itself: the copy is localized, and the
+    // badge is deliberately gone — a tag beside the bundle's title cannot name one row.
     for (const [language, dict] of [['en', en], ['zh', zh]]) {
-      for (const key of ['coreBadge', 'coreNote']) {
-        assert.equal(typeof dict[key], 'string', `${language} is missing ${key}`)
-        assert.ok(dict[key].length > 0, `${key} is empty in ${language}`)
-      }
+      assert.equal(typeof dict.coreNote, 'string', `${language} is missing coreNote`)
+      assert.ok(dict.coreNote.length > 0, `coreNote is empty in ${language}`)
+      assert.equal(dict.coreBadge, undefined, `${language} still carries the removed badge copy`)
     }
   })
 
