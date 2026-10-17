@@ -205,7 +205,7 @@ lib/
 └── vendor/         helper modules for runner-failure classification and bwrap profiles
 ```
 
-The design records live in `docs/decisions/` and are deliberately **not** part of the published tarball (`package.json` `files`), so a consumer reading the npm page still gets the reasoning through this README. Because no row of this plugin registers as `ctx.shell`, the patch inserts only its own rows and disables nothing: the base bundle's shell wiring (`pwsh-sandbox` on win32, `bash-sandbox` elsewhere) stays exactly as shipped, and pwsh keeps working whether or not this plugin is loaded.
+The reasoning for these decisions is written into **this README** — the repository carries no separate design-record tree, so a consumer reading the npm page and a reader of the checkout get the same argument. Because no row of this plugin registers as `ctx.shell`, the patch inserts only its own rows and disables nothing: the base bundle's shell wiring (`pwsh-sandbox` on win32, `bash-sandbox` elsewhere) stays exactly as shipped, and pwsh keeps working whether or not this plugin is loaded.
 
 ## Prerequisites
 
@@ -289,7 +289,6 @@ dsh-win-multi-bash/
 ├── package.json            # dsh.bundle + dsh.client manifest; exports . ./client ./tool-git-bash ./tool-wsl-bash ./tool-msys2-bash ./tool-ssh-bash
 ├── cordis.patch.yml        # the composition wiring (documented inline)
 ├── .gitattributes          # LF-only for every text file, binaries exempt
-├── docs/decisions/         # design records (repo-only, not published)
 ├── LICENSE / THIRD_PARTY_NOTICES
 ├── lib/                    # bundled implementation (plain ESM JS, no build step)
 └── smoke/                  # smoke test (not published)

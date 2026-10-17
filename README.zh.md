@@ -205,7 +205,7 @@ lib/
 └── vendor/         运行器失败分类与 bwrap 配置辅助模块
 ```
 
-设计决策记录放在 `docs/decisions/`，并且**刻意不进**发布产物的 `files`（npm tarball）——因此从 npm 页看包的人仍然能通过本 README 拿到同样的论证。由于本插件没有任何行注册为 `ctx.shell`，patch 只插入自己的那些行、不禁用任何行：基座自身的 shell 接线（Windows 上是 `pwsh-sandbox`，其他平台是 `bash-sandbox`）保持原样，pwsh 无论本插件是否加载都正常工作。
+这些决策的论证直接写在**本 README**里——仓库不携带单独的设计记录目录，因此从 npm 页看包的人与读 checkout 的人拿到的是同一份论证。由于本插件没有任何行注册为 `ctx.shell`，patch 只插入自己的那些行、不禁用任何行：基座自身的 shell 接线（Windows 上是 `pwsh-sandbox`，其他平台是 `bash-sandbox`）保持原样，pwsh 无论本插件是否加载都正常工作。
 
 ## 前置条件
 
@@ -289,7 +289,6 @@ dsh-win-multi-bash/
 ├── package.json            # dsh.bundle + dsh.client 清单；exports 暴露 . ./client ./tool-git-bash ./tool-wsl-bash ./tool-msys2-bash ./tool-ssh-bash
 ├── cordis.patch.yml        # 组合接线（即文档）
 ├── .gitattributes          # 所有文本文件 LF，二进制例外
-├── docs/decisions/         # 设计决策记录（只入仓库，不随包发布）
 ├── LICENSE / THIRD_PARTY_NOTICES
 ├── lib/                    # 打包实现（纯 ESM JS，无构建步骤）
 └── smoke/                  # 冒烟测试（不随包发布）

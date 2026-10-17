@@ -33,6 +33,11 @@ import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync, rmSync } from 'node:fs'
+
+/** Remove a fixture directory, retrying while Windows still holds the handles. */
+function removeFixtureDir(dir) {
+  rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 })
+}
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -2118,7 +2123,7 @@ console.log('\n[A] unit + [B] boot: the MSYS2 dialect end to end (S3)')
             const out = await execTool(ctx, 'msys2_bash', { command: 'pwd; cat hello.txt', workdir: cjk })
             assert.match(out, /msys2-non-ascii-ok/, out)
           } finally {
-            rmSync(dir, { recursive: true, force: true })
+            removeFixtureDir(dir)
           }
         }],
         ['msys2_bash is a dialect of its own: the git facts are not what it reports', async () => {
@@ -3726,13 +3731,14 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
       })
       await testAsync('a real Git Bash session keeps cwd, exported variables and aliases across calls', async () => {
         const dir = mkdtempSync(join(process.cwd(), '.temp', 'terminal-state-'))
+        let id
         try {
           const opened = await runTerminal(ctx, { action: 'open', name: 'roundtrip' })
           assert.ok(!opened.isError, opened.text)
           assert.equal(opened.value.kind, 'open')
           assert.equal(opened.value.shell, 'git_bash')
           assert.equal(opened.value.unconfined, true, 'a PTY session cannot be sandboxed, and the result says so')
-          const id = opened.value.sessionId
+          id = opened.value.sessionId
           const send = async (text) => (await runTerminal(ctx, { action: 'send', sessionId: id, text })).value.output
           assert.match(await send('cd "' + dir + '" && pwd'), /terminal-state-/, 'the shell moved')
           assert.match(await send('pwd'), /terminal-state-/, 'the directory survived the next call')
@@ -3752,7 +3758,9 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
           assert.deepEqual(Object.keys(drained.value).sort(), ['kind', 'lossy', 'nextOffset', 'output', 'truncated'],
             'read must return exactly the declared fields')
         } finally {
-          rmSync(dir, { recursive: true, force: true })
+          // The shell's cwd is INSIDE this directory: close the session before deleting it.
+          if (id !== undefined) await runTerminal(ctx, { action: 'close', sessionId: id }).catch(() => {})
+          removeFixtureDir(dir)
         }
       })
       await testAsync('a big burst reports truncation, and SIGINT interrupts without killing the session', async () => {
@@ -3765,8 +3773,12 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
         assert.ok(!signalled.isError, signalled.text)
         // The command text is echoed, so matching the ARITHMETIC RESULT proves the
         // shell really ran it rather than just printing what was typed.
-        const after = await runTerminal(ctx, { action: 'send', sessionId: id, text: 'echo AFTER-SIGINT-$((6*7))', waitMs: 3000 })
-        assert.match(after.value.output, /AFTER-SIGINT-42/, 'the session survives Ctrl+C')
+        let after = ''
+        for (let attempt = 0; attempt < 4 && !/AFTER-SIGINT-42/.test(after); attempt += 1) {
+          const probe = await runTerminal(ctx, { action: 'send', sessionId: id, text: 'echo AFTER-SIGINT-$((6*7))', waitMs: 3000 })
+          after += probe.value?.output ?? ''
+        }
+        assert.match(after, /AFTER-SIGINT-42/, 'the session survives Ctrl+C')
         const closed = await runTerminal(ctx, { action: 'close', sessionId: id })
         assert.equal(closed.value.kind, 'closed')
         const gone = await runTerminal(ctx, { action: 'send', sessionId: id, text: 'echo x' })
@@ -4659,8 +4671,12 @@ console.log('\n[B] boot integration: default fixture (pinned via probed bash)')
         const text = await execTool(ctx, 'git_bash', { command: 'echo bg-line-1; echo bg-line-2', run_in_background: true })
         const jobId = text.match(/started background job (\S+)/)?.[1]
         assert.ok(jobId, `no job id in: ${text}`)
-        await new Promise((r) => setTimeout(r, 2500))
-        const read = await execTool(ctx, 'job_output', { job_id: jobId })
+        let read = ''
+        const deadline = Date.now() + 15000
+        do {
+          await new Promise((r) => setTimeout(r, 400))
+          read += await execTool(ctx, 'job_output', { job_id: jobId })
+        } while (!/completed|exit code/i.test(read) && Date.now() < deadline)
         assert.match(read, /bg-line-1/)
         assert.match(read, /bg-line-2/)
         assert.match(read, /completed|exit code/i)

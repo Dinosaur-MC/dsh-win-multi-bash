@@ -1,3 +1,35 @@
+# dsh-win-multi-bash v0.7.1
+
+## New
+
+- **A remote shell dialect: `ssh_bash`.** Opt-in, Windows-only and switched off until a deployment names a host. It drives one command per call through the OpenSSH client (`ssh -T -o BatchMode=yes -o StrictHostKeyChecking=… -- <target> <command>`), reports `sandbox: { mode, remote: true }` instead of inventing a local verdict — no local wrapper, no sandbox temp root — and keeps its option surface closed (no free `sshOptions`; target and port are validated). The host-key policy is a knob: strict by default, `accept-new` when you say so, strict again for a changed key.
+- **The interactive `terminal` tool can open an SSH session.** `terminal { shell: "ssh_bash" }` runs `ssh -t … -- <target>` as a persistent PTY — the form that lets ssh ask for a fingerprint, a password or a passphrase, which the one-shot form cannot.
+
+## Improvements
+
+- **The self-heal switch is listed exactly once, on the plugin's own page.** It had been contributed a second time to the Settings navigation, where it appeared as an unlabelled entry beside the plugin page.
+- **The family prompt section now states its scope.** When no locally sandboxable shell is mounted, the file-sandbox sentence is dropped; when a remote dialect is mounted, the section adds the `sandbox.remote: true` sentence instead of promising a local fence.
+- **The SSH decisions are written into the README itself** (there is no separate design-record tree), so a consumer reading the npm page gets the same argument a checkout reader does.
+
+## Bug fixes
+
+- **A remote job's terminal state no longer hangs an unmatched-denial sentence on the dialect**, which had described a sandbox that never ran.
+- **A session in a remote backend reports `remote: true`** instead of reading like a local, unconfined session — the one fact that says whether the files are on this machine.
+- **The `terminal` row's pin schema honours each knob's declared kind.** Number and boolean leaves were being built as string pins, so a declared dialect's session form refused to open at run time.
+- **Three timing races in the verification suite are gone** (they produced one red run in three on this machine): the terminal round trip deleted its fixture directory while the shell's cwd was still inside it, the SIGINT probe expected an answer inside one fixed window, and the background-output case read once after a fixed sleep. All three poll to a bounded deadline now.
+
+## Compatibility
+
+- **No existing tool changes name, parameters or result shape**, and every new knob defaults to the previous behaviour. `ssh_bash` ships switched off; `msys2_bash` stays opt-in as before.
+- **`ssh_bash` is outside the DSH file sandbox on purpose.** A file sandbox fences the local effects of a command this host runs; an SSH command has none here, so the row wraps nothing and says so instead of claiming a verdict. `requireSandbox: true` therefore refuses every command on that row (the documented way through is an explicit `danger-full-access` escalation).
+
+## Verification
+
+- `pnpm test`: exit 0 — `git_bash`, `wsl_bash` and the base bundle's own `pwsh` seat each ran a real command, and `ctx.shell` stayed with the base bundle.
+- `pnpm run test:audit`: **392 assertions, 0 failures**, twice on the same tree.
+- With `DSH_AUDIT_SSH_HOST` set, the same suite adds the live one-shot round trip and the live SSH session round trip (opt-in, because they need a reachable host and a credential).
+- `npm pack --dry-run`: **30 files, 169,529 B packed** — nothing from `smoke/`, `.temp/` or this file.
+
 # dsh-win-multi-bash v0.7.0
 
 ## New
