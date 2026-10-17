@@ -1,3 +1,36 @@
+# dsh-win-multi-bash v0.7.2
+
+## New
+
+- **A call renders as the platform's own shell card.** `git_bash`, `wsl_bash`, `msys2_bash`, `ssh_bash` and `terminal` register a keyed `tool.call.toolview` row: the platform's command glyph, the tool's own name as the title (`Git Bash`, `WSL Bash`, `MSYS2 Bash`, `SSH remote shell`, `Terminal` / 「终端」), the command or its `description` as the collapsed summary, and the platform's terminal card as the body. A deployment missing the primitives the card is built from keeps the generic row rather than a half-drawn one.
+
+## Improvements
+
+- **Boot no longer blocks on probes.** `wsl -l -q`, the bwrap probe and the denial-dialect discovery run through an async `runProbe` (spawn + a killing timer) instead of `spawnSync`; a hanging `wsl.exe` can no longer freeze the host event loop for up to 16 s per row. The denial dialect is learned on the first confined command, not during apply, so a row that never runs confined pays nothing.
+- **`wsl_bash` ships opt-in.** Only `git_bash` and `terminal` are enabled by default; `wsl_bash` joins `msys2_bash` and `ssh_bash` as switched off (enable `win-mb-tool-wsl` on the Plugins page). A row that is off never probes.
+- **The verification entry point is a verdict again.** `pnpm test` fails on a missing tool, a wrong description, a lost `ctx.shell` seat or any failed command; the audit announces and counts its skips; `exports` are checked against `files`; `RELEASE_NOTES.md` must open with the version `package.json` declares; `DSH_AUDIT_TIMING=1` attributes the wall clock. Three timing races in the suite are gone.
+- **The checkout owns its dev runtime.** `devDependencies` plus `package-lock.json` pin the 0.2.1-rc.2 runtime; `smoke/prepare.mjs` resolves it from the checkout and only falls back to the live profile when the checkout has none. `npm ci` rebuilds the gate runtime.
+- **One shared prompt section and a smaller model surface.** The core row owns `tool:win-mb-bash`; each tool description keeps only its own dialect facts. Dead code and stale docs were removed (`attachToolLayer`, unused imports, `graceMs`, terminal internals), package metadata names `terminal`, and the README was trimmed to a bilingual entry point with the detail moved to `docs/`.
+- **Boot-path confinement is bounded and the inject surface is narrower.** Every boot-path `confine()` carries a deadline (8 s fallback); `shellEnv` is probed per call, so a deployment without it loses the managed `$DSH_*` facts rather than the tool; `sandboxPolicy` is injected.
+
+## Bug fixes
+
+- **The shell card no longer collapses to a zero-size row.** The terminal label set was missing `commandLine`, which `TerminalBlock` reads in its header; expanding a card threw and the slot's error boundary replaced the entire entry with an empty anchor. The row now mirrors all fourteen platform labels and uses the seat's `useDisclosure`, so its open state resets with the enclosing Turn.
+- **Ordinary output that merely names a not-settled marker stays a terminal card.** The old probe matched substrings anywhere, so reading this plugin's own source (or a command that printed the marker strings) fell back to the generic INPUT/OUTPUT body; it now matches a whole marker line.
+- **Background calls render the platform's card.** They were excluded early; they now use `TerminalBlock` with `background: true` (header only, no status or output), like `bash`/`pwsh`. The job id stays in the tool result and the job tools, not in the card.
+- **The collapsed row carries the platform's exit capsule** for a non-zero exit or a signal. The prompt cwd follows `resolveTerminalCwd`: a relative workdir joins the session workspace, `.`/`..` are collapsed, a settled `meta.cwd` absolute path wins, and `home` is passed so the home directory shows `~`.
+- **SSH facts are visible where the model reads them.** The host-key policy is emitted in the session form too; a sub-second `connectTimeoutMs` is refused by name instead of rounded; `SIGTSTP`/`SIGHUP` are refused by name; a promoted remote call carries its sandbox fact (stamped on the handle before settlement); a prepared-timeout remote call reports `{ mode, remote: true }` rather than a local `denied: false`; promoted and background results carry no `sandbox` field, matching the base tools.
+- **`terminal` results carry `shell` and `remote`.** Every `send` / `read` / `signal` / `close` / `list` value and its `output.schema` gained both; the session cap counts opens that have started but are not published; `close` waits (bounded by the row's grace) for the outcome its own terminate produced instead of reading `exitCode` the instant `terminate()` resolved.
+- **A numeric field whose text names a different number is reported** (`0x10`, `1e3`, `007`), and one unserviceable row no longer takes the editor down with it: a throw while building one row's Configure page used to skip every contribution registered after it.
+- **Historical release notes that contradicted their tags were corrected** — v0.7.1's live SSH session claim, v0.7.0's sandbox shape and README claims, v0.6.0's roadmap and line counts.
+
+## Compatibility
+
+- **`wsl_bash` is now opt-in.** Enable `win-mb-tool-wsl` on the Plugins page; `git_bash` and `terminal` stay on by default, and `msys2_bash`/`ssh_bash` stay off.
+- **`terminal` results gain `shell` and `remote`** (additive; a consumer validating the old key set exactly must accept the two new keys).
+- **`connectTimeoutMs` below 1000 ms is refused** rather than rounded, because ssh's `ConnectTimeout` is whole seconds. A one-shot call now always sends an explicit `StrictHostKeyChecking` (`yes` by default, `accept-new` when enabled); a `terminal` session keeps the inherited `ask` when the knob is off.
+- **No tool changes name, parameters or foreground result shape.** `ssh_bash` remains opt-in; a promoted result and a background acknowledgement carry no `sandbox` field, as before, now with an explicit assertion.
+
 # dsh-win-multi-bash v0.7.1
 
 ## New
