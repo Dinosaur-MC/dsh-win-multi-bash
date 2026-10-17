@@ -6454,6 +6454,16 @@ console.log('\n[A] unit: repository records (bilingual pair, LF discipline, publ
     }
   })
 
+  test('the README stays an entry point: short, and every docs link resolves', () => {
+    for (const side of ['README.md', 'README.zh.md']) {
+      const text = readFileSync(join(PLUGIN, side), 'utf8')
+      assert.ok(text.length <= 10_000, `${side} must stay under 10,000 characters (got ${text.length})`)
+      const links = [...new Set([...text.matchAll(/docs\/[A-Za-z0-9._/-]+\.md/g)].map((match) => match[0]))]
+      assert.ok(links.length > 0, `${side} must link the documentation set`)
+      for (const link of links) assert.ok(existsSync(join(PLUGIN, link)), `${side} links a missing ${link}`)
+    }
+  })
+
   test('.gitattributes pins LF for every text file', () => {
     const attributes = readFileSync(join(PLUGIN, '.gitattributes'), 'utf8')
     assert.ok(/^\* text=auto eol=lf$/m.test(attributes), 'every text file must be normalized to LF')
