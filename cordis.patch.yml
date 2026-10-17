@@ -49,6 +49,11 @@
 #                         C:\... paths.
 #   win-mb-tool-wsl     — the `wsl_bash` tool, owning its own WslBashExecutor;
 #                         its description carries only the WSL facts.
+#                         **Opt-in**: the row ships disabled (`disabled: true`)
+#                         because a WSL deployment is a second toolchain many
+#                         Windows machines do not have, and probing it at boot
+#                         costs the row's first load. Enable it in the Plugins
+#                         panel to add the tool.
 #   win-mb-tool-msys2   — the `msys2_bash` tool, owning its own Msys2BashExecutor.
 #                         **Opt-in**: the row ships disabled (`disabled: true`)
 #                         and the user enables it. It exists to prove the
@@ -129,7 +134,11 @@
 
     - id: win-mb-tool-wsl
       name: 'dsh-win-multi-bash/tool-wsl-bash'
-      disabled: !!js process.platform !== 'win32'
+      # OPT-IN: only `git_bash` and the interactive terminal row are enabled by
+      # default. A WSL deployment is a second toolchain a machine may not have,
+      # and the row's first load probes it — so the row ships switched OFF and
+      # the user enables it in the Plugins panel.
+      disabled: true
       # Optional per-machine pins and hardening, same shape as the git row:
       #   wslBash:
       #     wslDistro: '<发行版名，如 Ubuntu-24.04>'

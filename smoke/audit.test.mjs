@@ -717,6 +717,9 @@ console.log('\n[A] unit: GitBashExecutor (internals hooks)')
         config: gitConfig({ sandbox: 'auto', probeTimeoutMs: 20000 }),
       })
       ex.internals.probeConfined = async () => true
+      // The dialect learning is not this test's subject (it has its own tests), and
+      // the stubbed `confine` cannot answer the doomed-write probe faithfully.
+      ex.discoverDenialSignature = async () => undefined
       return ex
     }
     const spec = { command: 'echo x', timeoutMs: 30000, stdoutMaxBytes: 4096, workdir: process.cwd() }
@@ -730,6 +733,16 @@ console.log('\n[A] unit: GitBashExecutor (internals hooks)')
     const matched = await (await known.execute(known.resolve(spec))).result()
     assert.equal(matched.sandbox.denied, true, 'a matching signature still reports denied: true')
     assert.ok(!renderResult(matched, []).includes('denial dialect'))
+  })
+  testAsync('the apply-path probe does not learn the denial dialect; the first confined use does', async () => {
+    const ex = bareInstance(GitBashExecutor, { ctx: fakeCtx({ subprocess: fakeSubprocess() }), config: gitConfig() })
+    ex.runConfinedProbe = async () => true
+    const learned = []
+    ex.discoverDenialSignature = async () => { learned.push('learn') }
+    assert.equal(await ex.probeConfinedOnce(), true, 'the capability probe still answers')
+    assert.deepEqual(learned, [], 'the probe runs on the apply path, so it must not learn the dialect there')
+    await ex.confinedUsable()
+    assert.deepEqual(learned, ['learn'], 'the first confined use learns it before the command runs')
   })
   testAsync('execute(): confined path stamps sandbox facts (denied=false)', async () => {
     const ex = bareInstance(GitBashExecutor, {
@@ -1052,43 +1065,46 @@ console.log('\n[A] unit: WslBashExecutor (internals hooks)')
   test('defaultWorkdir() is gone — no consumer compares against a config default any more', () => {
     assert.equal(typeof WslBashExecutor.prototype.defaultWorkdir, 'undefined')
   })
-  test('distro(): an installed wslDistro wins over the probed first entry', () => {
+  testAsync('distro(): an installed wslDistro wins over the probed first entry', async () => {
     const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ wslDistro: 'Pinned' }) })
     ex.internals.probeDistro = () => ['Pinned', 'Ubuntu-24.04']
+    await ex.ensureDistroList()
     assert.equal(ex.distro(), 'Pinned')
   })
   // A3: a pin this host does not have would fail every command with wsl.exe's own
   // error; the row uses the first listed distro at RUNTIME instead and says so once.
-  test('distro(): an uninstalled wslDistro falls back to the first listed one and warns once', () => {
+  testAsync('distro(): an uninstalled wslDistro falls back to the first listed one and warns once', async () => {
     const warnings = []
     const ex = bareInstance(WslBashExecutor, {
       ctx: { logger: { warn: (message) => warnings.push(String(message)) } },
       config: WslBashExecutor.Config({ wslDistro: 'NoSuchDistro' }),
     })
     ex.internals.probeDistro = () => ['Ubuntu-24.04', 'Debian']
+    await ex.ensureDistroList()
     assert.equal(ex.distro(), 'Ubuntu-24.04')
     assert.equal(warnings.length, 1, warnings.join(' | '))
     assert.match(warnings[0], /^bash-wsl: wslBash\.wslDistro "NoSuchDistro" is not installed; falling back to "Ubuntu-24\.04"\.$/)
     ex.distro()
     assert.equal(warnings.length, 1, 'once per row')
   })
-  test('distro(): probe result cached and used', () => {
+  testAsync('distro(): probe result cached and used', async () => {
     let calls = 0
     const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({}) })
     ex.internals.probeDistro = () => { calls += 1; return 'Ubuntu-24.04' }
+    await ex.ensureDistroList()
     assert.equal(ex.distro(), 'Ubuntu-24.04')
     assert.equal(ex.distro(), 'Ubuntu-24.04')
     assert.equal(calls, 1)
   })
-  test('requireBwrapUsable(): auto + failed probe → false (honest degrade)', () => {
+  testAsync('ensureBwrapUsable(): auto + failed probe → false (honest degrade)', async () => {
     const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({}) })
     ex.internals.probeBwrap = () => false
-    assert.equal(ex.requireBwrapUsable(), false)
+    assert.equal(await ex.ensureBwrapUsable(), false)
   })
-  test('requireBwrapUsable(): explicit bwrap + failed probe throws loud', () => {
+  testAsync('ensureBwrapUsable(): explicit bwrap + failed probe throws loud', async () => {
     const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({ sandbox: 'bwrap' }) })
     ex.internals.probeBwrap = () => false
-    assert.throws(() => ex.requireBwrapUsable(), /bwrap was not found/)
+    await assert.rejects(() => ex.ensureBwrapUsable(), /bwrap was not found/)
   })
   testAsync('resolveSandboxMode(): mirrors the sync getter (auto + failed probe → undefined)', async () => {
     const ex = bareInstance(WslBashExecutor, { config: WslBashExecutor.Config({}) })
@@ -5680,7 +5696,10 @@ console.log('\n[B] boot integration: dialect discovery learns this host\'s refus
             ctx,
             config: WslBashExecutor.Config({ wslPath: WSL_EXE }),
           })
-          assert.equal(ex.requireBwrapUsable(), true, 'the functional probe must pass before discovery can run')
+          assert.equal(await ex.ensureBwrapUsable(), true, 'the functional probe must pass before discovery can run')
+          // The dialect is learned on the first confined run (not by the probe), so
+          // this test drives the same step the base's `execute` drives.
+          await ex.ensureDenialDialect()
           assert.equal(typeof ex.denialDiscovery, 'string', 'the WSL path must learn a signature on this host')
           assert.ok(ex.denialDiscovery.length >= 4)
           console.log(`  … learned denial signature: ${JSON.stringify(ex.denialDiscovery)}`)
@@ -5931,13 +5950,13 @@ console.log('\n[B] boot integration: REAL cordis.patch.yml applied as overlay pa
       ['boot with the shipped cordis.patch.yml: insert + !!js tags accepted', async () => {
         const names = ctx.tools.schemas().map((t) => t.name)
         assert.ok(names.includes('git_bash'))
-        assert.ok(names.includes('wsl_bash'))
+        // Only git_bash and the interactive terminal row are on by default; the WSL
+        // row is opt-in (first-load probing is why), so the tool is absent here.
+        assert.ok(!names.includes('wsl_bash'), 'the WSL row is opt-in and must not compose by default')
       }],
       ['tools execute through the real patch composition', async () => {
         const text = await execTool(ctx, 'git_bash', { command: 'echo patch-overlay-ok' })
         assert.match(text, /patch-overlay-ok/)
-        const wsl = await execTool(ctx, 'wsl_bash', { command: 'echo patch-overlay-wsl' })
-        assert.match(wsl, /patch-overlay-wsl/)
       }],
       ['the shipped patch does not leave the shell seat unprovided', async () => {
         assert.ok(ctx.shell !== undefined, 'the base bundle keeps ctx.shell')
