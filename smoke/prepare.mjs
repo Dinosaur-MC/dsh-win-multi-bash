@@ -11,10 +11,12 @@
  * shell out to `cmd /c rmdir`), and no UTF-8 BOM in its source.
  *
  * WHAT IT DOES
- *   1. Links the REAL runtime where the packaged code resolves `@deepseek-ai/*` by real
- *      path, refusing to overwrite anything that is not already the expected link:
+ *   1. Resolves the runtime scope the packaged code resolves `@deepseek-ai/*` from. A
+ *      self-contained install in the checkout wins: `npm ci` reproduces it from
+ *      `package-lock.json`, so it is the pinned tree the gate is meant to exercise. A
+ *      checkout without one borrows the live profile, linked in as before:
  *        <pluginRoot>/node_modules/@deepseek-ai -> <profile>/node_modules/@deepseek-ai
- *        smoke/node_modules/@deepseek-ai        -> the same scope
+ *        smoke/node_modules/@deepseek-ai        -> the scope in force
  *        smoke/node_modules/dsh-win-multi-bash  -> the plugin root
  *   2. Generates the fixtures from `smoke/fixture.template.cordis.yml` into `.temp/smoke/`
  *      (covered by the `.temp` rule in `.gitignore`), substituting the runtime-conditional
@@ -22,8 +24,9 @@
  *   3. Runs the requested entry with this repository Node: the smoke driver (default) or
  *      the audit suite (`audit`).
  *   4. Tears the two `smoke/` links down in a `finally`, removing the link itself and never
- *      anything through it. `<pluginRoot>/node_modules/@deepseek-ai` is NOT removed: it
- *      belongs to the checkout. `--keep-links` skips the teardown when debugging a boot.
+ *      anything through it. The checkout's own `node_modules` is never touched: a junction
+ *      this script created there is left in place, and a self-contained install is left
+ *      exactly as it is. `--keep-links` skips the teardown when debugging a boot.
  *
  * Usage:
  *   node smoke/prepare.mjs               # npm test: driver smoke, default + pinned fixture
@@ -38,11 +41,19 @@ import { resolveBashPath } from '../lib/bash-git/index.js'
 
 const smoke = dirname(fileURLToPath(import.meta.url))
 const pluginRoot = dirname(smoke)
-const runtimeScope = join(process.env.USERPROFILE || process.env.HOME || '', '.dsh', 'profiles', 'node_modules', '@deepseek-ai')
 const nmDir = join(smoke, 'node_modules')
 const linkPlugin = join(nmDir, 'dsh-win-multi-bash')
 const linkScope = join(nmDir, '@deepseek-ai')
 const pluginScope = join(pluginRoot, 'node_modules', '@deepseek-ai')
+const profileScope = join(process.env.USERPROFILE || process.env.HOME || '', '.dsh', 'profiles', 'node_modules', '@deepseek-ai')
+/**
+ * Whether the checkout carries its own `@deepseek-ai` install (a real directory, not the
+ * junction an older checkout got from the live profile). That tree comes from
+ * `npm ci` over package-lock.json, so it is pinned and reproducible — the gate must run
+ * against it rather than against whatever the profile happens to hold today.
+ */
+const selfContained = existsSync(pluginScope) && lstatSync(pluginScope).isDirectory() && !lstatSync(pluginScope).isSymbolicLink()
+const runtimeScope = selfContained ? pluginScope : profileScope
 const fixtureDir = join(pluginRoot, '.temp', 'smoke')
 const keepLinks = process.argv.includes('--keep-links')
 const mode = process.argv.slice(2).find((argument) => !argument.startsWith('-')) || 'driver'
@@ -97,9 +108,10 @@ if (mode !== 'driver' && mode !== 'audit') {
 }
 
 try {
-  // 1. The links. The plugin-root scope belongs to the checkout: created when missing,
-  //    never removed by this script.
-  ensureLink(pluginScope, runtimeScope)
+  // 1. The links. A self-contained install owns the plugin-root scope already, so only a
+  //    checkout that borrows the live profile gets that junction. The smoke links point
+  //    at whichever scope is in force and are removed in the finally below.
+  if (!selfContained) ensureLink(pluginScope, runtimeScope)
   ensureLink(linkPlugin, pluginRoot)
   ensureLink(linkScope, runtimeScope)
 
@@ -114,7 +126,11 @@ try {
   const alpha2Rows = existsSync(join(runtimeScope, 'dsh-working-directory'))
     ? "- id: fs-sandbox\n  name: '@deepseek-ai/dsh-fs-sandbox'\n\n- id: working-directory\n  name: '@deepseek-ai/dsh-working-directory'\n"
     : ''
-  const withRows = template.replaceAll('__ALPHA2_SERVICE_ROWS__', alpha2Rows)
+  // Anchored to the placeholder's own line: the template also mentions it in the header
+  // comment, and a multi-line replacement there would comment out only its first line
+  // and leave the rest as broken YAML (that is exactly how the driver smoke broke once
+  // the self-contained install made these rows non-empty).
+  const withRows = template.replace(/^__ALPHA2_SERVICE_ROWS__$/m, alpha2Rows.replace(/\n$/, ''))
 
   if (mode === 'audit') {
     runEntry('audit suite', [join(smoke, 'audit.test.mjs')])

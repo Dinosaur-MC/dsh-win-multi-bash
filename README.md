@@ -244,6 +244,8 @@ The manual equivalent is the profile's `cordis.patch.yml`: the `insert:` rows th
 
 ## Verification
 
+**Installing the dev runtime.** The checkout resolves `@deepseek-ai/*` from its own `node_modules`, pinned by `package-lock.json`: run `npm ci` once from the package root. That tree is the exact 0.2.1-rc.2 runtime the gate runs against, so a result does not depend on what the live profile happens to hold. A checkout without it falls back to linking the live profile — the arrangement earlier revisions used.
+
 ```bash
 pnpm test
 ```

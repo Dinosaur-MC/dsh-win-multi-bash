@@ -244,6 +244,8 @@ dsh plugin --profile web remove dsh-win-multi-bash
 
 ## 验证
 
+**安装开发运行时。** checkout 从自己的 `node_modules` 解析 `@deepseek-ai/*`，版本由 `package-lock.json` 钉住：在包根目录跑一次 `npm ci`。这棵树就是门禁所跑的 0.2.1-rc.2 运行时，因此结果不依赖 live profile 当下装了什么。没有这棵树时会回落到链接 live profile，也就是早期版本的做法。
+
 ```bash
 pnpm test
 ```
