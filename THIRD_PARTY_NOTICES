@@ -31,6 +31,10 @@ distributed under the MIT License:
 The modules below correspond to the upstream package files they were built
 from; import specifiers were rewired to package-local paths where noted.
 
+Paths are recorded **as of the vendor drop**. The upstream tree has since been
+reorganized (today's sources live under `packages/*/src/*.ts`), so a path in
+this table may no longer resolve in the current upstream repository.
+
 | Plugin path | Upstream package | Notes |
 | --- | --- | --- |
 | `lib/bash-git/` | `packages/shell/bash-git` | `GitBashExecutor`; `@deepseek-ai/dsh-bash-sandbox/helpers` import rewritten to `../vendor/helpers.js` |

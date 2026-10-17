@@ -11,7 +11,7 @@
 ![dialects: MSYS, WSL, MSYS2, SSH](https://img.shields.io/badge/dialects-MSYS%20%7C%20WSL%20%7C%20MSYS2%20%7C%20SSH-4c1.svg)
 [![已收录于 dsh-plugin.org](https://dsh-plugin.org/badges/listed.svg)](https://dsh-plugin.org/plugins/dinosaur-mc/dsh-win-multi-bash)
 
-适用于 DeepSeek Harness 的 Windows multi-bash 插件：`git_bash` / `wsl_bash` 两个模型工具，外加按需开启的 `msys2_bash` 与 `ssh_bash`，各自持有自己的执行器。插件不碰 `ctx.shell` 席位——该席位仍由 dsh 自带的 pwsh 执行器持有——因此 pwsh 行为与未装插件时完全一致。
+适用于 DeepSeek Harness 的 Windows multi-bash 插件：`git_bash` / `wsl_bash` 两个模型工具，外加按需开启的 `msys2_bash` 与 `ssh_bash`（各自持有自己的执行器），以及一个在多次调用之间保持 PTY 会话的 `terminal` 工具。插件不碰 `ctx.shell` 席位——该席位仍由 dsh 自带的 pwsh 执行器持有——因此 pwsh 行为与未装插件时完全一致。
 
 ## 功能一览
 
@@ -140,10 +140,10 @@ wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"   # 验
 - **会话有上限、会被回收、且是进程内的。** `maxSessions`（默认 8）会具名拒绝下一次 `open`；`idleMs`（默认 10 分钟）内没有 `send`/`read`/`signal` 的会话会被终止，之后用它的 id 会被告知"已被空闲回收"，而不是含糊的 unknown。会话**不**跨 `dsh` 重启存活。
 - **会话不是作业。** 它不注册进 `ctx.jobs`，`job_kill` 够不到它：`close` 是唯一的结束方式，空闲回收兜底。
 - **PTY 会话未包裹运行，并且会说。** 文件沙箱包裹的是被 spawn 命令的 argv；终端会话由另一条 provider 调用分配，而在本机上 windows-acl runner 根本起不了 MSYS bash（见上，本机实测 `0xC0000142`），因此没有诚实的办法去包裹它。每次 `open` 都携带该事实；`terminal.allowUnconfined: false` 会让 `open` 直接拒绝而不是无保护运行。若会话的后端效果在远端（SSH 方言），`open` 还会带上 `remote: true` 并在首行说明 —— 那正是这里唯一要紧的事：它碰到的文件根本不在本机；`unconfined` 依旧为真，因为无论哪种后端，PTY 会话都不会被包裹。
-- **本平台上只有 `SIGINT` 能到达 shell，其余四个都会明说。** 本机实测：win32 的 ConPTY 终端 `pid` 恒为 `0`，provider 的前台进程组查询返回同一个 0，而它的 kill 路径首行就是 `if (pid <= 0) return` —— 所以 `SIGTERM` 会**返回成功却什么都没送到**，`SIGKILL` 也因同样原因被 provider 拒绝。本工具因此把 `SIGTERM`/`SIGKILL` **具名拒绝**，而不是返回一个"送到了"的成功；`SIGTSTP`/`SIGHUP` 由 provider 拒绝并原样转达；`SIGINT` 以 Ctrl+C 字节投递，确实能打断前台命令（验证过：打断 `sleep 30` 后会话仍可继续使用）。
+- **本平台上只有 `SIGINT` 能到达 shell，其余四个都会明说。** 本机实测：win32 的 ConPTY 终端 `pid` 恒为 `0`，provider 的前台进程组查询返回同一个 0，而它的 kill 路径首行就是 `if (pid <= 0) return` —— 所以 `SIGTERM` 会**返回成功却什么都没送到**，`SIGKILL` 也因同样原因被 provider 拒绝。本工具因此把 `SIGTERM`/`SIGKILL` **具名拒绝**，而不是返回一个"送到了"的成功；`SIGTSTP`/`SIGHUP` 同样由本工具具名拒绝——provider 对它们只给出自己的原始错误，那会与本工具的信号清单自相矛盾；`SIGINT` 以 Ctrl+C 字节投递，确实能打断前台命令（验证过：打断 `sleep 30` 后会话仍可继续使用）。
 - **两个 provider 事实值得知道。** Windows 上 `pid` 是 `0`（ConPTY），仅供展示；`inspectActivity()` 在那里恒为 `unknown`，所以就绪判定回落到"输出静默" —— 在能作答的 provider 上，`idle` 立即结算，`busy` 会继续等。
 - **SSH 会话是能回答首次连接提问的地方，也是唯一会回收远端的形态。** 用 `shell: ssh_bash` 调 `open`，跑的是 `ssh.exe -t … -- <主机>`、不带 `BatchMode`：真正的 PTY 正是让 ssh 敢于询问未知主机指纹、密码或密钥短语的条件——用 `send` 回答即可。同一个 PTY 也是会话结束时 sshd 回收远端进程组的原因，而单次 `ssh -T` 命令会在客户端被杀之后继续活着（实测，见「沙箱行为」）。两条如实限制：凡经 `send` 键入的内容都会进入工具调用记录，因此请用密钥认证而不是直接敲密码；会话的 `cwd` 是 `ssh.exe` 在本机运行的目录，绝不是远端目录。
-- **默认值是测出来的，不是猜的。** `quietMs` 500 ms 相对实测最坏块间间隔（216 ms，`ls -la /usr/bin | head -80` 跑 18 次）留了约 2.3 倍余量；1 MiB 正是单条 `seq 1 200000` 越过的边界（原生 1,489,391 B；经本插件的转义剥离后剩 1,289,146 B = 1.229 MiB，而环形缓冲计的就是后者），这也让 `truncated` 可被观察到；`waitMs` 10 秒用 40×200 ms 的 ticker 验证过（返回部分输出且会话存活）；启动预算覆盖实测约 460 ms 到首提示符。以上每一项都能在插件面板的行上即时改。
+- **默认值是测出来的，不是猜的。** `quietMs` 500 ms 相对实测最坏块间间隔（216 ms，`ls -la /usr/bin | head -80` 跑 18 次）留了约 2.3 倍余量；1 MiB 正是单条 `seq 1 200000` 越过的边界（原生 1,489,391 B；经本插件的转义剥离后剩 1,289,146 B = 1.229 MiB，而环形缓冲计的就是后者），这也让 `truncated` 可被观察到；`waitMs` 10 秒用 40×200 ms 的 ticker 验证过（返回部分输出且会话存活）；启动预算覆盖实测约 0.5–0.7 s 到首提示符（冷启动首次分配 ConPTY 时最慢）。以上每一项都能在插件面板的行上即时改。
 
 ## 会话行（一次调用在对话里长什么样）
 
@@ -157,7 +157,7 @@ wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"   # 验
 
 ## 运行时配置（插件管理面板）
 
-两个工具行各自携带配置，且每个可配置项都声明了 `.volatile()`——这正是运行时设置服务能够寻址它们的条件。因此 Web 侧栏 **插件** 页可以直接编辑：侧栏打开 **插件** → 打开 `dsh-win-multi-bash` 包 → 每个行都有 **配置** 页。该页由浏览器半边（`lib/client.js`，通过 `dsh.client` 与 `./client` 导出声明）注册进页面的 `plugins.row.config` 槽位，key 为 `dsh-win-multi-bash#<行 id>`；保存经 `settings` / `ctx.configForms` 写入 profile 的 Cordis patch——与手改落点相同，没有自建 HTTP 路由、没有第二份设置文件，也不用碰 YAML。
+每个行各自携带配置——工具行是工具层开关与后端分区，核心行是部署级的自愈开关——且每个可配置项都声明了 `.volatile()`，这正是运行时设置服务能够寻址它们的条件。因此 Web 侧栏 **插件** 页可以直接编辑：侧栏打开 **插件** → 打开 `dsh-win-multi-bash` 包 → 每个行都有 **配置** 页。该页由浏览器半边（`lib/client.js`，通过 `dsh.client` 与 `./client` 导出声明）注册进页面的 `plugins.row.config` 槽位，key 为 `dsh-win-multi-bash#<行 id>`；保存经 `settings` / `ctx.configForms` 写入 profile 的 Cordis patch——与手改落点相同，没有自建 HTTP 路由、没有第二份设置文件，也不用碰 YAML。
 
 这也是接线块要插入**核心行**的原因（`win-mb-plugin`，`name: 'dsh-win-multi-bash'`）：`dsh-client-modules` 发现浏览器半边的方式是把行的**裸包名**解析到其 `package.json` 再读 `dsh.client`（`locatePkgJson` → `exactPackageSpecifier`，对子路径返回 `undefined`）。两个工具行都是子路径，缺了这一行浏览器半边永远不会被服务，行上也就没有任何配置入口。它的模块（`lib/index.js`）就是包 main，同时拥有那段共有提示词小节——**插件本身一行，每个工具一行**。
 
@@ -298,7 +298,7 @@ DSH_AUDIT_SSH_HOST=ubuntu_tx node smoke/prepare.mjs audit
 
 ```
 dsh-win-multi-bash/
-├── package.json            # dsh.bundle + dsh.client 清单；exports 暴露 . ./client ./tool-git-bash ./tool-wsl-bash ./tool-msys2-bash ./tool-ssh-bash
+├── package.json            # dsh.bundle + dsh.client 清单；exports 暴露 . ./client ./factory ./shell-family ./registry ./tool-git-bash ./tool-wsl-bash ./tool-msys2-bash ./tool-ssh-bash ./tool-terminal
 ├── cordis.patch.yml        # 组合接线（即文档）
 ├── .gitattributes          # 所有文本文件 LF，二进制例外
 ├── LICENSE / THIRD_PARTY_NOTICES

@@ -27,21 +27,21 @@
 
 - `pnpm test`: exit 0 — `git_bash`, `wsl_bash` and the base bundle's own `pwsh` seat each ran a real command, and `ctx.shell` stayed with the base bundle.
 - `pnpm run test:audit`: **392 assertions, 0 failures**, twice on the same tree.
-- With `DSH_AUDIT_SSH_HOST` set, the same suite adds the live one-shot round trip and the live SSH session round trip (opt-in, because they need a reachable host and a credential).
+- With `DSH_AUDIT_SSH_HOST` set, the same suite adds the live one-shot round trip (opt-in, because it needs a reachable host and a credential).
 - `npm pack --dry-run`: **30 files, 169,529 B packed** — nothing from `smoke/`, `.temp/` or this file.
 
 # dsh-win-multi-bash v0.7.0
 
 ## New
 
-- **An interactive PTY session tool: `terminal`.** `open` / `send` / `read` / `signal` / `close` / `list` drive a real Git Bash, WSL or MSYS2 session that survives between calls, so a REPL, a debugger or an interactive prompt works where a one-shot command cannot. A session is reclaimed after `idleMs` untouched, output is kept in a bounded ring with truncation reported, and the tool takes **no** `ctx.shell` seat — the base bundle's own pwsh provider stays exactly where it was, which the suite asserts. A PTY session is not sandbox-wrapped, and the row says so in its own result (`sandbox: { mode, unconfined: true }`) instead of implying otherwise.
+- **An interactive PTY session tool: `terminal`.** `open` / `send` / `read` / `signal` / `close` / `list` drive a real Git Bash, WSL or MSYS2 session that survives between calls, so a REPL, a debugger or an interactive prompt works where a one-shot command cannot. A session is reclaimed after `idleMs` untouched, output is kept in a bounded ring with truncation reported, and the tool takes **no** `ctx.shell` seat — the base bundle's own pwsh provider stays exactly where it was, which the suite asserts. A PTY session is not sandbox-wrapped, and the row says so in its own result (flat `sandboxMode` + `unconfined: true` fields) instead of implying otherwise.
 - **A sandbox private temp directory that was removed out of band heals itself, under one switch at the top of the plugin.** `guardSandboxTemp` (default on) is declared once on the package row rather than once per shell row, and the interval beside it (`tempWatchMs`, default 10000 ms) is a live value: a change applies without reloading a row. Healing is deterministic before a wrapped command runs — the engine checks at the call entry **and** again once the sandbox seam returns the argv it is about to spawn — with a timer as the unattended safety net for roots no command is about to use. Nothing is ever deleted: a missing `dsh-<6 alphanumerics>` direct child of an OS temp root is recreated and re-granted.
 
 ## Improvements
 
 - **The unwrapped-run notice is a per-row knob (`sandboxNotice`).** `once` (default) prints the full explanation on a row's first degraded run and then keeps the body silent, so the model's context stops carrying the same paragraph on every call; `always` keeps the short marker on each one. The structured fact `sandbox.unconfined: true` is unchanged for every degraded run.
 - **One verification entry point.** `smoke/prepare.mjs` replaces the two PowerShell bootstrap scripts: it links the profile runtime where the packaged code resolves `@deepseek-ai/*`, writes its fixtures under `.temp/smoke/`, and removes only the links it created. `pnpm test` runs the driver smoke; `pnpm run test:audit` runs the suite.
-- **Docs:** the README (both languages) says where the self-heal switch lives, what its default interval is, and which command runs each verification entry.
+- **Docs:** the README (both languages) says where the self-heal switch lives and which command runs each verification entry.
 
 ## Bug fixes
 
@@ -63,10 +63,10 @@
 ## Improvements
 
 - **A third shell dialect, `msys2_bash`, ships switched off.** It exposes MSYS2's UCRT64 bash as its own model tool — `uname` reports the MSYS runtime rather than Linux, `pacman` is reachable, `$MSYSTEM` is exported — with its own facts in the tool description; its `bash.exe` is discovered under the installation roots the dialect declares, or pinned per machine with `msys2Bash.bashPath`. The row arrives `disabled: true`: enable it in the Plugins page if you want a second toolchain next to Git Bash.
-- **Adding a shell is now one executor file plus one declaration.** Every dialect is declared once — id, tool name, row id, config key, executor class, argv style, executable resolver, sandbox stances, family facts, default-enabled — and the tool modules, the shared prompt section's membership, the row wiring, the config partition and the package exports are all derived from that declaration. The mechanism half moved into a shared executor base, so a new dialect inherits existing behaviour instead of copying it: `lib/bash-git/index.js` **658 → 550 lines**, `lib/bash-wsl/index.js` **571 → 471**.
+- **Adding a shell is now one executor file plus one declaration.** Every dialect is declared once — id, tool name, row id, config key, executor class, argv style, executable resolver, sandbox stances, family facts, default-enabled — and the tool modules, the shared prompt section's membership, the row wiring, the config partition and the package exports are all derived from that declaration. The mechanism half moved into a shared executor base, so a new dialect inherits existing behaviour instead of copying it: `lib/bash-git/index.js` **658 → 544 lines**, `lib/bash-wsl/index.js` **571 → 468**.
 - **A declaration that does not hold together refuses to load.** Five startup checks (unique dialect id / tool name / row id / config key; a `configKey` that does not match the client form partition; a tool name that collides with the family section's name; a sandbox stance list without `auto`; family facts with no shared text) throw at load time instead of leaving a half-wired tool behind. Forgetting a derived surface is a loud failure now, not a silently disabled feature.
 - **A background job keeps the identity of the call that created it.** `jobs.start` now carries `toolCall` (call id and root call id), so dsh's job records name the originating tool call; on a runtime that does not know the field, the plugin drops it and retries once instead of failing the call.
-- **Docs:** the README (both languages) now carries status badges — npm, license, Node, stars, the required dsh version, `platform: windows`, the three dialects — and a *Roadmap (registered, not implemented)* section naming the two next tools (an interactive PTY session and a remote SSH terminal).
+- **Docs:** the README (both languages) now carries status badges — npm, license, Node, stars, the required dsh version, `platform: windows`, the three dialects.
 
 ## Compatibility
 

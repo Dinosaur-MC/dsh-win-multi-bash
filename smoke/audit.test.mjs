@@ -2958,8 +2958,8 @@ console.log('\n[A] unit: sandbox private temp guard (self-heal for the sandbox p
   test('the self-heal switch is listed ONCE, on the package row, never on a tool row', () => {
     assert.deepEqual(TOOL_LAYER_FIELDS.map((knob) => knob.key), ['enableRunInBackground'])
     // The deployment-wide self-heal switch is NOT a tool-layer field any more: it is
-    // declared once on the package row, so no tool row repeats it and no row page
-    // shows it. A row that ever declares its own still wins (the override path).
+    // declared once on the package row, so no tool row repeats it, no row page shows
+    // it, and there is no per-row override left to disagree with it.
     for (const tool of [gitBashTool, wslBashTool]) {
       assert.ok(!(SANDBOX_TEMP_GUARD_KNOB in tool.Config({})), 'a tool row must not carry the deployment-wide switch')
       assert.equal(tool.Config.dict[SANDBOX_TEMP_GUARD_KNOB], undefined, 'and it must not be reachable as a row option either')
@@ -2968,7 +2968,6 @@ console.log('\n[A] unit: sandbox private temp guard (self-heal for the sandbox p
     // rows). The terminal row deliberately does NOT carry it: a PTY session is
     // never wrapped by the sandbox seam, so a switch there would be a control
     // that cannot do anything — the opposite of what this file exists to prevent.
-    const terminalRowId = TERMINAL_ROWS[0].rowId
     for (const row of REGISTRY_ROWS) {
       // THE SWITCH IS LISTED ONCE, on the package row (its own Config): a tool row
       // must not repeat it, because four copies of one deployment-wide knob is
@@ -2977,19 +2976,14 @@ console.log('\n[A] unit: sandbox private temp guard (self-heal for the sandbox p
     }
   })
 
-  test('attachToolLayer(): the row switch decides healing, and not attaching keeps the default', () => {
-    const withKnob = (value) => bareInstance(GitBashExecutor, { config: gitConfig(), toolLayer: { [SANDBOX_TEMP_GUARD_KNOB]: { get: () => value } } })
-    assert.equal(withKnob(true).sandboxTempGuardEnabled, true)
-    assert.equal(withKnob(false).sandboxTempGuardEnabled, false)
+  test('the self-heal switch comes from the package row only: the per-row override is gone', () => {
     const bare = bareInstance(GitBashExecutor, { config: gitConfig() })
     assert.equal(bare.sandboxTempGuardEnabled, SANDBOX_TEMP_GUARD_DEFAULT)
-    const plain = bareInstance(GitBashExecutor, { config: gitConfig() })
-    assert.equal(plain.attachToolLayer({ [SANDBOX_TEMP_GUARD_KNOB]: false }), plain)
-    assert.equal(plain.sandboxTempGuardEnabled, false)
-    plain.attachToolLayer({ [SANDBOX_TEMP_GUARD_KNOB]: true })
-    assert.equal(plain.sandboxTempGuardEnabled, true)
-    plain.attachToolLayer(undefined)
-    assert.equal(plain.sandboxTempGuardEnabled, SANDBOX_TEMP_GUARD_DEFAULT)
+    assert.equal(typeof bare.attachToolLayer, 'undefined', 'the removed override seam must not come back')
+    // Starting the watch is still a chainable, idempotent call on the row's context.
+    const chained = bare.startTempWatch({ effect: () => () => {} })
+    assert.equal(chained, bare)
+    assert.equal(bare.startTempWatch({ effect: () => () => {} }), bare)
   })
 
   assert.ok(Number.isFinite(SANDBOX_TEMP_WATCH_MS) && SANDBOX_TEMP_WATCH_MS >= 1000,

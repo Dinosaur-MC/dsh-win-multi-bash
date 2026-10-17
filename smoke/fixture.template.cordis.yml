@@ -8,7 +8,7 @@
 # gitBash.bashPath explicitly. Single-quoted: double quotes would treat
 # backslashes as escape sequences.
 #
-# __ALPHA2_SERVICE_ROWS__ is substituted by run.ps1: the minimal service chain
+# __ALPHA2_SERVICE_ROWS__ is substituted by smoke/prepare.mjs: the minimal service chain
 # dsh 0.2.1-alpha.2 needs before its own tool-pwsh can activate
 # (fs-sandbox → working-directory → workingDirectory), or an empty string on
 # runtimes that do not ship @deepseek-ai/dsh-working-directory.

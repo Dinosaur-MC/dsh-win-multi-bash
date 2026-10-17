@@ -21,15 +21,15 @@
 #                             tool rows are subpaths, so without this row
 #                             `lib/client.js` is never served and the tool rows
 #                             show no Configure page on the Plugins page.
-#                         (2) It owns the ONE prompt section the two bash tools
-#                             share (`tool:win-mb-bash`, order = midpoint of
-#                             dsh's TOOL_BASH/TOOL_PWSH). Its text is resolved
-#                             per assembly from the tools actually mounted, so
-#                             it says nothing when neither tool is enabled and
-#                             never assumes the other tool — or pwsh — is
-#                             present. Shared guidance lives here once instead
-#                             of once per tool description; each tool
-#                             description keeps only its own dialect facts.
+#                         (2) It owns the ONE prompt section the four family
+#                             tools share (`tool:win-mb-bash`, order = midpoint
+#                             of dsh's TOOL_BASH/TOOL_PWSH). Its text is resolved
+#                             per assembly from the tools actually mounted, so it
+#                             says nothing when no family tool is enabled and
+#                             never assumes another tool — or pwsh — is present.
+#                             Shared guidance lives here once instead of once per
+#                             tool description; each tool description keeps only
+#                             its own dialect facts.
 #                         This is the one row that must not be switched off:
 #                         there is no supported way to mark a third-party row
 #                         read-only (dsh's plugin manager locks only rows from
@@ -90,6 +90,18 @@
     - id: win-mb-plugin
       name: 'dsh-win-multi-bash'
       disabled: !!js process.platform !== 'win32'
+      # The deployment-wide sandbox private-temp self-heal, declared ONCE here
+      # (default ON). It is NOT a tool-row option: one behaviour for the whole
+      # plugin belongs on the row that owns the plugin. With it on, a confined
+      # run whose `--temp` private root (%TEMP%\dsh-<6 alphanumerics>) was
+      # removed out of band recreates that directory and re-applies the seam's
+      # write grant before the runner is spawned; with it off the command fails
+      # exactly as upstream does. `tempWatchMs` is the interval of the
+      # unattended safety net (default 10000 ms). Both are live: a saved value
+      # applies without reloading a row.
+      #   config:
+      #     guardSandboxTemp: false
+      #     tempWatchMs: 10000
 
     - id: win-mb-tool-git
       name: 'dsh-win-multi-bash/tool-git-bash'
@@ -111,14 +123,9 @@
       #     gitBash:
       #       requireSandbox: true
       #
-      # Optional: turn the sandbox private-temp self-heal off for this row
-      # (default ON). With it on, a confined run whose `--temp` private root
-      # (%TEMP%\dsh-<6 alphanumerics>) was removed out of band recreates that
-      # directory and re-applies the seam's write grant before the runner is
-      # spawned; with it off the command fails exactly as upstream does. It is a
-      # TOOL-LAYER knob (a sibling of enableRunInBackground), not a gitBash one:
-      #   config:
-      #     guardSandboxTemp: false
+      # (The sandbox private-temp self-heal is NOT a row option: it is declared
+      # once on the `win-mb-plugin` core row's own config, at the top of this
+      # file, because it is one behaviour for the whole plugin.)
 
     - id: win-mb-tool-wsl
       name: 'dsh-win-multi-bash/tool-wsl-bash'
