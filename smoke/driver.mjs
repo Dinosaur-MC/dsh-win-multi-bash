@@ -3,18 +3,37 @@
  * Smoke driver for the dsh-win-multi-bash plugin rows: boot the real app boot
  * path over the real runtime packages with the plugin's exact rows, verify the
  * git_bash / wsl_bash tools are registered, then execute one real command
- * through each and through the base bundle's own `ctx.shell` seat, and print a
- * JSON report. Same boot pattern as the harness's own windows-loader smoke
- * spec.
+ * through each AVAILABLE tool and through the base bundle's own `ctx.shell`
+ * seat, and print a JSON report. Same boot pattern as the harness's own
+ * windows-loader smoke spec.
+ *
+ * A `wsl.exe` on disk is not a usable WSL: GitHub-hosted Windows images install
+ * WSL without a distribution. The driver still proves the row registered and
+ * advertises its facts, but it can only run a real WSL command when a default
+ * distribution actually answers; otherwise the run is reported as a skip.
  *
  * Usage: node driver.mjs <fixture.yml>
  */
+
+import { spawnSync } from 'node:child_process'
 
 import { boot, resolveConfigPath } from '@deepseek-ai/dsh-app-boot'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 
 const configPath = process.argv[2]
 if (!configPath) throw new Error('usage: node driver.mjs <fixture.yml>')
+
+/** A default distribution that actually answers — not merely a launcher on disk. */
+function hasUsableWsl() {
+  try {
+    const launcher = process.env.DSH_AUDIT_WSL ?? 'wsl.exe'
+    return spawnSync(launcher, ['-e', 'true'], { timeout: 30000, stdio: 'ignore' }).status === 0
+  } catch {
+    return false
+  }
+}
+
+const wslUsable = hasUsableWsl()
 
 const ctx = await boot('dsh-win-multi-bash-smoke', resolveConfigPath(configPath, undefined))
 try {
@@ -34,6 +53,8 @@ try {
     // seat, so the base bundle's pwsh executor — and with it every plugin that
     // injects `shell` — must still be alive while our rows are loaded.
     shellSeatPresent: ctx.shell !== undefined,
+    wslUsable,
+    skips: [],
     runs: {},
   }
 
@@ -57,7 +78,12 @@ try {
   }
 
   await runTool('git_bash', 'echo git-bash-ok', 'smoke-git-bash')
-  await runTool('wsl_bash', 'echo wsl-ok', 'smoke-wsl-bash')
+  if (wslUsable) {
+    await runTool('wsl_bash', 'echo wsl-ok', 'smoke-wsl-bash')
+  } else {
+    report.skips.push('wsl_bash: no usable WSL distribution; registration and description were still asserted')
+    console.log('… skipping wsl_bash real command: no usable WSL distribution on this host')
+  }
 
   // The base bundle's seat: resolved and executed exactly as dsh's own
   // tool-pwsh would, proving our rows left `ctx.shell` intact.

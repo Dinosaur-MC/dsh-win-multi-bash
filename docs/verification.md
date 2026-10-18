@@ -24,6 +24,8 @@ Boots a real composition over the profile runtime (modifying nothing), verifies 
 
 It is a **verdict, not a report**: a missing tool, a wrong description, a lost `ctx.shell` seat or a failed command fails the run. The fixture whose git row is disabled is used to prove the missing-tool case actually fails.
 
+On a host where `wsl.exe` exists but no distribution answers (the GitHub-hosted Windows image installs WSL this way), the driver still asserts the `wsl_bash` row is registered and advertises its facts, but reports the real-WSL command as a skip instead of failing the verdict. Both entries accept `DSH_AUDIT_WSL` to point the probe at a non-default launcher.
+
 ## `pnpm run test:audit` — the audit
 
 ```bash
@@ -35,6 +37,12 @@ Runs the full audit instead: pure-unit coverage of the vendor helpers, executor 
 The suite also covers the SSH dialect end to end without a network: argv shape and option order, target validation (leading `-`, whitespace/control characters make option injection impossible), client resolution and the stale-pin fallback, the `sandbox: { mode, remote: true }` fact and the *absence* of `denied` / `enforcement` / `unconfined`, the rendered marker, `requireSandbox` failing closed, the session row's derived shell list and its `remote` fact, and the family section's remote gating. One boot case runs the real tool against `192.0.2.1` (TEST-NET-1, guaranteed unroutable), so the whole spawn → result → schema → render path is exercised with no server.
 
 The audit **announces and counts its skips**; an escaped assertion reports the case and prints the summary instead of killing the suite without a verdict. `DSH_AUDIT_TIMING=1` attributes the wall clock.
+
+The suite also probes the default WSL distribution functionally. When one is missing it skips and counts the WSL execution cases and the real-WSL degradation fixtures, while the WSL schema, argv and prompt cases still run.
+
+## GitHub Actions
+
+`.github/workflows/ci.yml` runs on `windows-latest` for Node 22.x and 24.x: `npm ci`, the driver smoke, the full audit and `npm pack --dry-run`. Hosted runners have WSL installed without a distribution, so the audit skips the WSL execution cases it cannot run; Git Bash, the PTY/ConPTY path and the rest of the suite are hard gates.
 
 ## Live SSH round trip (opt-in)
 
@@ -48,4 +56,4 @@ That boots the real SSH row with the real `ssh.exe` and runs `uname -sr; echo SS
 
 ## What `smoke/prepare.mjs` does
 
-Both entries run the same Node bootstrap: it links the profile runtime into `smoke/node_modules` (refusing to touch anything that is not already the expected link), writes its fixtures under `.temp/smoke/`, and removes only the links it created. The `bashPath` it pins comes from the plugin's own resolver in `lib/`, never a hardcoded path.
+Both entries run the same Node bootstrap: it links the runtime scope in force (the checkout's pinned `node_modules`, or the live profile when the checkout has none) into `smoke/node_modules`, refusing to touch anything that is not already the expected link, writes its fixtures under `.temp/smoke/`, and removes only the links it created. The `bashPath` it pins comes from the plugin's own resolver in `lib/`, never a hardcoded path.

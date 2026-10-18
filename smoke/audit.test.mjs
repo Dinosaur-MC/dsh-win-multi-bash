@@ -38,7 +38,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpath
 function removeFixtureDir(dir) {
   rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 })
 }
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -266,6 +266,35 @@ const WSL_EXE = process.env.DSH_AUDIT_WSL ?? 'C:\\Windows\\System32\\wsl.exe'
 // degrades at all: it falls back at runtime, by design.)
 const BROKEN_WSL = process.execPath
 const HAS_WSL = existsSync(WSL_EXE)
+
+/**
+ * A launcher on disk is not a usable WSL: GitHub-hosted Windows images install
+ * WSL without a distribution. Probe the default distribution functionally once;
+ * every case that needs a real bash skips (and counts the skip) when it fails,
+ * while the schema/argv cases that merely mention wsl.exe still run.
+ */
+const HAS_WSL_DISTRO = HAS_WSL && (() => {
+  try {
+    return spawnSync(WSL_EXE, ['-e', 'true'], { timeout: 30000, stdio: 'ignore' }).status === 0
+  } catch {
+    return false
+  }
+})()
+
+// The boot matrix needs this host's checkout and home, plus their MSYS/WSL
+// forms. Derive them instead of spelling a developer's machine into the gate:
+// GitHub-hosted runners use `runneradmin` and check out under `D:\a\...`.
+const REPO_ROOT = join(__dirname, '..')
+const HOME_ROOT = homedir()
+const HOME_NAME = basename(HOME_ROOT)
+const auditEscapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const HOME_PWD = new RegExp(auditEscapeRegExp(HOME_NAME), 'i')
+const drivePath = (value, wsl) => value
+  .replace(/^([A-Za-z]):[\\/]/, (_, letter) => (wsl ? '/mnt/' : '/') + letter.toLowerCase() + '/')
+  .replaceAll('\\', '/')
+const HOME_MSYS = drivePath(HOME_ROOT, false)
+const HOME_WSL = drivePath(HOME_ROOT, true)
+const REPO_WSL = drivePath(REPO_ROOT, true)
 
 // ═════════════════════════════════════════════════════════════════════════════
 // A) Unit tests
@@ -1177,8 +1206,8 @@ console.log('\n[A] unit: WslBashExecutor (internals hooks)')
       sandboxPolicy: { mode: 'read-only', workspaceRoot: '\\\\server\\share\\x' },
     }), /unsupported Windows path/)
   })
-  if (!HAS_WSL) {
-    skip('  … skipping real-spawn WSL tests: no wsl.exe on this host')
+  if (!HAS_WSL_DISTRO) {
+    skip('  … skipping real-spawn WSL tests: no usable WSL distribution on this host')
   } else {
   testAsync('execute(): an explicitly unconfined wsl run reports the fact (sandbox: none)', async () => {
     const ex = bareInstance(WslBashExecutor, {
@@ -1716,7 +1745,14 @@ async function bootFixture(extraRows, name = 'fixture.yml', patches = undefined)
  * finally disposes the ctx (testAsync alone returns a promise immediately).
  */
 async function runTests(ctx, tests) {
-  const jobs = tests.map(([name, fn]) => testAsync(name, fn))
+  // A distro-less launcher can register wsl_bash but cannot execute it; the
+  // GitHub-hosted Windows image ships exactly that. Skip only the cases that
+  // actually call wsl_bash; schema/argv/prompt cases still run.
+  const runnable = HAS_WSL_DISTRO ? tests : tests.filter(([name]) => !/^wsl_bash:\s/.test(name))
+  if (runnable.length !== tests.length) {
+    skip(`  … skipping ${tests.length - runnable.length} wsl_bash case(s): no usable WSL distribution on this host`)
+  }
+  const jobs = runnable.map(([name, fn]) => testAsync(name, fn))
   await Promise.all(jobs)
 }
 
@@ -5266,19 +5302,19 @@ console.log('\n[B] boot integration: default fixture (pinned via probed bash)')
         assert.ok(elapsed < 8000, `took ${elapsed}ms`)
       }],
       ['git_bash: workdir honored (absolute)', async () => {
-        const text = await execTool(ctx, 'git_bash', { command: 'pwd', workdir: 'C:\\Users\\Dinos' })
-        assert.match(text, /Dinos/)
+        const text = await execTool(ctx, 'git_bash', { command: 'pwd', workdir: HOME_ROOT })
+        assert.match(text, HOME_PWD)
       }],
       ['git_bash: MSYS-drive workdir translated, not passed to spawn as cwd', async () => {
         // Regression guard: `/c/...` is absolute to node:path but resolves to
         // `G:\c\...` in Windows, so spawn used to fail with `spawn bash.exe
         // ENOENT` — a missing-shell symptom for what is really a bad cwd.
-        const text = await execTool(ctx, 'git_bash', { command: 'pwd', workdir: '/c/Users/Dinos' })
-        assert.match(text, /Dinos/)
+        const text = await execTool(ctx, 'git_bash', { command: 'pwd', workdir: HOME_MSYS })
+        assert.match(text, HOME_PWD)
       }],
       ['git_bash: WSL automount workdir translated (same guard)', async () => {
-        const text = await execTool(ctx, 'git_bash', { command: 'pwd', workdir: '/mnt/c/Users/Dinos' })
-        assert.match(text, /Dinos/)
+        const text = await execTool(ctx, 'git_bash', { command: 'pwd', workdir: HOME_WSL })
+        assert.match(text, HOME_PWD)
       }],
       ['git_bash: workdir relative resolved against session workspace', async () => {
         const text = await execTool(ctx, 'git_bash', { command: 'pwd', workdir: 'smoke' })
@@ -5361,14 +5397,14 @@ console.log('\n[B] boot integration: default fixture (pinned via probed bash)')
         assert.match(text, /\[stderr\]\nerr-line/)
       }],
       ['wsl_bash: workdir translated by wsl --cd', async () => {
-        const text = await execTool(ctx, 'wsl_bash', { command: 'pwd', workdir: 'G:\\LAB\\202608\\dsh-win-multi-bash' })
-        assert.match(text, /\/mnt\/g\/LAB\/202608\/dsh-win-multi-bash/)
+        const text = await execTool(ctx, 'wsl_bash', { command: 'pwd', workdir: REPO_ROOT })
+        assert.ok(text.includes(REPO_WSL), `expected ${REPO_WSL}, got: ${text}`)
       }],
       ['wsl_bash: automount workdir translated, not passed to spawn as cwd', async () => {
-        // Same guard as git_bash: `/mnt/g/...` is a valid `--cd` value but an
-        // impossible process cwd, so it must be normalized before spawn.
-        const text = await execTool(ctx, 'wsl_bash', { command: 'pwd', workdir: '/mnt/g/LAB/202608/dsh-win-multi-bash' })
-        assert.match(text, /\/mnt\/g\/LAB\/202608\/dsh-win-multi-bash/)
+        // Same guard as git_bash: a `/mnt/<drive>/...` workdir is a valid `--cd`
+        // value but an impossible process cwd, so it must be normalized before spawn.
+        const text = await execTool(ctx, 'wsl_bash', { command: 'pwd', workdir: REPO_WSL })
+        assert.ok(text.includes(REPO_WSL), `expected ${REPO_WSL}, got: ${text}`)
       }],
       ['wsl_bash: auto-cds to the session dir when no workdir is given', async () => {
         // The auto-cd contract: with no explicit workdir the command still
@@ -5528,7 +5564,7 @@ console.log('\n[B] boot integration: an auto-degraded sandbox reports `unconfine
 - id: win-mb-tool-wsl
   name: 'dsh-win-multi-bash/tool-wsl-bash'${extra}
 `
-  const WSL_BWRAP_OK = HAS_WSL && (() => {
+  const WSL_BWRAP_OK = HAS_WSL_DISTRO && (() => {
     const probe = spawnSync(WSL_EXE, [
       '-e', 'bwrap', '--ro-bind', '/', '/', '--dev', '/dev', '--unshare-pid',
       '--proc', '/proc', '--die-with-parent', '--', '/bin/true',
@@ -5545,8 +5581,8 @@ console.log('\n[B] boot integration: an auto-degraded sandbox reports `unconfine
   const rawText = (result) => (result.content ?? [])
     .filter((block) => block.type === 'text').map((block) => block.text).join('').replace(/\r\n/g, '\n')
 
-  if (!HAS_WSL) {
-    skip('  … skipping unconfined fixture: no wsl.exe on this host')
+  if (!HAS_WSL_DISTRO) {
+    skip('  … skipping unconfined fixture: no usable WSL distribution on this host')
   } else {
     let ctx
     try {
@@ -5643,8 +5679,8 @@ console.log('\n[B] boot integration: an auto-degraded BACKGROUND job says so in 
     arguments: { description: 'audit background fact', ...args },
   })).value
 
-  if (!HAS_WSL) {
-    skip('  … skipping background-unconfined fixture: no wsl.exe on this host')
+  if (!HAS_WSL_DISTRO) {
+    skip('  … skipping background-unconfined fixture: no usable WSL distribution on this host')
   } else {
     // Each fixture below is used by ONE test that sequences its own calls: the
     // row-scoped first-time latch makes call ORDER observable, and `runTests`
@@ -5806,8 +5842,8 @@ console.log('\n[B] boot integration: dialect discovery learns this host\'s refus
   const labParent = dirname(labRoot)
   const leftovers = () => readdirSync(labParent).filter((name) => name.startsWith('.dsh-denial-probe-'))
 
-  if (!HAS_WSL) {
-    skip('  … skipping discovery fixture: no wsl.exe on this host')
+  if (!HAS_WSL_DISTRO) {
+    skip('  … skipping discovery fixture: no usable WSL distribution on this host')
   } else {
     let ctx
     try {
@@ -6382,6 +6418,10 @@ console.log('\n[B] boot integration: misconfiguration matrices')
 `, 'bad-distro.yml')
     await runTests(ctx2, [
       ['nonexistent wslDistro surfaces as a failed command, not a crash', async () => {
+        if (!HAS_WSL_DISTRO) {
+          skip('  … skipping bad-distro case: no usable WSL distribution on this host')
+          return
+        }
         const r = await execToolResult(ctx2, 'wsl_bash', { command: 'echo x' })
         assert.ok(r.text.length > 0)
       }],
@@ -6419,6 +6459,10 @@ console.log('\n[B] boot integration: misconfiguration matrices')
         assert.match(text, /still-works/)
       }],
       ['#3: explicit bwrap never runs wsl_bash unconfined', async () => {
+        if (!HAS_WSL_DISTRO) {
+          skip('  … skipping explicit-bwrap WSL case: no usable WSL distribution on this host')
+          return
+        }
         const names = ctx3.tools.schemas().map((t) => t.name)
         if (!names.includes('wsl_bash')) return // row deactivated loud: bwrap absent in the distro
         const r = await execToolResult(ctx3, 'wsl_bash', { command: 'echo x' })
