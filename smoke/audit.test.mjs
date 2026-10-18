@@ -2211,10 +2211,14 @@ console.log('\n[A] unit + [B] boot: the MSYS2 dialect end to end (S3)')
           assert.match(out, /TOOLCHAIN=\/(?:usr\/)?bin\/pacman/, out)
           assert.doesNotMatch(out, /fatal error/i)
         }],
-        ['msys2_bash carries the MSYS drive form and converts a Windows workdir', async () => {
-          const out = await execTool(ctx, 'msys2_bash', { command: 'pwd; echo "DRIVE=$(pwd | cut -c2)"', workdir: process.cwd() })
-          assert.match(out, /^\/[a-z]\//m, `workdir must arrive in MSYS drive form: ${out}`)
-          assert.match(out, /DRIVE=[a-z]/, out)
+        ['msys2_bash honors a Windows workdir (MSYS or native drive spelling)', async () => {
+          // GitHub-hosted runners check out on D:, where MSYS2 may print `D:/a/...`
+          // instead of `/d/a/...`; the contract is that the workdir is honored,
+          // not that the shell chooses one spelling over the other.
+          const out = await execTool(ctx, 'msys2_bash', { command: 'pwd', workdir: process.cwd() })
+          const actual = out.trim().split(/\r?\n/).find((line) => line.trim().length > 0) ?? ''
+          const normalize = (value) => value.trim().replaceAll('\\', '/').replace(/^([A-Za-z]):\//, (_, drive) => '/' + drive.toLowerCase() + '/')
+          assert.equal(normalize(actual), normalize(process.cwd()), `workdir must be honored: ${out}`)
         }],
         ['msys2_bash survives a non-ASCII workdir (and reads a file there)', async () => {
           // `.temp` is gitignored, so it is absent in a fresh clone and in every
