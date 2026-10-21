@@ -32,7 +32,7 @@ On a host where `wsl.exe` exists but no distribution answers (the GitHub-hosted 
 pnpm run test:audit
 ```
 
-Runs the full audit instead: pure-unit coverage of the vendor helpers, executor internals and tool config schemas, the browser half's form model, and boot-integration matrices for the real `cordis.patch.yml` and for misconfigurations (a stale pinned `bashPath`, a broken WSL backend, a nonexistent `wslDistro`, an explicit `bwrap` stance).
+Runs the full audit instead: pure-unit coverage of the vendor helpers, executor internals and tool config schemas, the browser half's form model, the client entry's export surface and the manifest's `engines.dsh` window, and boot-integration matrices for the real `cordis.patch.yml` and for misconfigurations (a stale pinned `bashPath`, a broken WSL backend, a nonexistent `wslDistro`, an explicit `bwrap` stance).
 
 The suite also covers the SSH dialect end to end without a network: argv shape and option order, target validation (leading `-`, whitespace/control characters make option injection impossible), client resolution and the stale-pin fallback, the `sandbox: { mode, remote: true }` fact and the *absence* of `denied` / `enforcement` / `unconfined`, the rendered marker, `requireSandbox` failing closed, the session row's derived shell list and its `remote` fact, and the family section's remote gating. One boot case runs the real tool against `192.0.2.1` (TEST-NET-1, guaranteed unroutable), so the whole spawn → result → schema → render path is exercised with no server.
 

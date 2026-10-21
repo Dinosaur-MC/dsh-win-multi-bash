@@ -4081,6 +4081,12 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
   // plain element objects, and the card is a pure function of its injected
   // store — so the whole page contract is exercised without a renderer.
   const registrations = []
+  /**
+   * The bundle keeps implementation values off its export surface (the official
+   * /client entry rule) and hands them to the audit through a test-only global.
+   */
+  let clientInternals
+  globalThis.__dshWinMbClientTest__ = (value) => { clientInternals = value }
   const previousWindow = globalThis.window
   globalThis.window = { __ModuleLoader__: { load: (entry) => registrations.push(entry) } }
   try {
@@ -4100,6 +4106,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
       return { SettingsForm: 'SettingsForm', SettingsValueField: 'SettingsValueField', Checkbox: 'Checkbox', SegmentedControl: 'SegmentedControl', Button: 'Button', DisclosureRow: 'DisclosureRow', TextShimmer: 'TextShimmer', IconApiOutlineRegular: 'IconApiOutlineRegular', IconInspectOutlineRegular: 'IconInspectOutlineRegular', TerminalBlock: 'TerminalBlock' }
     throw new Error(`unexpected client require: "${id}"`)
   })
+  const internals = clientInternals
   /**
    * A stand-in for the platform context: every service is reachable through
    * `ctx.get(name)`, which is the probe API the browser half uses for the one
@@ -4108,10 +4115,19 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
    */
   const applyWithProbes = (ctx) => client.apply(Object.assign({ get: (name) => ctx[name] }, ctx))
 
-  const { ROWS, rowKey, planOps, RowConfigForm, RowConfigCard, en, zh, SHELL_TOOL_NAMES, TERMINAL_TOOL_NAME, ToolCard, toolCardBody, toolCardIo, terminalBody, terminalLabels, cardTitle, shellCard, shellExitLabel, shellStatus, displayCwd, normalizeSegments, cardSummary, cardState, cardOutput, cardInput } = client.__internals
+  const { ROWS, rowKey, planOps, RowConfigForm, RowConfigCard, en, zh, SHELL_TOOL_NAMES, TERMINAL_TOOL_NAME, ToolCard, toolCardBody, toolCardIo, terminalBody, terminalLabels, cardTitle, shellCard, shellExitLabel, shellStatus, displayCwd, normalizeSegments, cardSummary, cardState, cardOutput, cardInput } = internals
+
+  test('the client entry exports exactly the platform plugin triple', () => {
+    // Official package-surface rule: a /client entry must not export implementation
+    // values or test conveniences. The shell reads only these three members.
+    assert.deepEqual(Object.getOwnPropertyNames(client).sort(), ['apply', 'inject', 'name'])
+    assert.equal(client.name, 'dsh-win-multi-bash')
+    assert.equal(client.__internals, undefined, 'the helpers must not ride on the export surface')
+    assert.equal(typeof internals.shellCard, 'function', 'they are still reachable through the test seam')
+  })
 
   test('it declares the client services the page needs', () => {
-    assert.equal(client.NS, 'settings.win-mb-bash')
+    assert.equal(internals.NS, 'settings.win-mb-bash')
     assert.ok(Array.isArray(client.inject))
     // `configForms` stays injected. Probing it was tried and reverted: the only
     // provider of `locale` (dsh-client-locale) itself injects configForms before
@@ -4167,7 +4183,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
         rowId + ': the page must list exactly the knobs the Host serves, in schema order')
     }
     // The core row's two switches are the same contract — they are what the bundle card edits.
-    const { CORE_ROW } = client.__internals
+    const { CORE_ROW } = internals
     assert.deepEqual(CORE_ROW.fields.map((knob) => knob.path.join('.')), volatilePaths(packageRow.Config))
   })
 
@@ -4501,12 +4517,12 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
       effect: (callback) => callback(),
     }
     applyWithProbes(ctx)
-    assert.deepEqual(localeRegistrations.map((entry) => entry.ns), [client.NS])
+    assert.deepEqual(localeRegistrations.map((entry) => entry.ns), [internals.NS])
     assert.ok(localeRegistrations[0].dict.en && localeRegistrations[0].dict.zh)
     const pages = slotRegistrations.filter((entry) => entry.options.name === 'plugins.row.config')
     assert.deepEqual(pages.map((entry) => entry.options.key), REGISTRY_ROWS.map((row) => rowKey(row.rowId)))
     for (const entry of pages) {
-      assert.equal(entry.options.locale, client.NS)
+      assert.equal(entry.options.locale, internals.NS)
       assert.equal(entry.component, RowConfigCard)
       assert.equal(typeof entry.options.inject().hooks.rowForm.getSnapshot, 'function')
     }
@@ -4515,11 +4531,11 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     // The bundle seat comes first, under both candidate keys; then the note. No
     // `settings.section` entry: that surface showed the same form a second time.
     assert.deepEqual(detail.map((entry) => entry.options.name), ['plugins.bundle.config', 'plugins.bundle.config', 'plugins.detail.section'])
-    assert.deepEqual(detail.slice(0, 2).map((entry) => entry.options.key), [client.__internals.CORE_ROW_ID, 'dsh-win-multi-bash'])
+    assert.deepEqual(detail.slice(0, 2).map((entry) => entry.options.key), [internals.CORE_ROW_ID, 'dsh-win-multi-bash'])
     assert.equal(detail[0].component, RowConfigCard)
     assert.equal(typeof detail[0].options.inject().hooks.rowForm.getSnapshot, 'function')
     for (const entry of detail.slice(2)) {
-      assert.equal(entry.options.locale, client.NS)
+      assert.equal(entry.options.locale, internals.NS)
       assert.equal(entry.options.id, 'dsh-win-multi-bash:core')
     }
   })
@@ -4539,7 +4555,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     const rows = slotRegistrations.filter((entry) => entry.options.name === 'tool.call.toolview')
     assert.deepEqual(rows.map((entry) => entry.options.key), [...SHELL_TOOL_NAMES, TERMINAL_TOOL_NAME])
     for (const entry of rows) {
-      assert.equal(entry.options.locale, client.NS)
+      assert.equal(entry.options.locale, internals.NS)
       assert.equal(entry.options.priority, undefined, 'a key nobody else registers needs no priority')
       assert.equal(entry.component, ToolCard)
     }
@@ -4802,6 +4818,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
         return { DisclosureRow: 'DisclosureRow', TextShimmer: 'TextShimmer', IconApiOutlineRegular: 'IconApiOutlineRegular', IconInspectOutlineRegular: 'IconInspectOutlineRegular' }
       throw new Error('unexpected client require: ' + id)
     })
+    const partialInternals = clientInternals
     partial.apply({
       locale: { register: () => () => {}, bind: () => (key) => key },
       configForms: { get: () => fakeScope(), whileServed: (names, callback) => { callback(new Set(names)); return () => {} } },
@@ -4811,7 +4828,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.equal(slotRegistrations.filter((entry) => entry.options.name === 'tool.call.toolview').length, SHELL_TOOL_NAMES.length + 1, 'the rows are still registered')
     const argsRaw = JSON.stringify({ command: 'ls' })
     const block = { kind: 'result', call: { argsRaw }, content: [{ type: 'text', text: 'out' }], isError: false }
-    assert.equal(partial.__internals.shellCard({ toolName: 'git_bash', block }, argsRaw, 'out'), null, 'without the primitive the body falls back to the ioCard')
+    assert.equal(partialInternals.shellCard({ toolName: 'git_bash', block }, argsRaw, 'out'), null, 'without the primitive the body falls back to the ioCard')
   })
 
   test('with the Host serving nothing, no Configure page is registered (the gate itself is pinned)', () => {
@@ -4900,7 +4917,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     // string lib/client.js builds, so renaming the package would have left this
     // green while every slot key silently stopped matching. The manifest is the
     // one authority; the key format (`<bundle>#<rowId>`) is the platform's.
-    const { PACKAGE_NAME } = client.__internals
+    const { PACKAGE_NAME } = internals
     const manifestName = JSON.parse(readFileSync(join(PLUGIN, 'package.json'), 'utf8')).name
     assert.equal(PACKAGE_NAME, manifestName, 'the browser half must key off the manifest name')
     for (const rowId of ROWS.map((row) => row.rowId))
@@ -4913,7 +4930,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
   // guard goes red (self-proof: .temp/review/client-fix-verify.mjs --mutate).
 
   await testAsync('a save is fenced by the revision its drafts were read at, not the latest one', async () => {
-    const { RowConfigForm, ROWS } = client.__internals
+    const { RowConfigForm, ROWS } = internals
     let revision = 7
     let snapshot = {
       status: 'ready', writable: true, revision,
@@ -4948,7 +4965,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
   })
 
   await testAsync('a save writes only the fields a draft actually changes', async () => {
-    const { RowConfigForm, ROWS } = client.__internals
+    const { RowConfigForm, ROWS } = internals
     // Resolved section: sandbox 'auto', probeTimeoutMs 10000, enableRunInBackground true.
     const scope = fakeScope()
     const form = new RowConfigForm(scope, ROWS[0])
@@ -4967,7 +4984,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
   })
 
   test('the stylesheet is an effect, and unloading the plugin reclaims it', () => {
-    const { installStyles, PACKAGE_NAME, STYLE_ID } = client.__internals
+    const { installStyles, PACKAGE_NAME, STYLE_ID } = internals
     const head = { children: [], appendChild(node) { head.children.push(node) } }
     const documentStub = {
       head,
@@ -5014,7 +5031,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
   })
 
   test('RowConfigCard calls the row-form hook before its view branch', () => {
-    const { RowConfigCard, RowConfigForm, ROWS } = client.__internals
+    const { RowConfigCard, RowConfigForm, ROWS } = internals
     const form = new RowConfigForm(fakeScope(), ROWS[0])
     const state = form.project()
     let hookCalls = 0
@@ -5033,7 +5050,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
   // Q2-G2-2 客户端侧：slot key 只有一份拼写（行为相同，故只能查源码）
   test('the slot key has one spelling: PACKAGE_NAME, not a second literal', () => {
     const source = readFileSync(join(PLUGIN, 'lib', 'client.js'), 'utf8')
-    assert.equal(rowKey('win-mb-tool-git'), `${client.__internals.PACKAGE_NAME}#win-mb-tool-git`)
+    assert.equal(rowKey('win-mb-tool-git'), `${internals.PACKAGE_NAME}#win-mb-tool-git`)
     assert.ok(!source.includes('dsh-win-multi-bash#'), 'the key must be built as `${PACKAGE_NAME}#${rowId}`')
   })
 
@@ -5041,7 +5058,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     // The second save would carry the baseline the first one already spent; the
     // Host refuses that stale fence and the refusal would raise a failure banner
     // over drafts the first save cleared — nothing left for the user to correct.
-    const { RowConfigForm, ROWS } = client.__internals
+    const { RowConfigForm, ROWS } = internals
     let revision = 7
     const waiters = []
     const calls = []
@@ -5078,7 +5095,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
   test('the stylesheet installer survives a host with no head (Q2-A1)', () => {
     // `installStyles` runs inside `ctx.effect`: a throw here takes both Configure
     // pages, the core-row badge and the note down with it.
-    const { installStyles } = client.__internals
+    const { installStyles } = internals
     const head = { children: [], appendChild(node) { head.children.push(node) } }
     const documentStub = { // deliberately no `head`
       createElement(tag) {
@@ -5111,7 +5128,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
   await testAsync('an unknown key stages nothing, in edit and resetField alike (Q2-A2)', async () => {
     // The phantom draft is inert on the public surface (planOps ignores it and
     // `dirty` stays false), so this guard has to read the staged map.
-    const { RowConfigForm, ROWS } = client.__internals
+    const { RowConfigForm, ROWS } = internals
     const scope = fakeScope()
     const form = new RowConfigForm(scope, ROWS[0])
     form.edit('gitBash.nonexistent', 'x')
@@ -6542,6 +6559,13 @@ console.log('\n[A] unit: repository records (bilingual pair, LF discipline, publ
     assert.ok(existsSync(join(PLUGIN, 'smoke/prepare.mjs')), 'the Node bootstrap must exist')
     assert.equal(manifest.scripts.test, 'node smoke/prepare.mjs', 'npm test must run the Node bootstrap')
     assert.equal(manifest.scripts['test:audit'], 'node smoke/prepare.mjs audit', 'and so must the audit entry')
+  })
+
+  test('the manifest declares the DSH range it supports', () => {
+    // Official rule: an own engines.dsh decides compatibility alone; a missing one
+    // falls back to the @deepseek-ai/dsh* peers. The declared window is the supported
+    // line (0.1.7-rc.2 .. 0.2.x); the -0 cap keeps 0.3 prereleases out.
+    assert.equal(manifest.engines?.dsh, '>=0.1.7-rc.2 <0.3.0-0')
   })
 
   test('the published file list ships the wiring and the implementation, and no hand-wiring scripts', () => {

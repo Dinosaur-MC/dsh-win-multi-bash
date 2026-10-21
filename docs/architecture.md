@@ -124,4 +124,4 @@ lib/
 └── vendor/         runner-failure classification, bwrap profiles
 ```
 
-No build step: `lib/` is plain ESM JS. `smoke/` and `docs/` are repository-only; `package.json`'s `files` whitelist is the publish boundary.
+No build step: `lib/` is plain ESM JS. `smoke/` and `docs/` are repository-only; `package.json`'s `files` whitelist is the publish boundary. The manifest also declares `engines.dsh` (`>=0.1.7-rc.2 <0.3.0-0`): the runtime refuses the plugin outside that window instead of falling back to the peer list.

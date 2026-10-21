@@ -6,7 +6,7 @@
 [![license](https://img.shields.io/npm/l/dsh-win-multi-bash.svg)](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/LICENSE)
 [![node](https://img.shields.io/node/v/dsh-win-multi-bash.svg)](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/package.json)
 [![GitHub stars](https://img.shields.io/github/stars/Dinosaur-MC/dsh-win-multi-bash.svg)](https://github.com/Dinosaur-MC/dsh-win-multi-bash/stargazers)
-![dsh ≥ 0.1.7-rc.2](https://img.shields.io/badge/dsh-%E2%89%A5%200.1.7--rc.2-blue.svg)
+![dsh ≥ 0.1.7-rc.2 < 0.3](https://img.shields.io/badge/dsh-%E2%89%A5%200.1.7--rc.2%20%3C%200.3-blue.svg)
 ![platform: windows](https://img.shields.io/badge/platform-windows-0078d4.svg)
 ![dialects: MSYS, WSL, MSYS2, SSH](https://img.shields.io/badge/dialects-MSYS%20%7C%20WSL%20%7C%20MSYS2%20%7C%20SSH-4c1.svg)
 [![Listed on dsh-plugin.org](https://dsh-plugin.org/badges/listed.svg)](https://dsh-plugin.org/plugins/dinosaur-mc/dsh-win-multi-bash)
@@ -28,9 +28,17 @@ DeepSeek Harness 的 Windows 多 bash 插件。**`git_bash`**（Git for Windows 
 
 只有 `git_bash` 与 `terminal` 默认开启。另外三行默认关闭，因为每行都挂载一台机器未必具备的工具链（或主机）；请在**插件**页按需启用。在许多 Git for Windows 主机上，windows-acl runner 无法启动 MSYS bash，所以 `git_bash` 会以未包裹方式运行并如实说明——需要沙箱时请用 `wsl_bash`（bwrap）或 dsh 自带的 pwsh。详见[沙箱行为](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/sandbox.md)。
 
+## 环境要求
+
+- dsh `0.1.7-rc.2` 到 `0.2.x` —— `package.json` 的 `engines.dsh` 声明的就是这个窗口。更新的 dsh 会拒绝本插件，直到有针对该版本线的重新验证发布。
+- Windows，以及一个提供已发布 `@deepseek-ai` 基础包的 dsh 部署。
+- Git Bash / WSL / MSYS2 只在启用对应后端时需要；缺后端不会影响 pwsh。
+- `ssh_bash` 需要 OpenSSH 客户端、可达主机，以及无需交互提示的凭据。
+- Node `^22.19.0 || >=24.0.0`（本包声明范围），安装需要 `pnpm`。
+
 ## 安装
 
-唯一安装路径是 `dsh plugin`（一个 pnpm 转发器）。bundle 层会应用本包自己的 `cordis.patch.yml`，插入它的行。
+用 `dsh plugin`（pnpm 转发）安装：它会应用本包自己的 `cordis.patch.yml` bundle 层，把这些行插进组合。
 
 ```powershell
 dsh plugin --profile web add dsh-win-multi-bash                    # npm 包（推荐）
@@ -82,18 +90,11 @@ DSH_AUDIT_SSH_HOST=ubuntu_tx node smoke/prepare.mjs audit   # 可选：live SSH 
 
 两个入口都是开发工具：发布 tarball 不包含 `smoke/`。`pnpm test` 在工具缺失、描述错误、`ctx.shell` 席位丢失或任一命令失败时退出非零；审计会声明并统计 skip。细节见[验证](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/verification.md)。
 
-## 环境要求
-
-- Windows，以及一个带已发布 `@deepseek-ai` 基础包的 dsh 部署。
-- Git Bash / WSL / MSYS2 只在启用对应后端时需要；缺后端不会影响 pwsh。
-- `ssh_bash` 需要 OpenSSH 客户端、可达主机，以及无需交互提示的凭据。
-- Node `^22.19.0 || >=24.0.0`（本包声明范围），安装需要 `pnpm`。
-
 ## 文件布局
 
 ```
 dsh-win-multi-bash/
-├── package.json            # dsh.bundle + dsh.client；每个工具子路径的 exports
+├── package.json            # dsh.bundle + dsh.client + engines.dsh；每个工具子路径的 exports
 ├── cordis.patch.yml        # 组合接线（行内注释）
 ├── lib/                    # 普通 ESM 实现（无构建步骤）
 ├── smoke/                  # 开发验证（不随包发布）

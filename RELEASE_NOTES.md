@@ -1,3 +1,21 @@
+# dsh-win-multi-bash v0.7.3
+
+## New
+
+- **The manifest declares the DSH window it supports.** `engines.dsh` is `>=0.1.7-rc.2 <0.3.0-0`, so the official compatibility rule reads one declared range instead of falling back to the `@deepseek-ai/dsh*` peer list, and a future 0.3 prerelease is not admitted silently.
+
+## Improvements
+
+- **The browser half exports exactly the platform plugin triple.** `name`, `inject` and `apply` are the only members on the entry; the renderer helpers the audit needs are reached through a test-only global instead of an `__internals` export, matching the official rule that a `/client` entry carries no implementation values.
+
+## Bug fixes
+
+- **A missing declaration could have hidden a future DSH line.** Without `engines.dsh` the compatibility check fell back to peer ranges; the explicit range now fails closed on the next minor line.
+
+## Compatibility
+
+- No change to tools, rows, config, results or the browser UI. Installing on 0.1.7-rc.2 through 0.2.x is unchanged; booting was verified on 0.2.1-rc.2, the runtime this tree pins.
+
 # dsh-win-multi-bash v0.7.2
 
 ## New

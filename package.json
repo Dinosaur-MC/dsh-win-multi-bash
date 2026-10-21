@@ -1,6 +1,6 @@
 {
   "name": "dsh-win-multi-bash",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "author": "Dinosaur_MC",
   "repository": {
     "type": "git",
@@ -21,7 +21,8 @@
   ],
   "license": "MIT",
   "engines": {
-    "node": "^22.19.0 || >=24.0.0"
+    "node": "^22.19.0 || >=24.0.0",
+    "dsh": ">=0.1.7-rc.2 <0.3.0-0"
   },
   "publishConfig": {
     "access": "public"

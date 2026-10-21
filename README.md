@@ -6,7 +6,7 @@ English | [中文](README.zh.md)
 [![license](https://img.shields.io/npm/l/dsh-win-multi-bash.svg)](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/LICENSE)
 [![node](https://img.shields.io/node/v/dsh-win-multi-bash.svg)](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/package.json)
 [![GitHub stars](https://img.shields.io/github/stars/Dinosaur-MC/dsh-win-multi-bash.svg)](https://github.com/Dinosaur-MC/dsh-win-multi-bash/stargazers)
-![dsh ≥ 0.1.7-rc.2](https://img.shields.io/badge/dsh-%E2%89%A5%200.1.7--rc.2-blue.svg)
+![dsh ≥ 0.1.7-rc.2 < 0.3](https://img.shields.io/badge/dsh-%E2%89%A5%200.1.7--rc.2%20%3C%200.3-blue.svg)
 ![platform: windows](https://img.shields.io/badge/platform-windows-0078d4.svg)
 ![dialects: MSYS, WSL, MSYS2, SSH](https://img.shields.io/badge/dialects-MSYS%20%7C%20WSL%20%7C%20MSYS2%20%7C%20SSH-4c1.svg)
 [![Listed on dsh-plugin.org](https://dsh-plugin.org/badges/listed.svg)](https://dsh-plugin.org/plugins/dinosaur-mc/dsh-win-multi-bash)
@@ -28,9 +28,17 @@ Every dialect owns its own executor, and **no tool registers as `ctx.shell`** �
 
 Only `git_bash` and `terminal` are enabled by default. The other three rows are switched off because each mounts a toolchain (or a host) a machine may not have; enable them on the **Plugins** page. On many Git for Windows hosts the windows-acl runner cannot launch MSYS bash, so `git_bash` runs unconfined and says so — for confinement use `wsl_bash` (bwrap) or dsh's pwsh. See [Sandbox behavior](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/sandbox.md).
 
+## Requirements
+
+- dsh `0.1.7-rc.2` through `0.2.x` — the window `package.json`'s `engines.dsh` declares. A newer dsh refuses this plugin until a release is re-verified for that line.
+- Windows, and a dsh deployment that provides the published `@deepseek-ai` base packages.
+- Git Bash and/or WSL and/or MSYS2 only for the backends you enable; a missing backend never affects pwsh.
+- For `ssh_bash`: an OpenSSH client, a reachable host and a credential that needs no interactive prompt.
+- Node `^22.19.0 || >=24.0.0` (the range this package declares), and `pnpm` for installation.
+
 ## Install
 
-There is one install path: `dsh plugin`, a pnpm forwarder. The bundle layer applies this package's own `cordis.patch.yml`, which inserts its rows.
+Install through `dsh plugin`, the pnpm forwarder: it applies this package's own `cordis.patch.yml` bundle layer, which inserts the rows.
 
 ```powershell
 dsh plugin --profile web add dsh-win-multi-bash                    # npm package (recommended)
@@ -80,18 +88,11 @@ DSH_AUDIT_SSH_HOST=ubuntu_tx node smoke/prepare.mjs audit   # optional live SSH
 
 Both entries are development tools: the published tarball ships no `smoke/`. `pnpm test` fails on a missing tool, a wrong description, a lost `ctx.shell` seat or a failed command; the audit announces and counts its skips. Details in [Verification](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/verification.md).
 
-## Requirements
-
-- Windows and a dsh deployment with the published `@deepseek-ai` base packages.
-- Git Bash and/or WSL and/or MSYS2 only for the backends you enable; a missing backend never affects pwsh.
-- For `ssh_bash`: an OpenSSH client, a reachable host and a credential that needs no interactive prompt.
-- Node `^22.19.0 || >=24.0.0` (the range this package declares), and `pnpm` for installation.
-
 ## Layout
 
 ```
 dsh-win-multi-bash/
-├── package.json            # dsh.bundle + dsh.client; exports for every tool subpath
+├── package.json            # dsh.bundle + dsh.client + engines.dsh; exports for every tool subpath
 ├── cordis.patch.yml        # the composition wiring (documented inline)
 ├── lib/                    # plain ESM implementation (no build step)
 ├── smoke/                  # development verification (not published)
