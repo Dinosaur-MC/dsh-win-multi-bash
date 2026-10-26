@@ -85,21 +85,25 @@ Both local backends support `requireSandbox: true` (default `false`). When enabl
 
 ## The private-temp self-heal
 
-The windows-acl backend materializes **one private temp root per (session, workspace root)** — `%TEMP%\dsh-<6 alphanumerics>` — and caches that path for the session. Its runner treats `--temp` as an input that must already exist, so a missing path is a hard failure (`windows-acl-run: --temp is not an existing directory: <path>`, exit 127) and every later **wrapped** spawn of that session fails until it is back.
+The windows-acl backend materializes **one private temp root per (session, workspace root)** — `%TEMP%\dsh-<6 alphanumerics>` — and caches that path for the provider's lifetime (one entry per session and workspace root). Its runner treats `--temp` as an input that must already exist, so a missing path is a hard failure (`windows-acl-run: --temp is not an existing directory: <path>`, exit 127) and every later **wrapped** spawn of that session fails until it is back.
 
 Recreating the directory by hand restores **existence only**: the seam's write grant (`tempWriteSid` ACE) does not come back, so a confined child writing its own `%TEMP%` stays denied.
 
-`guardSandboxTemp` (default on) fixes both: on the next confined run of a `git_bash` / `msys2_bash` row it reads the `--temp` the seam is about to hand the runner, and when that exact private root is missing it recreates the directory **and re-applies the seam's own write grant** (`tempWriteSid` + `AclWriteGrant`, the same calls `dsh-sandbox-local` makes).
+`guardSandboxTemp` (default on) repairs it at the one seam every confined spawn shares: the core row wraps `ctx.sandbox.confine()`, so the `--temp` named by the seam result is checked — and, when missing, recreated together with the seam's own write grant (`tempWriteSid` + `AclWriteGrant`, the same calls `dsh-sandbox-local` makes) — **before that result is handed back to the caller**. That covers this plugin's `git_bash` / `msys2_bash` rows *and* the host's own confined spawns — measured on this machine: `run_code`, the platform's `bash` and `pwsh`, and any PTY terminal service a deployment mounts (`dsh-terminal-bash` takes the same seam) — which no row of this plugin could otherwise reach; a per-row check also runs the repair on this plugin's own confine calls, and a timer (`tempWatchMs`) re-checks every private root the process has seen, so a directory deleted while nothing runs is restored without a human.
+
+The hook is installed through `ctx.inject(['sandbox'])`, never through the core row's own `inject` list: a composition without a sandbox service loses the hook and nothing else. It patches the provider class's `confine` (the object that owns the method), so a provider rebuilt later in the same process is covered too, and disposal puts the method back exactly as it was found.
 
 Boundaries, stated so the switch is not mistaken for a cleanup tool:
 
-- the only accepted target is a **missing, absolute** `dsh-<6 alphanumerics>` **direct child of an OS temp root**, outside every workspace root;
-- an ambient temp root, a nested path, a lock or spill directory, a wrongly spelled name, or an existing directory is refused and named;
+- the only accepted target is a **missing, absolute** `dsh-<6 alphanumerics>` **direct child of an OS temp root**, outside every workspace root — the workspace gate is applied wherever a root is known (the seam channel passes the policy root and the runner's `--workspace`), while the ambient scan has no workspace root to compare against and is bounded by the temp-root and name-shape gates alone;
+- an ambient temp root, a nested path, a lock or spill directory, a wrongly spelled name, or an existing directory is refused and named; the heal path tolerates an existence race, because a directory rebuilt by someone else still needs its grant;
 - nothing is deleted;
 - `AclWriteGrant` is an optional peer from `@deepseek-ai/dsh-sandbox-windows-acl`, imported lazily; when it cannot be resolved the directory is still recreated (existence only) and the plugin warns that the grant was **not** restored;
 - the switch is declared **once**, on the core row, and turning it off stops healing everywhere from the next command;
 - `wsl_bash` uses bwrap and never materializes a `--temp` directory, so the knob is inert there;
-- healing only happens where a confined run happens at all: on a host whose runner cannot start MSYS bash, the git row never reaches the runner, so it can neither break nor heal through it.
+- healing runs *before* the seam result is handed back, so the caller's spawn normally finds the directory already back — best-effort by construction: a failed `mkdir` or grant is reported and the command runs unchanged — while a deletion landing between that result and the runner's own check can still fail **that one call**, which is then repaired for the next;
+- healing *through this plugin's own rows* only happens where a confined run happens at all: on a host whose runner cannot start MSYS bash, the git row never reaches the runner, so it can neither break nor heal through it — the seam channel above is what still covers the host's tools;
+- wrapping another package's service is a deliberate, stated limit: the hook only ever adds a missing `dsh-<6>` directory and its grant, forwards arguments and rejections untouched, and is removed when the row goes away.
 
 Measured on this machine (2026-10-16, reproduced by the audit): without the grant a wrapped `cmd.exe` write into its own `%TEMP%` fails with "Access is denied"; with it the write succeeds; after deleting the private root the runner exits 127 with that signature; after the heal the wrapped write succeeds again.
 

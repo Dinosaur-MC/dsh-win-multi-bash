@@ -1,3 +1,24 @@
+# dsh-win-multi-bash v0.7.4
+
+## New
+
+- **The self-heal now covers every confined spawn on the host, not just this plugin's rows.** The core row wraps the shared sandbox seam — `ctx.sandbox.confine()` — so the private temp root a windows-acl spawn is about to use is recreated, with its write grant, before the seam result reaches the caller. That is the path the host's own `run_code`, the platform `bash` / `pwsh` and any mounted PTY terminal service take, and the path this plugin could not reach before: measured, `run_code` asks the same service (two call sites in its runtime) and no consumer caches the method, so one wrapper covers all of them.
+- **The hook is optional by construction.** It arrives through `ctx.inject(['sandbox'])`, never through the core row's own `inject` list, is installed when the service appears (an already-wrapped seam is left alone), and is removed — the method restored to its original descriptor — when the row goes away. A composition without a sandbox service loses the hook and nothing else.
+
+## Improvements
+
+- **`guardSandboxTemp` now closes the timer's window instead of only narrowing it.** Until this release a deleted private root was repaired by a timer (up to `tempWatchMs` late) or by this plugin's own next confine, so the failing call itself still failed — and the failing tool was often the very one that would have reported it. The repair now happens inside the seam, before the runner reads `--temp`; a delete landing in the last instant can still fail one call, which the next one repairs.
+- **The seam contract is preserved, and the audit pins it.** The seam result is returned unmodified (`enforcement`, `denialSignatures`, `runnerFailureRules` untouched); `this` and every argument pass through; a rejection stays a rejection (a swallowed `SandboxUnavailableError` would turn a refusal into an unconfined spawn); one wrapper per seam; a non-redefinable seam is refused by name; and the switch OFF does no filesystem work at all.
+
+## Bug fixes
+
+- **A missing sandbox private temp directory no longer bricks the session for core tools.** `dsh-sandbox-local` caches one `%TEMP%\dsh-<6>` per (session, workspace root) for its provider lifetime and never revalidates it, while the windows-acl runner refuses an argv whose `--temp` is gone (exit 127). Every confined spawn the host makes — `run_code`, `pwsh`, the platform `bash` — failed with `code run failed (sandbox-unavailable): windows-acl-run: --temp is not an existing directory: …` until something rebuilt the directory.
+
+## Compatibility
+
+- No change to tools, rows, config keys or tool results. `guardSandboxTemp` and `tempWatchMs` keep their names, defaults and page placement; the hook follows the same switch.
+- Stated limit: only a missing `dsh-<6>` direct child of an OS temp root, outside every workspace root, is ever created and nothing is ever deleted; a deletion landing between the seam result and the runner's own check can still fail one call (repaired for the next); and when `@deepseek-ai/dsh-sandbox-windows-acl` cannot be loaded the directory is still recreated, but its write grant is not restored — and the plugin says so.
+
 # dsh-win-multi-bash v0.7.3
 
 ## New

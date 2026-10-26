@@ -2899,6 +2899,7 @@ console.log('\n[A] unit: sandbox private temp guard (self-heal for the sandbox p
     SANDBOX_TEMP_GUARD_DEFAULT, SANDBOX_TEMP_GUARD_KNOB, SANDBOX_TEMP_NAME, SANDBOX_TEMP_WATCH_MS,
     GUARD_REASONS, HEAL_OUTCOMES, SandboxTempGuard, classifySandboxTempTarget, startSandboxTempWatch,
     loadAclGrantApi, missingTempDirectoryOf, sandboxTempArgument, workspaceArgument,
+    CONFINE_HOOK_CHANNEL, CONFINE_HOOK_REASONS, hookSandboxConfine,
   } = await import(libUrl('sandbox-temp-guard.js'))
   const { TOOL_LAYER_FIELDS, TERMINAL_ROWS } = await import(libUrl('tool-bash', 'types', 'registry.js'))
 
@@ -3578,6 +3579,180 @@ console.log('\n[A] unit: sandbox private temp guard (self-heal for the sandbox p
     assert.deepEqual(other.sandbox, { mode: 'workspace-write', unconfined: true })
   })
 
+  // The seam hook. WHY IT EXISTS: the per-row channel above repairs only THIS plugin's
+  // own confine calls, so the harness's own confined tools (run_code, pwsh, the
+  // terminal rows) were repaired by the timer at best — up to one tempWatchMs LATE, and
+  // the tool that fails is the very one that would report it. Measured: every confined
+  // spawn on this host asks ctx.sandbox.confine() for its argv, and no consumer caches
+  // that method, so ONE wrapper covers all of them.
+  await testAsync('hookSandboxConfine(): the --temp exists before the caller can spawn, and the seam result is unchanged', async () => {
+    const root = scratchRoot()
+    const missing = join(root, 'dsh-Hk42Zz')
+    const guard = new SandboxTempGuard({ tempRoots: () => [root], warn: () => {}, internals: { aclApi: async () => fakeAcl([]) } })
+    // The real shape: confine is a CLASS method (dsh-sandbox-local's provider), so the
+    // hook has to patch the object that OWNS it, not the instance it was read from.
+    class FakeProvider {
+      constructor() { this.calls = [] }
+      async confine(argv, policy, signal) {
+        this.calls.push({ argv, policy, signal, self: this })
+        return { argv: runnerArgv('C:/ws', missing), enforcement: 'partial', denialSignatures: [], runnerFailureRules: [] }
+      }
+    }
+    const provider = new FakeProvider()
+    const hook = hookSandboxConfine(provider, guard, { warn: () => {} })
+    assert.equal(hook.installed, true, 'the seam must be hookable: ' + hook.reason)
+    assert.equal(hook.owner, Object.getPrototypeOf(provider), 'the OWNER of a prototype method is what gets patched, so a provider re-created from the same class stays covered')
+    assert.ok(!existsSync(missing), 'the premise is a missing private root')
+    const policy = { mode: 'workspace-write', workspaceRoot: 'C:/ws' }
+    const signal = { aborted: false }
+    const confined = await provider.confine(['bash', '-c', 'exit 0'], policy, signal)
+    assert.ok(existsSync(missing), 'the root must exist by the time the caller holds the argv')
+    assert.equal(sandboxTempArgument(confined.argv), missing, 'the seam result is returned unmodified')
+    assert.equal(confined.enforcement, 'partial', 'and its other fields survive the wrapper')
+    assert.equal(provider.calls.length, 1, 'the seam itself runs exactly once')
+    assert.equal(provider.calls[0].self, provider, 'the wrapper must not lose this')
+    assert.equal(provider.calls[0].signal, signal, 'every argument must pass through untouched')
+    assert.equal(guard.reports.at(-1).channel, CONFINE_HOOK_CHANNEL, 'a heal from the hook is attributed to the hook')
+    assert.equal(guard.reports.at(-1).outcome, HEAL_OUTCOMES.HEALED)
+    assert.equal(hook.restore(), true)
+    assert.equal(provider.confine.name, 'confine', 'restoring puts the seam back exactly as it was found')
+    assert.equal(hook.restore(), false, 'and a second restore is a no-op, not a second write')
+    const again = hookSandboxConfine(provider, guard, { warn: () => {} })
+    assert.equal(again.installed, true, 'a restored seam can be hooked again — that is what a row reload does')
+    again.restore()
+  })
+
+  await testAsync('hookSandboxConfine(): ONE wrapper per seam, shared by every custodian, and the method returns only when the last one leaves', async () => {
+    const root = scratchRoot()
+    const guard = new SandboxTempGuard({ tempRoots: () => [root], warn: () => {}, internals: { aclApi: async () => fakeAcl([]) } })
+    class FakeProvider { async confine() { return { argv: ['node', 'runner.js'] } } }
+    const provider = new FakeProvider()
+    const prototype = Object.getPrototypeOf(provider)
+    const original = prototype.confine
+    const first = hookSandboxConfine(provider, guard, { warn: () => {} })
+    assert.equal(first.installed, true)
+    assert.equal(first.adopted, false)
+    const wrapped = prototype.confine
+    assert.notEqual(wrapped, original, 'the seam is wrapped')
+    // A second custodian (another row, or this row reloaded) must NOT stack a second
+    // wrapper: it shares the first one and takes over the guard and report sink, so a
+    // reloaded row keeps its live switch and a live logger.
+    const second = hookSandboxConfine(new FakeProvider(), guard, { warn: () => {} })
+    assert.equal(second.installed, true)
+    assert.equal(second.adopted, true)
+    assert.equal(prototype.confine, wrapped, 'and the seam is still wrapped exactly once')
+    // The regression this pins: the FIRST custodian leaving must not disarm the second.
+    assert.equal(first.restore(), false, 'a custodian that still has company does not restore')
+    assert.equal(prototype.confine, wrapped, 'the wrapper stays while a custodian remains')
+    assert.equal(second.restore(), true, 'the last custodian puts the original method back')
+    assert.equal(prototype.confine, original)
+    assert.equal(second.restore(), false, 'a second release is a no-op, not a second write')
+    assert.equal(hookSandboxConfine(undefined, guard).reason, CONFINE_HOOK_REASONS.NO_SERVICE)
+    assert.equal(hookSandboxConfine({}, guard).reason, CONFINE_HOOK_REASONS.NO_CONFINE)
+    assert.equal(hookSandboxConfine({ confine: async () => ({}) }, undefined).reason, CONFINE_HOOK_REASONS.NO_GUARD)
+    // A seam that cannot be redefined is refused, never half-installed.
+    const frozen = Object.create(null)
+    Object.defineProperty(frozen, 'confine', { value: async () => ({ argv: [] }), writable: false, configurable: false })
+    const refused = hookSandboxConfine(frozen, guard, { warn: () => {} })
+    assert.equal(refused.installed, false)
+    assert.equal(refused.reason, CONFINE_HOOK_REASONS.NOT_INSTALLABLE)
+    assert.equal(typeof frozen.confine, 'function', 'the refused seam is left untouched')
+  })
+
+  await testAsync('hookSandboxConfine(): the live switch gates it, and a throwing guard never replaces the seam result', async () => {
+    const root = scratchRoot()
+    const missing = join(root, 'dsh-Off11X')
+    let mkdirs = 0
+    let listings = 0
+    // The switch is documented as "no filesystem work at all", so the READ-ONLY half counts
+    // too: a listing is filesystem work. Review found the timer still listing while OFF.
+    const offGuard = new SandboxTempGuard({
+      enabled: () => false,
+      tempRoots: () => [root],
+      warn: () => {},
+      internals: {
+        mkdir: () => { mkdirs += 1 },
+        readdir: () => { listings += 1; return [] },
+        aclApi: async () => fakeAcl([]),
+      },
+    })
+    assert.equal(offGuard.rememberAmbient(), 0, 'an OFF guard learns nothing')
+    assert.equal(listings, 0, 'and does not even list the OS temp roots')
+    class FakeProvider { async confine() { return { argv: runnerArgv('C:/ws', missing) } } }
+    const provider = new FakeProvider()
+    const offHook = hookSandboxConfine(provider, offGuard, { warn: () => {} })
+    assert.equal(offHook.installed, true, 'the switch is read per call, so the hook may stay installed while it is OFF')
+    await provider.confine(['bash', '-c', 'exit 0'], { workspaceRoot: 'C:/ws' })
+    assert.equal(mkdirs, 0, 'a switch that is OFF must never create a directory')
+    assert.ok(!existsSync(missing))
+    offHook.restore()
+    // A guard that throws is the next way this could become a new failure mode: it is
+    // reported once and the seam result still reaches the spawner.
+    const reported = []
+    const broken = { ensureArgvUsable: async () => { throw new Error('guard exploded') } }
+    const brokenProvider = new FakeProvider()
+    const brokenHook = hookSandboxConfine(brokenProvider, broken, { warn: (key, message) => { reported.push([key, message]) } })
+    const confined = await brokenProvider.confine(['bash', '-c', 'exit 0'], { workspaceRoot: 'C:/ws' })
+    assert.equal(sandboxTempArgument(confined.argv), missing, 'the argv the caller spawns is unchanged')
+    assert.equal(reported.length, 1)
+    assert.ok(reported[0][1].includes('runs unchanged'), reported[0][1])
+    brokenHook.restore()
+    // A refused confine stays refused: a wrapper that swallowed this would turn a
+    // fail-closed sandbox into an unconfined spawn.
+    class Refusing { async confine() { throw new Error('sandbox unavailable') } }
+    const refusing = new Refusing()
+    const refuseHook = hookSandboxConfine(refusing, broken, { warn: () => {} })
+    await assert.rejects(async () => refusing.confine(['bash', '-c', 'exit 0']), /sandbox unavailable/)
+    refuseHook.restore()
+    // The READ-ONLY seam result names the ambient temp ROOT, not a private root. The
+    // guard is asked (that is the seam contract) and must REFUSE it without touching a
+    // single path — which refusal code it is depends on which scope gate answers first.
+    let ambientMkdirs = 0
+    const ambientGuard = new SandboxTempGuard({
+      tempRoots: () => [root],
+      warn: () => {},
+      internals: { mkdir: () => { ambientMkdirs += 1 }, aclApi: async () => fakeAcl([]) },
+    })
+    class Ambient { async confine() { return { argv: runnerArgv('C:/ws', root) } } }
+    const ambient = new Ambient()
+    const ambientHook = hookSandboxConfine(ambient, ambientGuard, { warn: () => {} })
+    await ambient.confine(['bash', '-c', 'exit 0'], { workspaceRoot: 'C:/ws' })
+    assert.equal(ambientMkdirs, 0, 'the ambient temp root is not a private root and is never created')
+    const ambientReport = ambientGuard.reports.at(-1)
+    assert.equal(ambientReport.action, 'skip', 'the ambient root must be refused, never healed')
+    assert.ok([GUARD_REASONS.NOT_DIRECT_CHILD, GUARD_REASONS.NAME_SHAPE, GUARD_REASONS.OUTSIDE_TEMP_ROOT].includes(ambientReport.reason), String(ambientReport.reason))
+    ambientHook.restore()
+  })
+
+  // BEHAVIOUR, not a source substring. Review mutation E (delete the armConfineHook call,
+  // keep the whole hook implementation) left the previous string-matching case GREEN: a
+  // correct hook that is never assembled is exactly the regression a substring assertion
+  // cannot see. This drives apply() through a fake context and then asks the seam itself.
+  await testAsync('apply() actually arms the confine hook, and gives the method back when the row goes away', async () => {
+    const plugin = await import(libUrl('index.js'))
+    const guardApi = await import(libUrl('sandbox-temp-guard.js'))
+    class FakeProvider { async confine() { return { argv: ['node', 'runner.js'] } } }
+    const provider = new FakeProvider()
+    const prototype = Object.getPrototypeOf(provider)
+    const original = prototype.confine
+    const disposers = []
+    const injected = []
+    const collect = (callback) => { const off = callback(); if (typeof off === 'function') disposers.push(off); return off }
+    const fakeCtx = {
+      logger: { warn: () => {} },
+      effect: collect,
+      inject: (deps, callback) => {
+        injected.push(deps)
+        callback({ sandbox: provider, effect: collect })
+      },
+    }
+    plugin.apply(fakeCtx, {})
+    assert.deepEqual(injected[0], ['sandbox'], 'the seam is an OPTIONAL capability: ctx.inject, never the row inject list')
+    assert.notEqual(prototype.confine, original, 'the seam must be wrapped by apply, not only by the exported helper')
+    for (const off of disposers.slice().reverse()) off()
+    assert.equal(prototype.confine, original, 'and the method is given back when the row is disposed')
+    guardApi.setSandboxTempGuardEnabled(true)
+  })
   // Only this block's own scratch roots, and only after re-verifying that each
   // one really is a mkdtemp child of the OS temp root.
   const tempRoot = realpathSync(tmpdir()).toLowerCase()

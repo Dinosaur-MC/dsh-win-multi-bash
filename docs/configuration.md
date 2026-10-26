@@ -46,9 +46,9 @@ Whether a value actually works is decided **at runtime**: the executor warns onc
 
 ## Self-heal switch
 
-`guardSandboxTemp` (default on) is declared once on the core row, never per tool row: one deployment-wide value governs the guard, each row's inline pre-spawn check and every row alike. `enableRunInBackground` stays on the tool layer, so that one **is** on each row.
+`guardSandboxTemp` (default on) is declared once on the core row, never per tool row: one deployment-wide value governs the guard, the seam hook every confined spawn goes through (`ctx.sandbox.confine()` — `run_code`, the platform's `bash` / `pwsh`, and this plugin's own rows), each row's inline pre-spawn check, and the watch timer alike. `enableRunInBackground` stays on the tool layer, so that one **is** on each row.
 
-Two honest limits: `wsl_bash` uses bwrap and never materializes a `--temp` directory, so the knob is inert there; and healing only happens where a confined run happens at all — on a host where the windows-acl runner cannot start MSYS bash, the git row never reaches the runner, so it can neither break nor heal through it. See [Sandbox behavior](sandbox.md) for the mechanism and its boundaries.
+Two honest limits: `wsl_bash` uses bwrap and never materializes a `--temp` directory, so the knob is inert there; and the hook refreshes the directory the seam hands a spawn, so a deletion landing between that seam result and the runner's own check can still fail one call (repaired for the next). See [Sandbox behavior](sandbox.md) for the mechanism and its boundaries.
 
 ## Unwrapped-run notice
 
