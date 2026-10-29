@@ -2489,7 +2489,7 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
 
   test('the ssh_bash row exposes the shared knobs and its own, and nothing else', () => {
     assert.deepEqual(volatilePaths(sshTool.Config), [
-      'enableRunInBackground',
+      'enableRunInBackground', 'promoteOnTimeout',
       'sshBash.cwd', 'sshBash.timeoutMs', 'sshBash.maxTimeoutMs', 'sshBash.maxOutputBytes',
       'sshBash.maxSpillBytes', 'sshBash.graceMs',
       'sshBash.sshPath', 'sshBash.sshHost', 'sshBash.sshUser', 'sshBash.sshPort',
@@ -2852,7 +2852,7 @@ console.log('\n[A] unit: runtime-editable config surface (the volatile projectio
     // No guardSandboxTemp here: the deployment-wide switch is listed ONCE, on the
     // package row, and a row copy is exactly the repetition this pins against.
     assert.deepEqual(volatilePaths(gitBashTool.Config), [
-      'enableRunInBackground',
+      'enableRunInBackground', 'promoteOnTimeout',
       'gitBash.cwd', 'gitBash.timeoutMs', 'gitBash.maxTimeoutMs', 'gitBash.maxOutputBytes',
       'gitBash.maxSpillBytes', 'gitBash.graceMs',
       'gitBash.bashPath', 'gitBash.sandbox', 'gitBash.probeTimeoutMs', 'gitBash.requireSandbox', 'gitBash.sandboxNotice',
@@ -2860,7 +2860,7 @@ console.log('\n[A] unit: runtime-editable config surface (the volatile projectio
   })
   test('the wsl_bash row exposes the background switch and every executor knob', () => {
     assert.deepEqual(volatilePaths(wslBashTool.Config), [
-      'enableRunInBackground',
+      'enableRunInBackground', 'promoteOnTimeout',
       'wslBash.cwd', 'wslBash.timeoutMs', 'wslBash.maxTimeoutMs', 'wslBash.maxOutputBytes',
       'wslBash.maxSpillBytes', 'wslBash.graceMs',
       'wslBash.wslPath', 'wslBash.wslDistro', 'wslBash.sandbox', 'wslBash.probeTimeoutMs', 'wslBash.requireSandbox', 'wslBash.sandboxNotice',
@@ -3028,7 +3028,7 @@ console.log('\n[A] unit: sandbox private temp guard (self-heal for the sandbox p
   })
 
   test('the self-heal switch is listed ONCE, on the package row, never on a tool row', () => {
-    assert.deepEqual(TOOL_LAYER_FIELDS.map((knob) => knob.key), ['enableRunInBackground'])
+    assert.deepEqual(TOOL_LAYER_FIELDS.map((knob) => knob.key), ['enableRunInBackground', 'promoteOnTimeout'], 'every tool-layer knob is declared once, in the order the page shows it')
     // The deployment-wide self-heal switch is NOT a tool-layer field any more: it is
     // declared once on the package row, so no tool row repeats it, no row page shows
     // it, and there is no per-row override left to disagree with it.
@@ -4647,19 +4647,19 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.deepEqual(CORE_ROW.fields.map((knob) => knob.path.join('.')), volatilePaths(packageRow.Config))
   })
 
-  test('a non-volatile tool knob changes behaviour, not the editable surface (Q1-G1)', () => {
-    // `promoteOnTimeout` is deliberately plain (dsh declares it plain too), so it
-    // must not appear in the Plugins form. This is the invariant the (skipped)
-    // dsh-settings section used to be the only evidence for; here it runs on the
-    // schema the form is actually built from, on every runtime.
+  test('both tool-layer knobs are editable, and the form is built from that one list (Q1-G1)', () => {
+    // The invariant this pins: a behaviour a deployment can change must be reachable
+    // on the Plugins page. `promoteOnTimeout` used to be YAML-only, so the form and
+    // the schema must now agree on BOTH knobs — the failure mode is one side moving
+    // without the other.
     for (const [rowId, tool, partition] of [
       ['win-mb-tool-git', gitBashTool, 'gitBash'],
       ['win-mb-tool-wsl', wslBashTool, 'wslBash'],
     ]) {
       assert.deepEqual(Object.keys(tool.Config.dict), ['enableRunInBackground', 'promoteOnTimeout', partition])
-      assert.equal(tool.Config.dict.promoteOnTimeout.meta?.volatile, undefined, 'promoteOnTimeout must stay plain')
+      assert.equal(tool.Config.dict.promoteOnTimeout.meta?.volatile, true, 'promoteOnTimeout is editable')
       const paths = volatilePaths(tool.Config)
-      assert.ok(!paths.includes('promoteOnTimeout'), `${rowId}: promoteOnTimeout must not be projected`)
+      assert.ok(paths.includes('promoteOnTimeout'), `${rowId}: promoteOnTimeout must be projected`)
       assert.deepEqual(ROWS.find((row) => row.rowId === rowId).fields.map((knob) => knob.path.join('.')), paths)
     }
   })
