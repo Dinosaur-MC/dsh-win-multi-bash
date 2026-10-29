@@ -53,7 +53,7 @@ dsh plugin --profile web remove dsh-win-multi-bash                 # 卸载
 - **`git_bash`** 装好即可用。每次调用启动一个全新的 MSYS bash；`workdir` 接受原生、MSYS（`/c/...`）与 WSL automount（`/mnt/c/...`）三种写法。
 - **`wsl_bash` / `msys2_bash`**：在插件页启用 `win-mb-tool-wsl` / `win-mb-tool-msys2`。只有自动探测不够时才需要 pin `wslBash.wslDistro` 或 `msys2Bash.bashPath`。
 - **`ssh_bash`**：启用 `win-mb-tool-ssh` 并 pin `sshBash.sshHost`（主机名或 `~/.ssh/config` 别名），需要时再设 `sshUser` / `sshPort`。目标永远不是工具参数；没有主机的行会拒绝每一次调用。单次调用使用 `BatchMode=yes`，请用密钥认证；要回答首次连接提问，用 `terminal` 的 `shell: "ssh_bash"` 会话形态。
-- **`terminal`**：`open` 开会话，`send`（`submit: true`）发命令，`read` 读回复，`close` 结束。工作目录、导出的变量与别名会跨调用保留。会话是进程内的、有上限、空闲会被回收，且**不是**后台任务。
+- **`terminal`**：`open` 开会话，`send`（`submit: true`）发命令，`read` 读回复，`close` 结束。工作目录、导出的变量与别名会跨调用保留。会话是进程内的、有上限、空闲会被回收，且**不是**后台任务；Session 头部面板会列出运行中与已结束的会话，并可停止其中一个。
 - 每行在插件页都有**配置**入口：路径、超时、沙箱立场、会话上限，以及部署级的自愈开关。除非某个旋钮决定工具 schema，改动都是即时的。
 
 ## 设计概览

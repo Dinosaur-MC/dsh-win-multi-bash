@@ -13,6 +13,6 @@ The [README](../README.md) is the entry point and release summary. These documen
 | [Verification](verification.md) | Dev runtime, both test entries, the audit gate, the live SSH round trip |
 | [Troubleshooting](troubleshooting.md) | Symptom → fix |
 
-These documents are maintained in English. The bilingual README (`README.md` / `README.zh.md`) is the release-facing summary and is kept consistent by the audit (both sides are recorded in `README.i18n.yaml`).
+These documents are maintained in English. The bilingual README (`README.md` / `README.zh.md`) is the release-facing summary and is kept in step by hand: both sides are recorded in `README.i18n.yaml`, and the audit fails when either side changes without re-recording — it does not compare the two texts.
 
 Repository-only material (`docs/`, `smoke/`) is not part of the published npm tarball; `package.json`'s `files` whitelist decides what ships.

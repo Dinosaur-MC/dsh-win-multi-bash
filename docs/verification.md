@@ -20,7 +20,7 @@ Requires Node `^22.19.0 || >=24.0.0` — the range this package declares and the
 pnpm test
 ```
 
-Boots a real composition over the profile runtime (modifying nothing), verifies the shipped patch mounts **only `git_bash`** by default (the opt-in `wsl_bash` row is enabled explicitly in its own fixture) and that it executes real commands — including an explicit `bashPath` variant — and asserts `ctx.shell` is still provided by the base bundle's own row (the regression this plugin once caused).
+Boots a real composition over the profile runtime (modifying nothing) from its own fixture — which mounts the `git_bash` **and** `wsl_bash` rows explicitly, because the shipped patch ships the WSL row off — executes real commands (including an explicit `bashPath` variant), and asserts `ctx.shell` is still provided by the base bundle's own row (the regression this plugin once caused). The shipped patch's own default rows are verified by the audit instead (`pnpm run test:audit`, below).
 
 It is a **verdict, not a report**: a missing tool, a wrong description, a lost `ctx.shell` seat or a failed command fails the run. The fixture whose git row is disabled is used to prove the missing-tool case actually fails.
 

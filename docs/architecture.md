@@ -87,6 +87,7 @@ Each tool description keeps only its own dialect facts. When the core row is swi
 - injects the stylesheet once per document;
 - registers one `plugins.row.config` page per row (key `dsh-win-multi-bash#<row id>`) while the Host serves that row's namespace;
 - registers the conversation rows through the keyed `tool.call.toolview` slot (see [Conversation rows](conversation-rows.md));
+- registers the Session header's terminal list (`conversation.session.header.actions`): `sessions.list` / `sessions.tail` over the `/win-mb` RPC, and `sessions.stop` for a human Stop;
 - registers the core-row note via `plugins.detail.section`.
 
 The browser half cannot import the package (the client module loader resolves subpaths to `undefined`), so the dialect list and terminal literals are generated into a marked region by `smoke/gen-client-registry.mjs`; the audit byte-compares that region with the registry. The bare-package core row is what makes the browser half discoverable at all: `dsh-client-modules` reads `dsh.client` from the row's resolved `package.json`, and a subpath row does not resolve that way.

@@ -2,8 +2,8 @@
 
 ## New
 
-- **The terminal sessions now have a Session header panel, built like the first-party job list.** One control beside the Session title lists every PTY session the deployment runs — running and finished — with a live count and an elapsed clock, and expands a row into its retained output. Stopping is a two-press action on running rows only; the panel is anchored to its trigger rather than overlay-ed, and it disappears when there is no session to show. Its `/win-mb` RPC (`sessions.list`, `stop`, `tail`) is registered on the root context through Connection, so the panel inherits that service's trust fence instead of inventing one.
-- **An ended session stays readable, which it did not before.** Reclaiming a session dropped the object together with its output ring, so a shell that exited, was stopped from the header, or was closed by the idle reaper became unreadable at once — the model got "is gone" and the panel lost the row. The last eight ended sessions are now retained with their windows: `read` and `tail` still answer, the header's finished section still expands, and an evicted id answers with the reason it left instead of pretending it never existed.
+- **The terminal sessions now have a Session header panel, built like the first-party job list.** One control beside the Session title lists every PTY session the deployment runs — running and finished — with a live count and an elapsed clock, and expands a row into its retained output. Stopping is a two-press action on running rows only; the panel is anchored to its trigger rather than overlay-ed, and it disappears when there is no session to show. Its `/win-mb` RPC (`sessions.list`, `sessions.tail`, `sessions.stop`) is registered on the root context through Connection, so the panel inherits that service's trust fence instead of inventing one.
+- **An ended session stays readable, which it did not before.** Reclaiming a session dropped the object together with its output ring, so a session stopped from the header or closed by the idle reaper became unreadable at once — the model got "is gone" and the row was gone with it. The last eight ended sessions are now retained with their windows: `read` and `tail` still answer, the header's finished section still expands, and an evicted id answers with the reason it left instead of pretending it never existed.
 
 ## Improvements
 
@@ -20,7 +20,7 @@
 
 ## Compatibility
 
-- No change to the tool schema, rows, config keys or existing results. `read`'s `waitMs` and `all` are additive parameters; `waitReason` gains new string values on an existing field. The Session header panel registers on `conversation.session.header.actions` and needs the Connection service — a deployment without it registers nothing and the rest is unchanged.
+- No breaking change to tool names, rows, config keys or existing results. `all` is a new optional `read` parameter, `read` now honours `waitMs` where it used to ignore it, and `read` results carry `waitReason` (with the new value `no_output`) where v0.7.4 returned none. The Session header panel registers on `conversation.session.header.actions` and needs the Connection service — a deployment without it registers nothing and the rest is unchanged.
 - Stated limit: the finished list holds eight sessions with their output rings (about 1 MiB each at most) in memory, evicted in ending order; an evicted id is no longer readable.
 
 # dsh-win-multi-bash v0.7.4

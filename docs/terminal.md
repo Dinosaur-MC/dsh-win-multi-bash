@@ -36,8 +36,8 @@ The backend is the dialect registry. `shell` names one of the dialects that decl
 ## Lifecycle
 
 - **Capped, reclaimed, process-local.** `maxSessions` (default 8) refuses the next `open` by name; a session untouched by `send` / `read` / `signal` for `idleMs` (default 10 minutes) is terminated, and its id afterwards says it was reclaimed by the idle reaper rather than looking unknown. Sessions do **not** survive a `dsh` restart.
-- **Sessions are not jobs.** They are not registered in `ctx.jobs`, so `job_kill` cannot reach one: `close` is the only way to end a session, with the idle reaper as the backstop.
-- **`close` reports what its terminate caused.** It waits (bounded by the row's grace) for the outcome the session tree produced instead of reading `exitCode` the instant `terminate()` resolves; a force-terminated session reports exit code 1 on Windows (no signal), a natural `exit 0` reports 0.
+- **Sessions are not jobs.** They are not registered in `ctx.jobs`, so `job_kill` cannot reach one: `close` is the only way the **model** can end a session; the Session header's Stop (a human) and the idle reaper are the other two paths.
+- **`close` reports what its terminate caused.** It waits (bounded by a fixed 1 s grace) for the outcome the session tree produced instead of reading `exitCode` the instant `terminate()` resolves; a force-terminated session reports exit code 1 on Windows (no signal), a natural `exit 0` reports 0.
 
 ## Sandbox and remote facts
 
@@ -55,21 +55,21 @@ A session that ends is still history. `reclaim` moves it to a bounded **finished
 - `list` keeps showing it with `status: exited`, and the Session header's finished section keeps its row expandable;
 - `read` answers from the retained ring — the delta since your cursor, or `all: true` for the whole window; `tail` (the panel's expand) returns that window without moving any cursor;
 - `send`, `signal` and `close` are refused with the reason it ended (`stopped by the user from the session header`, `closed by the idle reaper after …`, `exited before its first prompt`);
-- an evicted id answers `is gone — finished session evicted (retention limit)`.
+- an evicted id answers `is gone — finished session evicted (retention limit)` (the reason is remembered for the most recent 16 reclaimed ids).
 
 ## Session header panel
 
 The browser half adds one control beside the Session title (`conversation.session.header.actions`, the same list the first-party job and subagent entries use), modelled on the first-party **jobs** list (`@deepseek-ai/dsh-client-ui-jobs`):
 
-- the trigger is a live dot plus a count and a chevron (`3 terminal sessions running`), and it renders **nothing** while no session exists — exactly like the job list;
+- the trigger is a dot (only while a session is running) plus a count (`3 terminal session running`, or `3 terminal sessions` when all have ended) and a chevron; it renders **nothing** while no session exists — exactly like the job list;
 - the popover lists **Running** rows first (filled cards, live dot, shell badge, name, cwd, elapsed time) and a **Finished** section for sessions whose shell already exited;
-- each row carries a two-press **Stop** (the first press arms it for 3 s and widens into a labelled confirm, the second sends the stop) — the same affordance as the job list's kill;
-- rows poll `sessions.list` every 2 s while open and the elapsed clock ticks every second.
+- each **running** row carries a two-press **Stop** (the first press arms it for 3 s and widens into a labelled confirm, the second sends the stop) — the same affordance as the job list's kill;
+- rows poll `sessions.list` every 2 s while open (and every 5 s while closed, which is how the trigger appears), an expanded row re-reads `sessions.tail` every 1.5 s, and the elapsed clock ticks every second.
 
 - The list and the stop ride the deployment's own Connection RPC channel (`/win-mb`): `sessions.list` answers with the registry's view, `sessions.stop` closes one session through the same `reclaim` path as the tool's `close`, and the tombstone records `stopped by the user from the session header` so a later model read names who ended it.
 - A deployment without `ctx.connection`, or a shell that does not declare the slot, registers nothing: the button simply does not appear and every tool keeps working.
-- The panel polls every 2 s while open. It is a reading surface, not a second control plane: the model's `terminal list` / `close` remain the agent-facing contract.
-- A session can end without a tool call — the shell exits, the idle reaper closes it, or a human presses Stop. Each of those posts **one in-session notice** to the agent that opened the session (`session … was stopped from the session header` / `closed by the idle reaper` / `exited on its own`), so the owner reads it instead of polling. A model's own `close` is not announced: its tool result already said so.
+- The panel polls the list every 2 s while open and the expanded row's retained tail every 1.5 s. It is a reading surface, not a second control plane: the model's `terminal list` / `close` remain the agent-facing contract.
+- A session can end without a tool call — the shell exits, the idle reaper closes it, or a human presses Stop. Each of those posts **one in-session notice** to the agent that opened the session (`terminal: session … was stopped by the user (session header).` / `terminal: session … was closed by the idle reaper after … ms without activity.` / `terminal: session … exited on its own (exit code …).`), so the owner reads it instead of polling. A model's own `close` is not announced: its tool result already said so.
 
 ## Signals
 
@@ -99,4 +99,4 @@ The defaults were measured, not guessed:
 - `waitMs` 10 s was verified with a 40×200 ms ticker that returned partial output while the session stayed alive;
 - the 10 s startup budget covers the first prompt: a bare `bash -i` prints in ~0.8 s here, but a session loads the user's startup files, and this repository's prompt runs git — the first prompt measured ~4.0 s, exactly on the old 4 s budget, so every `open` used to pay it and report `timeout`.
 
-Every one of these is live-editable on the row's Plugins page.
+All but the startup budget are live-editable on the row's Plugins page; the 10 s startup wait is the module constant `DEFAULT_STARTUP_WAIT_MS`.

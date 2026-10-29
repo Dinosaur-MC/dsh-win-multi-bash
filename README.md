@@ -53,7 +53,7 @@ Requires `pnpm`. The bundle layer is assembled at boot, so **restart `dsh web`**
 - **`git_bash`** is ready after install. It runs a fresh MSYS bash per call; `workdir` accepts native, MSYS (`/c/...`) and WSL automount (`/mnt/c/...`) forms.
 - **`wsl_bash` / `msys2_bash`**: enable `win-mb-tool-wsl` / `win-mb-tool-msys2` on the Plugins page. Pin `wslBash.wslDistro` or `msys2Bash.bashPath` only when discovery is not enough.
 - **`ssh_bash`**: enable `win-mb-tool-ssh` and pin `sshBash.sshHost` (a host or a `~/.ssh/config` alias), plus `sshUser` / `sshPort` when needed. The target is never a tool argument; a row with no host refuses every call. A one-shot call uses `BatchMode=yes`, so authenticate with a key; a `terminal` session with `shell: "ssh_bash"` is the form that can answer a first-connect prompt.
-- **`terminal`**: `open` a session, `send` commands with `submit: true`, `read` the reply, then `close`. The working directory, exported variables and aliases survive between calls. Sessions are process-local, capped, idle-reclaimed and **not** jobs.
+- **`terminal`**: `open` a session, `send` commands with `submit: true`, `read` the reply, then `close`. The working directory, exported variables and aliases survive between calls. Sessions are process-local, capped, idle-reclaimed and **not** jobs; the Session header lists running and finished sessions and can stop one.
 - Every row has a **Configure** page on the Plugins page: paths, timeouts, sandbox stance, session limits and the deployment-wide self-heal switch. Changes are live unless a knob shapes the tool schema.
 
 ## Design at a glance
@@ -76,6 +76,8 @@ Requires `pnpm`. The bundle layer is assembled at boot, so **restart `dsh web`**
 | [Configuration](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/configuration.md) | The Plugins page, every row's knobs, live semantics, staged saves |
 | [Verification](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/verification.md) | Dev runtime, both test entries, the live SSH round trip |
 | [Troubleshooting](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/troubleshooting.md) | Symptom → fix |
+
+The detailed documents are maintained in English; this README is the bilingual entry point and release summary.
 
 ## Verification
 
