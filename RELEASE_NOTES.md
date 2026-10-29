@@ -1,3 +1,28 @@
+# dsh-win-multi-bash v0.7.5
+
+## New
+
+- **The terminal sessions now have a Session header panel, built like the first-party job list.** One control beside the Session title lists every PTY session the deployment runs — running and finished — with a live count and an elapsed clock, and expands a row into its retained output. Stopping is a two-press action on running rows only; the panel is anchored to its trigger rather than overlay-ed, and it disappears when there is no session to show. Its `/win-mb` RPC (`sessions.list`, `stop`, `tail`) is registered on the root context through Connection, so the panel inherits that service's trust fence instead of inventing one.
+- **An ended session stays readable, which it did not before.** Reclaiming a session dropped the object together with its output ring, so a shell that exited, was stopped from the header, or was closed by the idle reaper became unreadable at once — the model got "is gone" and the panel lost the row. The last eight ended sessions are now retained with their windows: `read` and `tail` still answer, the header's finished section still expands, and an evicted id answers with the reason it left instead of pretending it never existed.
+
+## Improvements
+
+- **`read` waits when asked, and an empty answer always says why.** A positive `waitMs` blocks until new output arrives and returns that delta; `0` stays an instant snapshot. Every empty result now carries `no_output`, `timeout` or `session_exit` — the row used to drop even the exit it received. `all: true` returns the whole retained window without moving the read cursor, and is refused together with `offset` or `waitMs`.
+- **`send` and `signal` stop swallowing output that arrived between calls.** Their delta now starts at the caller's cursor, not the ring head, so output produced between two calls is delivered instead of vanishing (it was neither in that call's result nor in any later read).
+- **Startup no longer pays a timeout on a slow prompt.** The readiness wait baselines at session birth by byte offset (an echo landing before the first poll no longer makes a silent command pay the whole budget), and `DEFAULT_STARTUP_WAIT_MS` moved from 4 s to 10 s: this repository's prompt runs git and the first prompt measured ~4.0 s, exactly on the old budget.
+
+## Bug fixes
+
+- **A reclaimed session no longer lists as running.** A stopped or reaped session reported `status: exited` only after its provider settled `done`; until then the panel showed it under running with a stop button. The view now reports a reclaimed session as `exited`, while the internal status is left alone so `close` still reports the exit code its terminator produces.
+- **A finished row's clock stops at the end.** The panel computed every duration as `now - startedAt`, so a dead row kept counting up. Retention stamps `lastActiveAt` and a finished row's clock uses it; running rows keep ticking.
+- **The blank line after every echoed command is gone.** ConPTY sends a lone CR — a cursor return — before a command's output, and a CRLF can straddle two chunks; both became an extra line break. A line-leading CR is now dropped and a split CRLF is paired across chunks.
+- **Reopening the header panel no longer jumps.** The anchor survived a close, so the first frame painted at the previous position and the measurement moved it. The position is cleared on close and on open, so the first frame stays hidden until it is measured.
+
+## Compatibility
+
+- No change to the tool schema, rows, config keys or existing results. `read`'s `waitMs` and `all` are additive parameters; `waitReason` gains new string values on an existing field. The Session header panel registers on `conversation.session.header.actions` and needs the Connection service — a deployment without it registers nothing and the rest is unchanged.
+- Stated limit: the finished list holds eight sessions with their output rings (about 1 MiB each at most) in memory, evicted in ending order; an evicted id is no longer readable.
+
 # dsh-win-multi-bash v0.7.4
 
 ## New
