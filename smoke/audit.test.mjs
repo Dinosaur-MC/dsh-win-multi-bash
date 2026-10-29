@@ -3887,12 +3887,6 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
     maxSessions: 2, idleMs: 0, rows: 30, cols: 110, maxBufferBytes: 4096, waitMs: 300, quietMs: 60, graceMs: 1000, ...over,
   })
   const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-  const throwsSync = (fn, predicate, label) => {
-    let error
-    try { fn() } catch (caught) { error = caught }
-    assert.ok(error !== undefined, label + ': expected a refusal')
-    assert.ok(predicate(error), label + ': ' + String(error?.message ?? error))
-  }
   await testAsync('the session cap, owner fence, signal set and disposal are enforced', async () => {
     const fake = fakePty()
     const sessions = createTerminalSessions({ subprocess: fake.service }, {})
@@ -3900,7 +3894,7 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
     await sessions.open(sessionRequest('agent-a'))
     await assert.rejects(() => sessions.open(sessionRequest('agent-a')), (error) => error.code === 'SESSION_LIMIT')
     assert.equal(fake.spawned.length, 2, 'the refused open spawned nothing')
-    throwsSync(() => sessions.read({ ownerKey: 'agent-b', sessionId: opened.session.id }),
+    await assert.rejects(() => sessions.read({ ownerKey: 'agent-b', sessionId: opened.session.id }),
       (error) => error.code === 'FOREIGN_SESSION', 'another agent')
     assert.equal(sessions.list('agent-b').length, 0)
     // Three of the five declared signals can reach this platform's provider at all; the
@@ -4002,8 +3996,142 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
     const idled = await sessions.open(sessionRequest('a', { idleMs: 40 }))
     await settle(140)
     assert.equal(fake.handles[1].terminated, 1)
-    throwsSync(() => sessions.read({ ownerKey: 'a', sessionId: idled.session.id }),
+    await assert.rejects(() => sessions.read({ ownerKey: 'a', sessionId: idled.session.id }),
       (error) => error.code === 'SESSION_GONE' && /idle reaper/.test(error.message), 'an idle-reclaimed id')
+    await sessions.dispose()
+  })
+
+  await testAsync('read honors waitMs: it blocks for new output instead of snapshotting empty', async () => {
+    // The reported failure: a model passed waitMs and got an instant empty snapshot,
+    // because `read` had no wait path at all. Both halves are pinned here — the wait
+    // must RETURN the output that arrives inside it, and the budget must stay a budget.
+    const fake = fakePty()
+    const sessions = createTerminalSessions({ subprocess: fake.service }, {})
+    const opened = await sessions.open(sessionRequest('a', { startupWaitMs: 0 }))
+    const handle = fake.handles[0]
+    const instant = await sessions.read({ ownerKey: 'a', sessionId: opened.session.id })
+    assert.equal(instant.text, '')
+    assert.equal(instant.waitReason, 'no_output', 'an empty read explains itself instead of looking broken')
+    setTimeout(() => handle.output.write('LATE-DELTA\n'), 150)
+    const began = Date.now()
+    const waited = await sessions.read({ ownerKey: 'a', sessionId: opened.session.id, waitMs: 2000 })
+    assert.match(waited.text, /LATE-DELTA/, 'the wait returns the output that arrived inside it')
+    assert.ok(Date.now() - began >= 100, 'and it really waited for it')
+    assert.equal(waited.waitReason, undefined, 'output is its own explanation')
+    const beganTimeout = Date.now()
+    const timedOut = await sessions.read({ ownerKey: 'a', sessionId: opened.session.id, waitMs: 120 })
+    assert.equal(timedOut.text, '')
+    assert.equal(timedOut.waitReason, 'timeout', 'an empty wait names the cap')
+    assert.ok(Date.now() - beganTimeout >= 100, 'the timeout is not an early return')
+    await sessions.dispose()
+  })
+
+  await testAsync('read all dumps the retained window without moving the delta cursor', async () => {
+    const fake = fakePty()
+    const sessions = createTerminalSessions({ subprocess: fake.service }, {})
+    const opened = await sessions.open(sessionRequest('a', { startupWaitMs: 0 }))
+    const handle = fake.handles[0]
+    handle.output.write('ALPHA\n')
+    await settle(30)
+    assert.match((await sessions.read({ ownerKey: 'a', sessionId: opened.session.id })).text, /ALPHA/, 'the delta read consumes ALPHA')
+    handle.output.write('BETA\n')
+    await settle(30)
+    const all = await sessions.read({ ownerKey: 'a', sessionId: opened.session.id, all: true })
+    assert.equal(all.text, 'ALPHA\nBETA\n', 'all returns the whole retained window')
+    assert.equal(all.lossy, false, 'a scrollback read never claims a dropped offset')
+    const delta = await sessions.read({ ownerKey: 'a', sessionId: opened.session.id })
+    assert.equal(delta.text, 'BETA\n', 'the scrollback read did not consume the caller\'s delta')
+    await sessions.dispose()
+  })
+
+  await testAsync('send and signal start their delta at the caller\'s cursor, so unread output is never swallowed', async () => {
+    // Output that lands AFTER a call returned and BEFORE the next one used to be invisible
+    // forever: send/signal read from the ring\'s end and then jumped the cursor past it.
+    const fake = fakePty()
+    const sessions = createTerminalSessions({ subprocess: fake.service }, {})
+    const opened = await sessions.open(sessionRequest('a', { startupWaitMs: 0 }))
+    const handle = fake.handles[0]
+    handle.output.write('BEFORE-SEND\n')
+    await settle(30)
+    const sent = await sessions.send({ ownerKey: 'a', sessionId: opened.session.id, text: 'cmd', waitMs: 120, quietMs: 30 })
+    assert.match(sent.text, /BEFORE-SEND/, 'the send carries the output the caller had not read yet')
+    handle.output.write('BEFORE-SIGNAL\n')
+    await settle(30)
+    const signalled = await sessions.signal({ ownerKey: 'a', sessionId: opened.session.id, signal: 'SIGINT', waitMs: 120, quietMs: 30 })
+    assert.match(signalled.text, /BEFORE-SIGNAL/, 'and so does the signal')
+    assert.equal((await sessions.read({ ownerKey: 'a', sessionId: opened.session.id })).text, '',
+      'nothing is left over once it has been delivered')
+    await sessions.dispose()
+  })
+
+  await testAsync('a send settles on its own echo even when the echo lands before the wait opens', async () => {
+    // The wait used to count "output this wait has seen" from its own start clock, so an
+    // echo that landed while the write was still resolving was read as "no output yet",
+    // and a silent command then paid the whole waitMs instead of settling on its silence.
+    const fake = fakePty()
+    const sessions = createTerminalSessions({ subprocess: fake.service }, {})
+    const opened = await sessions.open(sessionRequest('a', { startupWaitMs: 0 }))
+    const handle = fake.handles[0]
+    handle.write = async (data) => {
+      handle.writes.push(data)
+      handle.output.write('echo: ' + data + '\n')
+      await settle(0)
+    }
+    const began = Date.now()
+    const sent = await sessions.send({ ownerKey: 'a', sessionId: opened.session.id, text: 'silent', waitMs: 5000, quietMs: 40 })
+    assert.match(sent.text, /echo: silent/, 'the echo is part of the result')
+    assert.equal(sent.waitReason, 'quiet', 'silence after the echo is the right verdict')
+    assert.ok(Date.now() - began < 1000, 'and the send never pays the whole cap')
+    await sessions.dispose()
+  })
+
+  await testAsync('read all on an empty window explains itself and keeps the resume offset', async () => {
+    // `all` must not be the one read form that returns a bare empty string, and its
+    // nextOffset is the caller's delta cursor (the resume point), not the window's end.
+    const fake = fakePty()
+    const sessions = createTerminalSessions({ subprocess: fake.service }, {})
+    const opened = await sessions.open(sessionRequest('a', { startupWaitMs: 0 }))
+    const all = await sessions.read({ ownerKey: 'a', sessionId: opened.session.id, all: true })
+    assert.equal(all.text, '')
+    assert.equal(all.waitReason, 'no_output', 'an empty scrollback is explained like any other empty read')
+    assert.equal(all.nextOffset, 0, 'all reports the delta cursor it left alone')
+    // The registry refuses the meaningless combinations itself: a direct caller must not
+    // get a silent "all wins" answer that only the tool row would have refused.
+    await assert.rejects(() => sessions.read({ ownerKey: 'a', sessionId: opened.session.id, all: true, offset: 0 }),
+      (error) => error.code === 'INVALID_REQUEST', 'all + offset')
+    await assert.rejects(() => sessions.read({ ownerKey: 'a', sessionId: opened.session.id, all: true, waitMs: 10 }),
+      (error) => error.code === 'INVALID_REQUEST', 'all + waitMs')
+    await sessions.dispose()
+  })
+
+  await testAsync('a blocked read is cancelled with the call instead of running its budget out', async () => {
+    // The budget can be minutes long; a cancelled call must stop polling now, not at the
+    // cap, or a Stop in the UI leaves the turn blocked behind a shell that said nothing.
+    const fake = fakePty()
+    const sessions = createTerminalSessions({ subprocess: fake.service }, {})
+    const opened = await sessions.open(sessionRequest('a', { startupWaitMs: 0 }))
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(), 80)
+    const began = Date.now()
+    await assert.rejects(
+      () => sessions.read({ ownerKey: 'a', sessionId: opened.session.id, waitMs: 10000, abortSignal: controller.signal }),
+      (error) => error.code === 'ABORTED',
+      'the wait reports the abort to the row that maps it',
+    )
+    assert.ok(Date.now() - began < 2000, 'and it never reaches the ten-second budget')
+    await sessions.dispose()
+  })
+
+  await testAsync('a read wait counts as activity, so the idle reaper cannot close the session it watches', async () => {
+    // idleMs shorter than the wait used to let the reaper terminate the very session the
+    // caller was blocked on; the wait has to refresh the idle clock while it polls.
+    const fake = fakePty()
+    const sessions = createTerminalSessions({ subprocess: fake.service }, {})
+    const opened = await sessions.open(sessionRequest('a', { startupWaitMs: 0, idleMs: 150, maxSessions: 1 }))
+    setTimeout(() => fake.handles[0].output.write('AFTER-IDLE-WINDOW\n'), 400)
+    const read = await sessions.read({ ownerKey: 'a', sessionId: opened.session.id, waitMs: 2000 })
+    assert.match(read.text, /AFTER-IDLE-WINDOW/, 'the session survived an idleMs shorter than the wait')
+    assert.equal(sessions.list('a').length, 1, 'and it is still live afterwards')
     await sessions.dispose()
   })
 
@@ -4173,6 +4301,20 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
           assert.match(await send('echo "PROBE=$DSH_WMB_PROBE"'), /PROBE=42/, 'the exported variable survived')
           await send("alias t='echo alias-ok'")
           assert.match(await send('t'), /alias-ok/, 'the alias survived')
+          // The reported bug, end to end over a real ConPTY: waitMs used to be ignored, so
+          // a poll during a long command was an instant empty snapshot.
+          const slow = await runTerminal(ctx, { action: 'send', sessionId: id, text: 'sleep 1; echo WAITED-$((6*7))', waitMs: 1200 })
+          assert.equal(slow.value.waitReason, 'quiet', 'the send returns on silence while the command is still running')
+          const waited = await runTerminal(ctx, { action: 'read', sessionId: id, waitMs: 4000 })
+          assert.match(waited.value.output, /WAITED-42/, 'read with waitMs returns the output that arrives during the wait')
+          const scrollback = await runTerminal(ctx, { action: 'read', sessionId: id, all: true })
+          assert.match(scrollback.value.output, /WAITED-42/, 'all returns the whole retained window')
+          const allWithWait = await runTerminal(ctx, { action: 'read', sessionId: id, all: true, waitMs: 10 })
+          assert.equal(allWithWait.isError, true, 'all and waitMs are refused together instead of one silently winning')
+          assert.match(allWithWait.text, /"all" .*"waitMs"/, 'and the refusal names the pair')
+          const allWithOffset = await runTerminal(ctx, { action: 'read', sessionId: id, all: true, offset: 0 })
+          assert.equal(allWithOffset.isError, true, 'all and offset are refused together too')
+          assert.match(allWithOffset.text, /"all" .*"offset"/, 'and names its own pair')
           const listed = await runTerminal(ctx, { action: 'list' })
           assert.equal(listed.value.kind, 'list')
           assert.ok(listed.value.sessions.some((session) => session.sessionId === id), 'list names the live session')
@@ -4182,8 +4324,10 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
           assert.ok(['quiet', 'idle', 'timeout'].includes(opened.value.waitReason), String(opened.value.waitReason))
           const drained = await runTerminal(ctx, { action: 'read', sessionId: id })
           assert.equal(drained.value.kind, 'session')
-          assert.deepEqual(Object.keys(drained.value).sort(), ['kind', 'lossy', 'nextOffset', 'output', 'remote', 'shell', 'truncated'],
-            'read must return exactly the declared fields')
+          assert.deepEqual(Object.keys(drained.value).filter((key) => key !== 'waitReason').sort(),
+            ['kind', 'lossy', 'nextOffset', 'output', 'remote', 'shell', 'truncated'],
+            'read must return exactly the declared fields (waitReason included only when there is one)')
+          if (drained.value.output === '') assert.equal(drained.value.waitReason, 'no_output', 'an empty read says why it is empty')
           assert.equal(drained.value.shell, 'git_bash', 'a session result names the shell it belongs to')
           assert.equal(drained.value.remote, false, 'and whether that shell runs its effects on another host')
         } finally {

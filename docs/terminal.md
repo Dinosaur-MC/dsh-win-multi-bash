@@ -6,7 +6,7 @@
 | --- | --- |
 | `open` | Starts a session and returns its `sessionId`, `pid`, cwd, shell/remote fact and startup output |
 | `send` | Writes `text` (with Enter unless `submit: false`) and returns the reply |
-| `read` | Reads new output without writing; `offset` re-reads from a whole-stream byte offset |
+| `read` | Reads new output without writing; `waitMs` blocks until the next output arrives, `all: true` dumps the retained scrollback, `offset` re-reads from a whole-stream byte offset |
 | `signal` | Delivers a signal to the foreground process group; on this platform only `SIGINT` reaches the shell |
 | `close` | Ends the session and waits for the outcome its own terminate produced |
 | `list` | The sessions you own |
@@ -28,6 +28,9 @@ The backend is the dialect registry. `shell` names one of the dialects that decl
 ## Output and waits
 
 - **A wait that ends on silence is not a finished command.** `send` / `signal` return once output has been silent for `quietMs` and report `waitReason: "quiet"`; a tty echoes input within milliseconds, so silence usually starts long before a command finishes. `timeout` means the wait hit `waitMs` and the session is still running. Either way, `read` again for more.
+- **`read` waits only when asked, and says why it is empty.** With a positive `waitMs` (clamped to `maxWaitMs`) it blocks until NEW output arrives and returns that delta the moment it lands; without one the call is an instant snapshot. An empty answer is never bare: it carries `waitReason: "no_output"` (nothing new since the last read), `"timeout"` (the budget ended with nothing new), or `"session_exit"`. The wait is cancelled with the call: an aborted tool call stops polling immediately instead of holding the session for the rest of its budget.
+- **`all: true` is the unconditional form of `read`.** It returns the whole retained window (the scrollback) instead of a delta, and does not move the read cursor, so a later delta read still reports everything that arrived after the last delta; its `nextOffset` is therefore that cursor, not the end of the window. It is refused together with `offset` or `waitMs` (at the tool row and in the registry) rather than letting one silently win, and an empty window reports `no_output` like any other empty read.
+- **A `send` or `signal` never swallows output.** Its delta starts at the caller's read cursor, not at the moment of the write, so output that arrived between the last read and the call is delivered with it instead of becoming invisible. That means a `send` after a long unread stretch carries the backlog too — bounded by `maxBufferBytes`, and reported by `truncated` / `lossy` like any other read.
 - **Output is bounded and honest about it.** Each session retains the last `maxBufferBytes` (default 1 MiB) of **sanitized** text and reports two facts separately: `truncated` (the session dropped output at some point) and `lossy` (the offset this read asked for had already been dropped, so the whole retained tail came back instead of a delta). ANSI escape sequences are stripped; there is no terminal emulator, so a program that redraws one line with carriage returns becomes several lines.
 
 ## Lifecycle
@@ -85,6 +88,6 @@ The defaults were measured, not guessed:
 - `quietMs` 500 ms has ~2.3× headroom over the worst inter-chunk gap seen (216 ms, 18 runs of `ls -la /usr/bin | head -80`);
 - 1 MiB is the boundary a single `seq 1 200000` crosses (1,489,391 B raw; the plugin's escape stripping leaves 1,289,146 B = 1.229 MiB, and the ring counts that), which is what makes `truncated` observable;
 - `waitMs` 10 s was verified with a 40×200 ms ticker that returned partial output while the session stayed alive;
-- the 4 s startup budget covers the first prompt, measured at roughly 0.5–0.7 s on this host (a cold first ConPTY allocation is the slow end).
+- the 10 s startup budget covers the first prompt: a bare `bash -i` prints in ~0.8 s here, but a session loads the user's startup files, and this repository's prompt runs git — the first prompt measured ~4.0 s, exactly on the old 4 s budget, so every `open` used to pay it and report `timeout`.
 
 Every one of these is live-editable on the row's Plugins page.
