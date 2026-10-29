@@ -45,6 +45,20 @@ A PTY session runs **unconfined**, and says so:
 - `terminal.allowUnconfined: false` makes `open` refuse instead of running unprotected;
 - a session in a remote backend (SSH) also carries `remote: true` and says so in its first line — the one fact that matters there, since the files it touches are not on this host; `unconfined` stays true beside it.
 
+## Session header panel
+
+The browser half adds one control beside the Session title (`conversation.session.header.actions`, the same list the first-party job and subagent entries use), modelled on the first-party **jobs** list (`@deepseek-ai/dsh-client-ui-jobs`):
+
+- the trigger is a live dot plus a count and a chevron (`3 terminal sessions running`), and it renders **nothing** while no session exists — exactly like the job list;
+- the popover lists **Running** rows first (filled cards, live dot, shell badge, name, cwd, elapsed time) and a **Finished** section for sessions whose shell already exited;
+- each row carries a two-press **Stop** (the first press arms it for 3 s and widens into a labelled confirm, the second sends the stop) — the same affordance as the job list's kill;
+- rows poll `sessions.list` every 2 s while open and the elapsed clock ticks every second.
+
+- The list and the stop ride the deployment's own Connection RPC channel (`/win-mb`): `sessions.list` answers with the registry's view, `sessions.stop` closes one session through the same `reclaim` path as the tool's `close`, and the tombstone records `stopped by the user from the session header` so a later model read names who ended it.
+- A deployment without `ctx.connection`, or a shell that does not declare the slot, registers nothing: the button simply does not appear and every tool keeps working.
+- The panel polls every 2 s while open. It is a reading surface, not a second control plane: the model's `terminal list` / `close` remain the agent-facing contract.
+- A session can end without a tool call — the shell exits, the idle reaper closes it, or a human presses Stop. Each of those posts **one in-session notice** to the agent that opened the session (`session … was stopped from the session header` / `closed by the idle reaper` / `exited on its own`), so the owner reads it instead of polling. A model's own `close` is not announced: its tool result already said so.
+
 ## Signals
 
 Only `SIGINT` reaches the shell on this platform; the other four are refused **by name**:

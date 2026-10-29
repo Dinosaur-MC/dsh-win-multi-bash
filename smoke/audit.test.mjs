@@ -4006,6 +4006,48 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
       (error) => error.code === 'SESSION_GONE' && /idle reaper/.test(error.message), 'an idle-reclaimed id')
     await sessions.dispose()
   })
+
+  await testAsync('the session header lists and stops any session without an owner key', async () => {
+    // The header is a human surface: it lists every live session and may stop
+    // one, so its reason must reach the tombstone a later model read reports.
+    const fake = fakePty()
+    const sessions = createTerminalSessions({ subprocess: fake.service }, {})
+    const opened = await sessions.open(sessionRequest('agent-a', { maxSessions: 1 }))
+    const listed = sessions.listAll()
+    assert.equal(listed.length, 1, 'listAll returns every live session')
+    assert.equal(listed[0].sessionId, opened.session.id)
+    assert.equal(listed[0].shell, 'git_bash')
+    assert.deepEqual(await sessions.stop(opened.session.id), { sessionId: opened.session.id, shell: 'git_bash', closed: true })
+    assert.equal(fake.handles[0].terminated, 1, 'stop terminates the provider session once')
+    assert.equal(sessions.listAll().length, 0)
+    await assert.rejects(() => sessions.stop(opened.session.id),
+      (error) => error.code === 'SESSION_GONE' && /stopped by the user from the session header/.test(error.message),
+      'a stopped id explains itself, naming the header as the reason')
+    await sessions.dispose()
+  })
+
+  await testAsync('a session announces its end once: exit and header stop notify, a model close stays silent', async () => {
+    // A PTY can end without a tool call, and the owner is not watching it.
+    const fake = fakePty()
+    const events = []
+    const sessions = createTerminalSessions({ subprocess: fake.service }, { notify: (event) => events.push(event) })
+    const a = await sessions.open(sessionRequest('agent-a', { maxSessions: 3 }))
+    fake.handles[0].exit({ exitCode: 0, signal: null })
+    await settle(60)
+    assert.deepEqual(events.map((event) => event.cause), ['exited'], 'a spontaneous exit is news')
+    assert.equal(events[0].session.id, a.session.id)
+    assert.equal(events[0].view.status, 'exited')
+    const b = await sessions.open(sessionRequest('agent-a', { maxSessions: 3 }))
+    await sessions.close({ ownerKey: 'agent-a', sessionId: b.session.id })
+    await settle(30)
+    assert.deepEqual(events.map((event) => event.cause), ['exited'], 'a model close is not news: the tool result said it')
+    const c = await sessions.open(sessionRequest('agent-a', { maxSessions: 3 }))
+    await sessions.stop(c.session.id)
+    assert.deepEqual(events.map((event) => event.cause), ['exited', 'stopped'], 'the header stop is announced as such')
+    await sessions.stop(c.session.id).catch(() => {})
+    assert.equal(events.length, 2, 'one session, one notice')
+    await sessions.dispose()
+  })
 }
 
 console.log('\n[B] boot integration: the terminal row over a REAL PTY (state must survive between calls)')
@@ -4299,6 +4341,44 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.equal(client.name, 'dsh-win-multi-bash')
     assert.equal(client.__internals, undefined, 'the helpers must not ride on the export surface')
     assert.equal(typeof internals.shellCard, 'function', 'they are still reachable through the test seam')
+  })
+
+  test('the session header panel registers on the declared slot when a connection exists', () => {
+    // The panel rides the deployment's own Connection RPC channel. The header slot
+    // is declared by ui-conversation, so `slots.inject` only fires where that shell
+    // renders; the inject face carries the connection into the component.
+    const registered = []
+    const platform = {
+      locale: { register: () => () => {}, t: (key) => key },
+      configForms: { get: () => ({ get: () => ({}), inject: () => ({}) }), whileServed: (rows, run) => run() },
+      slots: {
+        inject: (name, run) => { run(); return () => {} },
+        register: (options, component) => { registered.push({ options, component }); return () => {} },
+      },
+      effect: (fn) => { fn(); return () => {} },
+      connection: { rpc: { call: async () => ({ sessions: [] }) } },
+      logger: { warn: () => {} },
+    }
+    const panelClient = registrations[0].factory((id) => {
+      if (id === 'react')
+        return {
+          createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+          useState: (initial) => [initial, () => {}],
+          useRef: (initial) => ({ current: initial }),
+          useCallback: (fn) => fn,
+          useEffect: () => {},
+          Fragment: 'Fragment',
+        }
+      if (id === '@deepseek-ai/dsh-client-ui-primitives') return {}
+      throw new Error('unexpected client require: ' + id)
+    })
+    panelClient.apply(Object.assign({ get: (name) => platform[name] }, platform))
+    const entry = registered.find((item) => item.options.name === 'conversation.session.header.actions')
+    assert.ok(entry, 'the header slot must be registered when a connection exists')
+    assert.equal(entry.options.id, 'dsh-win-multi-bash:terminal-sessions')
+    assert.equal(entry.options.order, 20)
+    // Like the job list, the control renders nothing while no session exists.
+    assert.equal(entry.component({ t: (key) => key, connection: platform.connection }), null, 'an empty registry hides the control')
   })
 
   test('it declares the client services the page needs', () => {
