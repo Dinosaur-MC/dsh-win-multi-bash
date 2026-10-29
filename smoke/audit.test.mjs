@@ -3996,8 +3996,11 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
     const idled = await sessions.open(sessionRequest('a', { idleMs: 40 }))
     await settle(140)
     assert.equal(fake.handles[1].terminated, 1)
-    await assert.rejects(() => sessions.read({ ownerKey: 'a', sessionId: idled.session.id }),
-      (error) => error.code === 'SESSION_GONE' && /idle reaper/.test(error.message), 'an idle-reclaimed id')
+    // An ended session keeps its ring: reading it still works, while new input
+    // is refused with the reason it ended.
+    assert.equal((await sessions.read({ ownerKey: 'a', sessionId: idled.session.id })).shell, 'git_bash', 'an idle-reclaimed id stays readable')
+    await assert.rejects(() => sessions.send({ ownerKey: 'a', sessionId: idled.session.id, text: 'x', waitMs: 50 }),
+      (error) => error.code === 'SESSION_GONE' && /idle reaper/.test(error.message), 'a dead id refuses new input')
     await sessions.dispose()
   })
 
@@ -4147,10 +4150,32 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
     assert.equal(listed[0].shell, 'git_bash')
     assert.deepEqual(await sessions.stop(opened.session.id), { sessionId: opened.session.id, shell: 'git_bash', closed: true })
     assert.equal(fake.handles[0].terminated, 1, 'stop terminates the provider session once')
-    assert.equal(sessions.listAll().length, 0)
+    // Ended sessions stay listed (finished section) and readable; only new input
+    // and a second stop are refused, with the reason.
+    const ended = sessions.listAll()
+    assert.equal(ended.length, 1, 'a stopped session stays in the finished list')
+    assert.equal(ended[0].status, 'exited')
+    assert.equal(sessions.tail(opened.session.id).sessionId, opened.session.id, 'its retained output is still readable')
+    assert.equal((await sessions.read({ ownerKey: 'agent-a', sessionId: opened.session.id })).shell, 'git_bash', 'an agent can read it too')
     await assert.rejects(() => sessions.stop(opened.session.id),
       (error) => error.code === 'SESSION_GONE' && /stopped by the user from the session header/.test(error.message),
       'a stopped id explains itself, naming the header as the reason')
+    await sessions.dispose()
+  })
+
+  await testAsync('finished sessions are retained up to the limit, then evicted with a reason', async () => {
+    const fake = fakePty()
+    const sessions = createTerminalSessions({ subprocess: fake.service }, {})
+    const ids = []
+    for (let index = 0; index < 9; index += 1) {
+      const opened = await sessions.open(sessionRequest('agent-a', { maxSessions: 1 }))
+      ids.push(opened.session.id)
+      await sessions.stop(opened.session.id)
+    }
+    assert.equal(sessions.listAll().length, 8, 'the retention limit bounds the finished list')
+    await assert.rejects(() => sessions.read({ ownerKey: 'agent-a', sessionId: ids[0] }),
+      (error) => error.code === 'SESSION_GONE' && /evicted/.test(error.message), 'the oldest finished session')
+    assert.equal((await sessions.read({ ownerKey: 'agent-a', sessionId: ids[8] })).shell, 'git_bash', 'the newest is still readable')
     await sessions.dispose()
   })
 

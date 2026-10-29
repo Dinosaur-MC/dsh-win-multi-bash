@@ -48,6 +48,15 @@ A PTY session runs **unconfined**, and says so:
 - `terminal.allowUnconfined: false` makes `open` refuse instead of running unprotected;
 - a session in a remote backend (SSH) also carries `remote: true` and says so in its first line — the one fact that matters there, since the files it touches are not on this host; `unconfined` stays true beside it.
 
+## Finished sessions
+
+A session that ends is still history. `reclaim` moves it to a bounded **finished** list (8 sessions, oldest evicted first) instead of dropping it, so:
+
+- `list` keeps showing it with `status: exited`, and the Session header's finished section keeps its row expandable;
+- `read` answers from the retained ring — the delta since your cursor, or `all: true` for the whole window; `tail` (the panel's expand) returns that window without moving any cursor;
+- `send`, `signal` and `close` are refused with the reason it ended (`stopped by the user from the session header`, `closed by the idle reaper after …`, `exited before its first prompt`);
+- an evicted id answers `is gone — finished session evicted (retention limit)`.
+
 ## Session header panel
 
 The browser half adds one control beside the Session title (`conversation.session.header.actions`, the same list the first-party job and subagent entries use), modelled on the first-party **jobs** list (`@deepseek-ai/dsh-client-ui-jobs`):
