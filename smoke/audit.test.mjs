@@ -4179,6 +4179,42 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
     await sessions.dispose()
   })
 
+  await testAsync('a stopped session reads as ended instead of waiting for a provider that never settles', async () => {
+    // `terminate` ends the output stream here but never settles `done`, which is the
+    // shape a real provider can leave behind; `read` must not treat that as "running".
+    const fake = fakePty()
+    const sessions = createTerminalSessions({ subprocess: fake.service }, {})
+    const opened = await sessions.open(sessionRequest('agent-a', { maxSessions: 1 }))
+    await sessions.stop(opened.session.id)
+    const started = Date.now()
+    const result = await sessions.read({ ownerKey: 'agent-a', sessionId: opened.session.id, waitMs: 5000 })
+    assert.equal(result.waitReason, 'session_exit', 'a reclaimed session is over, not still running')
+    assert.ok(Date.now() - started < 1000, 'the wait ended at once instead of burning its budget')
+    await sessions.dispose()
+  })
+
+  await testAsync('a shell that exits on its own is retired: the cap frees and the ring stays readable', async () => {
+    const fake = fakePty()
+    const sessions = createTerminalSessions({ subprocess: fake.service }, {})
+    const first = await sessions.open(sessionRequest('agent-a', { maxSessions: 1 }))
+    await sessions.send({ ownerKey: 'agent-a', sessionId: first.session.id, text: 'echo bye', quietMs: 30, waitMs: 50 })
+    fake.handles[0].exit({ exitCode: 0 })
+    await settle(20)
+    const listed = sessions.listAll()
+    assert.equal(listed.length, 1, 'the ended session is retained, not dropped')
+    assert.equal(listed[0].status, 'exited')
+    const second = await sessions.open(sessionRequest('agent-b', { maxSessions: 1 }))
+    assert.equal(second.session.shell, 'git_bash', 'the dead session no longer holds the only slot')
+    assert.equal((await sessions.read({ ownerKey: 'agent-a', sessionId: first.session.id })).shell, 'git_bash', 'its ring is still readable')
+    await sessions.dispose()
+  })
+
+  test('a session killed mid-escape does not end its output with the fragment', () => {
+    const sanitizer = new TerminalSanitizer()
+    assert.equal(sanitizer.push('abc\u001b[3').text, 'abc')
+    assert.equal(sanitizer.flush().text, '', 'the half-written sequence is dropped, not printed')
+  })
+
   await testAsync('a session announces its end once: exit and header stop notify, a model close stays silent', async () => {
     // A PTY can end without a tool call, and the owner is not watching it.
     const fake = fakePty()
