@@ -3815,6 +3815,8 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
     assert.deepEqual(volatilePaths(terminalTool.Config), TERMINAL_FORM_ROWS[0].fields.map((knob) => knob.path.join('.')))
     const schema = terminalTool.Config({})
     assert.equal(schema.terminal.defaultShell.get(), TERMINAL_BACKENDS[0].toolName, 'the default is the first capable dialect')
+    // 0 is the documented way to turn idle reclamation off, so the schema must accept it.
+    assert.equal(terminalTool.Config({ terminal: { idleMs: 0 } }).terminal.idleMs.get(), 0, 'a stored 0 survives the schema')
     assert.equal(schema.terminal.allowUnconfined.get(), true)
     for (const backend of TERMINAL_BACKENDS)
       assert.ok(schema[backend.configKey] !== undefined, backend.configKey + ' must have a pin partition')
@@ -4137,6 +4139,18 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
     const read = await sessions.read({ ownerKey: 'a', sessionId: opened.session.id, waitMs: 2000 })
     assert.match(read.text, /AFTER-IDLE-WINDOW/, 'the session survived an idleMs shorter than the wait')
     assert.equal(sessions.list('a').length, 1, 'and it is still live afterwards')
+    await sessions.dispose()
+  })
+
+  await testAsync('idleMs 0 arms no reaper at all', async () => {
+    const fake = fakePty()
+    const sessions = createTerminalSessions({ subprocess: fake.service }, {})
+    const opened = await sessions.open(sessionRequest('a', { startupWaitMs: 0, idleMs: 0, maxSessions: 1 }))
+    await settle(300)
+    const live = sessions.list('a').filter((session) => session.status === 'running')
+    assert.equal(live.length, 1, 'the session stayed live with no activity')
+    assert.equal(live[0].sessionId, opened.session.id)
+    assert.equal(fake.handles[0].terminated ?? 0, 0, 'and the provider was never asked to terminate it')
     await sessions.dispose()
   })
 
