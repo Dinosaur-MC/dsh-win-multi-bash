@@ -6,16 +6,18 @@
 - **Every session now says how it ended.** The registry records a structured `endedReason` beside the prose it already kept, and both `sessions.list` and the model-facing `terminal list` carry it together with `exitCode`: `running`, `exited`, `exit N`, `stopped`, `idle timeout`, `closed`, `cancelled`, `died at startup`, `transport failed`. The panel colours its dot and picks its status word from that field instead of from exited-or-not.
 - **Any number of rows can be expanded at once.** Each open row owns its tail poll, its scroll-follow flag and its own output element, so two shells can be watched side by side; reopening the panel or unfolding the finished section returns each row to the end of its output.
 
-## Fixes
+## Improvements
+
+- **`promoteOnTimeout` is a real knob.** It was declared non-volatile, so the settings service never offered it; it is now volatile and present on the Plugins page, in both languages.
+- **The sandbox temp guard stops probing when it is off.** With `guardSandboxTemp: false` or a row whose stance is `none`, every spawn still created a private temp root and granted it an ACE before returning. Both cases now return before touching the seam.
+- **The self-heal warnings key on the result, not on the first failure.** One latch swallowed every later `GRANT_FAILED`; the mkdir, ACL, grant, grant-free and healed outcomes now warn on their own keys.
+- **Probing `ctx.get('loader')` can no longer fail a whole row.** The composed-row loader lookup is wrapped, with a safe fallback, so a live context that throws on the probe no longer drops every contribution registered after it.
+- **The MSYS2 dialect's PATH is its own.** `<MSYSTEM>\\bin` now leads the PATH it builds, and it no longer routes through the Git executor's PATH rewriting, so `MSYSTEM=UCRT64` means what it says.
+
+## Bug fixes
 
 - **A shell that exited on its own no longer keeps a live idle timer.** `retire()` did not mark the session closed, so a later `read` re-armed the reaper; it then re-entered the retention path as `idle timeout`, rewrote the ending, reset the elapsed clock and put a cleared row back in the list. A retired session is now `closed` for every purpose, and the end notice is selected by the reason code rather than by matching prose.
 - **A spawn that crossed the disposal boundary is reclaimed instead of leaked.** The start path checked for disposal once, before the spawn settled; a session published after the row was disposed outlived its owner. `open` now re-checks and reclaims, so a terminal cannot survive the plugin reload that killed its row.
-- **The sandbox temp guard stops probing when it is off.** With `guardSandboxTemp: false` or a row whose stance is `none`, every spawn still created a private temp root and granted it an ACE before returning. Both cases now return before touching the seam.
-- **The self-heal warnings key on the result, not on the first failure.** One latch swallowed every later `GRANT_FAILED`; the mkdir, ACL, grant, grant-free and healed outcomes now warn on their own keys.
-- **`promoteOnTimeout` is a real knob.** It was declared non-volatile, so the settings service never offered it; it is now volatile and present on the Plugins page, in both languages.
-- **Probing `ctx.get('loader')` can no longer fail a whole row.** The composed-row loader lookup is wrapped, with a safe fallback, so a live context that throws on the probe no longer drops every contribution registered after it.
-- **The MSYS2 dialect's PATH is its own.** `<MSYSTEM>\bin` now leads the PATH it builds, and it no longer routes through the Git executor's PATH rewriting, so `MSYSTEM=UCRT64` means what it says.
-
 ## Docs
 
 - **The documents match the code again.** `terminal.md` states the real end paths, the fixed close grace, which rows carry Stop, the 5 s closed poll and the 1.5 s tail re-read, the verbatim end notices, and the two reload outcomes (a page refresh keeps sessions, a plugin reload ends them and keeps no record). `verification.md` no longer claims the test suite verifies the shipped default rows, `RELEASE_NOTES` for 0.7.5 was corrected in place, and the bilingual README pair is back in step with its recorded hashes.
