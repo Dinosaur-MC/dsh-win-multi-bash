@@ -4194,6 +4194,26 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
     await sessions.dispose()
   })
 
+  await testAsync('the session cap is per conversation, and a host ceiling refuses across owners', async () => {
+    const fake = fakePty()
+    const sessions = createTerminalSessions({ subprocess: fake.service }, {})
+    await sessions.open(sessionRequest('agent-a', { maxSessions: 2, maxSessionsTotal: 3 }))
+    await sessions.open(sessionRequest('agent-a', { maxSessions: 2, maxSessionsTotal: 3 }))
+    // One conversation at its own limit must not lock another conversation out.
+    await sessions.open(sessionRequest('agent-b', { maxSessions: 2, maxSessionsTotal: 3 }))
+    const total = await sessions.open(sessionRequest('agent-b', { maxSessions: 2, maxSessionsTotal: 3 })).catch((error) => error)
+    assert.equal(total.code, 'SESSION_LIMIT_TOTAL', 'the host ceiling is a different refusal')
+    assert.match(total.message, /maxSessionsTotal/, 'and the message names the host-wide knob')
+    assert.match(total.message, /deployment-wide limit is 3/, 'with the number it actually hit')
+    // The per-conversation refusal names its own knob, not the host one.
+    const first = await sessions.open(sessionRequest('agent-c', { maxSessions: 1, maxSessionsTotal: 9 }))
+    assert.equal(typeof first.session.id, 'string')
+    const own = await sessions.open(sessionRequest('agent-c', { maxSessions: 1, maxSessionsTotal: 9 })).catch((error) => error)
+    assert.equal(own.code, 'SESSION_LIMIT')
+    assert.match(own.message, /this conversation already has 1 live session and the per-conversation limit is 1 \(maxSessions\)/)
+    await sessions.dispose()
+  })
+
   await testAsync('the header list and clear can be scoped to one conversation', async () => {
     // The panel belongs to a conversation: another conversation's terminals must
     // not appear in it, and its Clear must not wipe them either.
