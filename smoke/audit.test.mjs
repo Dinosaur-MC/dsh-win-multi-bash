@@ -4140,6 +4140,21 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
     await sessions.dispose()
   })
 
+  await testAsync('watching a row in the header keeps its session out of the idle reaper', async () => {
+    // The panel polls `tail` for open rows; that poll must refresh the idle clock,
+    // or a human reading the output loses the session mid-read.
+    const fake = fakePty()
+    const sessions = createTerminalSessions({ subprocess: fake.service }, {})
+    const opened = await sessions.open(sessionRequest('a', { startupWaitMs: 0, idleMs: 150, maxSessions: 1 }))
+    // `list` keeps the ended rows too, so ask for the live ones.
+    const live = () => sessions.list('a').filter((session) => session.status === 'running').length
+    for (let i = 0; i < 8; i += 1) { await settle(60); sessions.tail(opened.session.id) }
+    assert.equal(live(), 1, 'the tail poll kept it alive past idleMs')
+    await settle(400)
+    assert.equal(live(), 0, 'and once the panel stops polling the reaper takes it')
+    await sessions.dispose()
+  })
+
   await testAsync('the session header lists and stops any session without an owner key', async () => {
     // The header is a human surface: it lists every live session and may stop
     // one, so its reason must reach the tombstone a later model read reports.
