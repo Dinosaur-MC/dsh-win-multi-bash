@@ -3996,6 +3996,8 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
     const idled = await sessions.open(sessionRequest('a', { idleMs: 40 }))
     await settle(140)
     assert.equal(fake.handles[1].terminated, 1)
+    assert.equal(sessions.listAll().find((session) => session.sessionId === idled.session.id).endedReason, 'idle',
+      'the reaper names its own ending, not the generic fallback')
     // An ended session keeps its ring: reading it still works, while new input
     // is refused with the reason it ended.
     assert.equal((await sessions.read({ ownerKey: 'a', sessionId: idled.session.id })).shell, 'git_bash', 'an idle-reclaimed id stays readable')
@@ -4155,11 +4157,40 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
     const ended = sessions.listAll()
     assert.equal(ended.length, 1, 'a stopped session stays in the finished list')
     assert.equal(ended[0].status, 'exited')
+    // The panel colours its dot and picks its wording from the structured reason.
+    assert.equal(ended[0].endedReason, 'stopped', 'the view names how it ended, not only that it did')
+    // A real provider publishes the outcome after terminate; the stop must keep the
+    // reason even though an exit code now exists.
+    fake.handles[0].exit({ exitCode: 0 })
+    await settle(20)
+    const settledView = sessions.listAll()[0]
+    assert.equal(settledView.endedReason, 'stopped', 'the stop reason outranks the terminate outcome')
+    assert.equal(settledView.exitCode, 0, 'and the published code is still reported')
     assert.equal(sessions.tail(opened.session.id).sessionId, opened.session.id, 'its retained output is still readable')
     assert.equal((await sessions.read({ ownerKey: 'agent-a', sessionId: opened.session.id })).shell, 'git_bash', 'an agent can read it too')
     await assert.rejects(() => sessions.stop(opened.session.id),
       (error) => error.code === 'SESSION_GONE' && /stopped by the user from the session header/.test(error.message),
       'a stopped id explains itself, naming the header as the reason')
+    await sessions.dispose()
+  })
+
+  await testAsync('clearing the finished list empties the settled section but keeps the reason readable', async () => {
+    const fake = fakePty()
+    const sessions = createTerminalSessions({ subprocess: fake.service }, {})
+    const opened = await sessions.open(sessionRequest('agent-a', { maxSessions: 2 }))
+    const live = await sessions.open(sessionRequest('agent-b', { maxSessions: 2 }))
+    await sessions.stop(opened.session.id)
+    assert.equal(sessions.listAll().length, 2, 'the stopped session is retained first')
+    assert.equal(sessions.clearFinished(), 1, 'the clear reports how many rows it dropped')
+    const afterClear = sessions.listAll()
+    assert.equal(afterClear.length, 1, 'the live session survives the clear')
+    assert.equal(afterClear[0].sessionId, live.session.id)
+    assert.equal(afterClear[0].status, 'running', 'clearing history must not stop anything')
+    assert.equal((await sessions.read({ ownerKey: 'agent-b', sessionId: live.session.id })).shell, 'git_bash', 'and it stays readable')
+    assert.equal(sessions.clearFinished(), 0, 'clearing twice is a no-op, not an error')
+    await assert.rejects(() => sessions.read({ ownerKey: 'agent-a', sessionId: opened.session.id }),
+      (error) => error.code === 'SESSION_GONE' && /cleared from the session header/.test(error.message),
+      'a cleared id still explains itself instead of reading as unknown')
     await sessions.dispose()
   })
 
@@ -4203,6 +4234,8 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
     const listed = sessions.listAll()
     assert.equal(listed.length, 1, 'the ended session is retained, not dropped')
     assert.equal(listed[0].status, 'exited')
+    assert.equal(listed[0].endedReason, 'exited', 'a shell that exited names that ending')
+    assert.equal(listed[0].exitCode, 0, 'and carries the code the panel shows')
     const second = await sessions.open(sessionRequest('agent-b', { maxSessions: 1 }))
     assert.equal(second.session.shell, 'git_bash', 'the dead session no longer holds the only slot')
     assert.equal((await sessions.read({ ownerKey: 'agent-a', sessionId: first.session.id })).shell, 'git_bash', 'its ring is still readable')
@@ -4581,7 +4614,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     const entry = registered.find((item) => item.options.name === 'conversation.session.header.actions')
     assert.ok(entry, 'the header slot must be registered when a connection exists')
     assert.equal(entry.options.id, 'dsh-win-multi-bash:terminal-sessions')
-    assert.equal(entry.options.order, 20)
+    assert.equal(entry.options.order, 30, 'the panel follows the job list (order 20) in the header band')
     // Like the job list, the control renders nothing while no session exists.
     assert.equal(entry.component({ t: (key) => key, connection: platform.connection }), null, 'an empty registry hides the control')
   })
