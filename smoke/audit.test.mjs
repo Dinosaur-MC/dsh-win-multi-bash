@@ -4194,6 +4194,24 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
     await sessions.dispose()
   })
 
+  await testAsync('the header list and clear can be scoped to one conversation', async () => {
+    // The panel belongs to a conversation: another conversation's terminals must
+    // not appear in it, and its Clear must not wipe them either.
+    const fake = fakePty()
+    const sessions = createTerminalSessions({ subprocess: fake.service }, {})
+    const mine = await sessions.open(sessionRequest('agent-a', { maxSessions: 2 }))
+    const theirs = await sessions.open(sessionRequest('agent-b', { maxSessions: 2 }))
+    assert.deepEqual(sessions.list('agent-a').map((session) => session.sessionId), [mine.session.id], 'list(owner) filters')
+    await sessions.stop(theirs.session.id)
+    assert.equal(sessions.clearFinished('agent-a'), 0, 'clearing one owner leaves the other owner history alone')
+    assert.equal(sessions.listAll().length, 2, 'both rows are still there')
+    assert.equal(sessions.clearFinished('agent-b'), 1, 'the owner that has history clears it')
+    const left = sessions.listAll()
+    assert.equal(left.length, 1, 'only the finished row of that owner went away')
+    assert.equal(left[0].sessionId, mine.session.id)
+    await sessions.dispose()
+  })
+
   await testAsync('finished sessions are retained up to the limit, then evicted with a reason', async () => {
     const fake = fakePty()
     const sessions = createTerminalSessions({ subprocess: fake.service }, {})
