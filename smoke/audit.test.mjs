@@ -4174,6 +4174,35 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
     await sessions.dispose()
   })
 
+  await testAsync('a session already silent when the loop goes idle gets no quiet notice', async () => {
+    const fake = fakePty()
+    const notices = []
+    let idle = false
+    const sessions = createTerminalSessions({ subprocess: fake.service }, { notify: (event) => notices.push(event), isOwnerIdle: () => idle, transitionTickMs: 10 })
+    await sessions.open(sessionRequest('a', { startupWaitMs: 0, quietNoticeMs: 120, maxSessions: 1 }))
+    fake.handles[0].output.write('during the turn\n')
+    await settle(120)
+    idle = true
+    await settle(400)
+    assert.deepEqual(notices.map((notice) => notice.cause), [], 'a silence that began while busy is not a crossing')
+    await sessions.dispose()
+  })
+
+  await testAsync('turning the interval off live silences a session that is already open', async () => {
+    const fake = fakePty()
+    const notices = []
+    let interval = 120
+    const sessions = createTerminalSessions({ subprocess: fake.service }, { notify: (event) => notices.push(event), samplingMs: () => interval, transitionTickMs: 10 })
+    await sessions.open(sessionRequest('a', { startupWaitMs: 0, quietNoticeMs: 120, maxSessions: 1 }))
+    fake.handles[0].output.write('first\n')
+    await settle(300)
+    const before = notices.length
+    interval = 0
+    await settle(300)
+    assert.equal(notices.length, before, 'nothing new is reported once the interval is 0')
+    await sessions.dispose()
+  })
+
   await testAsync('a burst inside the first interval after the loop goes idle is reported', async () => {
     const fake = fakePty()
     const notices = []
@@ -4182,7 +4211,7 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
     await sessions.open(sessionRequest('a', { startupWaitMs: 0, quietNoticeMs: 120, maxSessions: 1 }))
     await settle(300)
     idle = true
-    await settle(30)
+    await settle(80)
     fake.handles[0].output.write('late start\n')
     await settle(500)
     const burst = notices.find((notice) => notice.cause === 'burst')
@@ -4213,13 +4242,14 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
     await settle(40)
     assert.equal(notices.length, 0, 'a session that just spoke is not quiet yet')
     await settle(400)
+    assert.ok(notices.length >= 1, 'the silence raises a notice')
     assert.equal(notices[0].cause, 'quiet', 'the silence is the first transition')
     fake.handles[0].output.write('late\n')
     await settle(400)
     const burst = notices.find((notice) => notice.cause === 'burst')
     assert.ok(burst !== undefined, 'speaking again is the other transition')
     assert.equal(burst.bytes, 5, 'how much arrived while it was quiet')
-    assert.ok(burst.gapMs >= 120, 'the burst reports the silence it interrupted, not its own age')
+    assert.ok(burst.gapMs >= 120 && burst.gapMs <= 600, 'the burst reports the silence it interrupted, not its own age')
     await sessions.dispose()
   })
 
