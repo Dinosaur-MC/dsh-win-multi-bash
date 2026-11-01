@@ -75,6 +75,7 @@ The browser half adds one control beside the Session title (`conversation.sessio
 - A deployment without `ctx.connection`, or a shell that does not declare the slot, registers nothing: the button simply does not appear and every tool keeps working.
 - The panel is a reading surface, not a second control plane: the model's `terminal list` / `close` remain the agent-facing contract. A **plugin reload** disposes the row and ends every session with no record, while a page refresh keeps them; see [Lifecycle](#lifecycle).
 - A session can end without a tool call — the shell exits, the idle reaper closes it, or a human presses Stop. Each of those posts **one in-session notice** to the agent that opened the session (`terminal: session … was stopped by the user (session header).` / `terminal: session … was closed by the idle reaper after … ms without activity.` / `terminal: session … exited on its own (exit code …).`), so the owner reads it instead of polling. A model's own `close` is not announced: its tool result already said so.
+- A notice **never starts a turn**: it is injected into the owner's next-turn inbox (and steered into a turn that is already running), so a shell that exits while the loop is idle does not wake it just to say so — the next turn simply begins with that context. Only a host whose agent object lacks `inject` falls back to the old wake-up (`followup`) path.
 
 ## Signals
 

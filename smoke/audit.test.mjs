@@ -3811,6 +3811,21 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
           backend.configKey + '.' + own.leaf + ' must be pinnable from the session row too')
   })
 
+  test('an end-of-session notice is queued for the next turn, never a new turn', () => {
+    // The notice reaches the owner through `inject` (next-turn inbox); `followup`
+    // would wake an idle loop with a turn of its own. Only a host without `inject`
+    // keeps the old path.
+    const calls = []
+    const owner = { status: 'idle', inject: (message) => calls.push(['inject', message]), followup: (message) => calls.push(['followup', message]) }
+    assert.equal(terminalTool.deliverNotice(owner, { tag: 'notice' }), 'inject', 'inject wins even when the loop is idle')
+    assert.deepEqual(calls, [['inject', { tag: 'notice' }]], 'and followup was never called')
+    const legacy = { followup: (message) => calls.push(['legacy', message]) }
+    assert.equal(terminalTool.deliverNotice(legacy, { tag: 'notice' }), 'followup', 'a host without inject still gets the notice')
+    const broken = { inject: () => { throw new Error('no inbox') }, followup: (message) => calls.push(['fallback', message]) }
+    assert.equal(terminalTool.deliverNotice(broken, { tag: 'notice' }), 'followup', 'a throwing inject falls back instead of dropping the notice')
+    assert.equal(terminalTool.deliverNotice(undefined, { tag: 'notice' }), 'none', 'a gone owner is not an error')
+  })
+
   test('the row schema and its Plugins page address one and the same set, in one order', () => {
     assert.deepEqual(volatilePaths(terminalTool.Config), TERMINAL_FORM_ROWS[0].fields.map((knob) => knob.path.join('.')))
     const schema = terminalTool.Config({})
