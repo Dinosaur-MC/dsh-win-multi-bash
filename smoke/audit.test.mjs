@@ -4174,6 +4174,36 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
     await sessions.dispose()
   })
 
+  await testAsync('a burst inside the first interval after the loop goes idle is reported', async () => {
+    const fake = fakePty()
+    const notices = []
+    let idle = false
+    const sessions = createTerminalSessions({ subprocess: fake.service }, { notify: (event) => notices.push(event), isOwnerIdle: () => idle, transitionTickMs: 10 })
+    await sessions.open(sessionRequest('a', { startupWaitMs: 0, quietNoticeMs: 120, maxSessions: 1 }))
+    await settle(300)
+    idle = true
+    await settle(30)
+    fake.handles[0].output.write('late start\n')
+    await settle(500)
+    const burst = notices.find((notice) => notice.cause === 'burst')
+    assert.ok(burst !== undefined, 'the baseline is taken at idle, so output inside the first interval is a crossing')
+    await sessions.dispose()
+  })
+
+  await testAsync('quietNoticeMs 0 silences state notices but not the ending', async () => {
+    const fake = fakePty()
+    const notices = []
+    const sessions = createTerminalSessions({ subprocess: fake.service }, { notify: (event) => notices.push(event), transitionTickMs: 10 })
+    await sessions.open(sessionRequest('a', { startupWaitMs: 0, quietNoticeMs: 0, maxSessions: 1 }))
+    fake.handles[0].output.write('first\n')
+    await settle(300)
+    assert.deepEqual(notices.map((notice) => notice.cause), [], 'no state notices at all')
+    fake.handles[0].exit({ exitCode: 0 })
+    await settle(250)
+    assert.ok(notices.some((notice) => notice.cause === 'exited'), 'the ending still reports')
+    await sessions.dispose()
+  })
+
   await testAsync('a session falling quiet and speaking again each raise one notice', async () => {
     const fake = fakePty()
     const notices = []
@@ -4189,6 +4219,7 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
     const burst = notices.find((notice) => notice.cause === 'burst')
     assert.ok(burst !== undefined, 'speaking again is the other transition')
     assert.equal(burst.bytes, 5, 'how much arrived while it was quiet')
+    assert.ok(burst.gapMs >= 120, 'the burst reports the silence it interrupted, not its own age')
     await sessions.dispose()
   })
 
