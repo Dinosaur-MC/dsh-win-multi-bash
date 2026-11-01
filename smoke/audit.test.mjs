@@ -3811,6 +3811,17 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
           backend.configKey + '.' + own.leaf + ' must be pinnable from the session row too')
   })
 
+  test('a state-transition notice only fires for an idle loop, and may open a turn', () => {
+    const calls = []
+    const idle = { status: 'idle', followup: (message) => calls.push(['followup', message]) }
+    assert.equal(terminalTool.deliverTransitionNotice(idle, { tag: 'quiet' }), 'followup', 'an idle loop is woken: these transitions are the news it cannot discover')
+    const busy = { status: 'running', followup: () => calls.push(['busy']), inject: () => calls.push(['busy-inject']) }
+    assert.equal(terminalTool.deliverTransitionNotice(busy, { tag: 'quiet' }), 'none', 'a busy loop gets nothing: the bytes are in its next tool result')
+    assert.deepEqual(calls, [['followup', { tag: 'quiet' }]], 'and it was never touched')
+    const noFollow = { status: 'idle', inject: (message) => calls.push(['inject', message]) }
+    assert.equal(terminalTool.deliverTransitionNotice(noFollow, { tag: 'burst' }), 'inject', 'a host without followup still hears it, without a turn')
+  })
+
   test('an end-of-session notice is queued for the next turn, never a new turn', () => {
     // The notice reaches the owner through `inject` (next-turn inbox); `followup`
     // would wake an idle loop with a turn of its own. Only a host without `inject`
@@ -4141,6 +4152,45 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
       'the wait reports the abort to the row that maps it',
     )
     assert.ok(Date.now() - began < 2000, 'and it never reaches the ten-second budget')
+    await sessions.dispose()
+  })
+
+  await testAsync('only a crossing that happens inside the idle window is reported', async () => {
+    const fake = fakePty()
+    const notices = []
+    let idle = false
+    const sessions = createTerminalSessions({ subprocess: fake.service }, { notify: (event) => notices.push(event), isOwnerIdle: () => idle })
+    await sessions.open(sessionRequest('a', { startupWaitMs: 0, quietNoticeMs: 80, maxSessions: 1 }))
+    fake.handles[0].output.write('first\n')
+    await settle(220)
+    assert.equal(notices.length, 0, 'a busy loop counts nothing, however long the silence is')
+    idle = true
+    await settle(220)
+    assert.equal(notices.length, 0, 'the session was already silent when the loop went idle: that is not a crossing')
+    fake.handles[0].output.write('late\n')
+    await settle(40)
+    assert.equal(notices.length, 1, 'speaking again IS a crossing inside the idle window')
+    assert.equal(notices[0].cause, 'burst')
+    await sessions.dispose()
+  })
+
+  await testAsync('a session falling quiet and speaking again each raise one notice', async () => {
+    const fake = fakePty()
+    const notices = []
+    const sessions = createTerminalSessions({ subprocess: fake.service }, { notify: (event) => notices.push(event) })
+    await sessions.open(sessionRequest('a', { startupWaitMs: 0, quietNoticeMs: 120, maxSessions: 1 }))
+    fake.handles[0].output.write('first\n')
+    await settle(40)
+    assert.equal(notices.length, 0, 'a session that just spoke is not quiet yet')
+    await settle(180)
+    assert.equal(notices.length, 1, 'the silence itself is a transition worth reporting')
+    assert.equal(notices[0].cause, 'quiet')
+    fake.handles[0].output.write('late\n')
+    await settle(50)
+    assert.equal(notices.length, 2, 'speaking again is the other transition')
+    assert.equal(notices[1].cause, 'burst')
+    assert.ok(notices[1].gapMs >= 120, 'the gap is what the notice reports')
+    assert.equal(notices[1].bytes, 5, 'and how much arrived')
     await sessions.dispose()
   })
 
