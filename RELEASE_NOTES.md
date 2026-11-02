@@ -1,3 +1,31 @@
+# dsh-win-multi-bash v0.7.7
+
+## New
+
+- **A terminal session now says when it changes between active and quiet.** `quietNoticeMs` (default 60 s, `0` turns it off) is the sampling interval: the state is taken the moment the assistant goes idle, then once per interval the session is asked whether it printed since the previous sample — yes is active, no is quiet, and only a change is reported. Two notices are therefore at least one interval apart, and a burst that starts and stops inside one interval reads as a single active sample.
+- **Those notices may open a turn, but only for idle work.** A session that starts printing again (or falls quiet) while the assistant is idle is news the model cannot discover by itself, so the notice is delivered with `followup` and starts a turn. While the assistant is busy nothing is sampled: the same output is already in its next tool result, and a busy period resets the baseline so a silence that began during a turn is never reported as a fresh crossing. End-of-session notices are unchanged and still never start a turn.
+
+## Improvements
+
+- **`idleMs: 0` now means "never reclaim on idleness" for real.** The reaper is not armed at all instead of being armed with a zero delay, so a long-lived shell can be kept without the idle timeout fighting it.
+- **Watching a session row counts as activity.** A `terminal` read or a header row that is polling keeps the session out of the idle reaper, so a shell being looked at is not closed underneath the viewer.
+- **The notice interval is read live.** Editing `quietNoticeMs` on the Plugins page (including setting it to `0`) applies to sessions that are already open; turning it off and on again starts from a fresh baseline instead of resurfacing a stale window.
+
+## Bug fixes
+
+- **A silence that began during a busy turn is no longer announced after it.** The baseline used to look a full interval back, so a session that fell silent while the assistant was working was counted as active and produced a quiet notice one sample later — a turn opened for a crossing that never happened inside the idle window. The baseline now uses a short edge: only output right before idle counts as active.
+- **The burst notice reports the silence it interrupted, not its own age.** It used to compute the gap from a timestamp the burst itself had just rewritten, so the text always said "after 0 s". The silence is captured when the first byte after a quiet sample arrives, and it is dropped when the assistant goes busy or the sampling is switched off, so a stale number cannot be carried over.
+- **Burst bytes are UTF-8 bytes, not UTF-16 code units.** A Chinese line of 7 bytes used to be reported as 3.
+- **The sampler stops when the registry has no sessions left**, instead of leaving a 250 ms timer running for an empty map.
+- **`quietNoticeMs` validation no longer explains the idle-timeout meaning of `0`.** It has its own zero-aware guard ("0 turns these state notices off").
+
+## Docs
+
+- `docs/terminal.md` describes the sampling model, the idle-only delivery, the turn-opening rule for state notices (and its absence for end notices), the live-read interval, and the burst text's meaning. `docs/configuration.md` lists `quietNoticeMs`, and the Settings hints are written in user language.
+
+## Breaking changes
+
+- A state notice can now start a turn while the assistant is idle, which spends a turn without a user action. Set `quietNoticeMs` to `0` to keep sessions silent.
 # dsh-win-multi-bash v0.7.6
 
 ## New
