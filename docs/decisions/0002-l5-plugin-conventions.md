@@ -48,3 +48,25 @@
 5. **`apply` 不做等待**：把 `resolveSandboxMode()` 的 await 从行装配路径移到首次命令的惰性路径，让 apply 严格同步完成。此项需要改动工具行契约，排在 1–3 之后。
 6. 上述完成后发一版，让 dsh.so 重测最新版本；若仍报 0ms 的 boot failed，再按其 runner 复现。
 
+## 官方规范核对（本地源码：deepseek-harness，tag dsh-v0.2.1-rc.2）
+
+依据 `docs/user/develop/basic/publish.zh.md` 与 `packages/client/modules/src/client/manifest.ts`：
+
+| 规范项 | 是否必需 | dsh-win-multi-bash | dsh-decision-tools |
+| --- | --- | --- | --- |
+| `dsh.bundle.patch`（字符串或有序列表） | 必需（否则只当普通依赖） | 有 | 有 |
+| patch 行按包名引用包 | 必需 | `dsh-win-multi-bash` + 子路径 | `dsh-decision-tools` + 子路径 |
+| `engines.dsh` SemVer 范围 | 必需（缺失则回退 peer 依赖） | `>=0.1.7-rc.2 <0.3.0-0` | `>=0.2.0-rc.2` |
+| `dsh.client.platform` 为字符串 | 声明 `dsh.client` 时必需 | 有 | 有 |
+| 声明 `dsh.client` 必须导出 `./client` | 必需（否则扫描抛错） | `./lib/client.js` | `./lib/browser.js` |
+| `dsh.client.inject` / `.external` / `.immediately` | 可选（数组/布尔，影响模块图排序） | 未声明 | 未声明 |
+| `dsh.plugin.json` | **官方源码与文档中零引用** | 无（合法） | 无（合法） |
+| `dsh.compatibility` | **官方源码与文档中零引用** | 无（合法） | 无（合法） |
+
+结论：两个仓库都**符合官方规范**；先前对照样本列出的三处“缺口”（`client.inject`、`compatibility`、`plugin.json`）里，只有 `client.inject` 是官方支持的机制（用于模块图排序），另外两项在宿主源码里根本不读，属于第三方/市场侧的约定。
+
+因此对 L5 的实际动作调整为：
+
+1. **补 `dsh.client.inject`**（把客户端 `require` 的 `@deepseek-ai/dsh-client-*` 包逐条列入）：这能保证本包客户端工厂在依赖包工厂之后物化，属于真实收益，不是猜测。
+2. `dsh.plugin.json` 与 `dsh.compatibility` 仅在确认市场侧读取时再补；宿主不读，补了也不影响 boot。
+3. 站点 L5 的 `boot failed` 与规范无关，仍按 runner 侧排查。
