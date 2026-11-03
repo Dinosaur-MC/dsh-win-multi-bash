@@ -6192,7 +6192,7 @@ console.log('\n[B] boot integration: promote-on-timeout (shipped default, SERIAL
           let jobId
           for (let attempt = 0; attempt < 100 && jobId === undefined; attempt += 1) {
             await new Promise((resolve) => setTimeout(resolve, 50))
-            jobId = ctx.jobs.list(undefined).find((job) => job.status === 'running' && job.label === 'echo started; sleep 5')?.id
+            jobId = ctx.jobs.list(undefined).find((job) => job.status === 'running' && job.label === 'audit stopped marker')?.id
           }
           assert.ok(jobId !== undefined, 'a foreground command must be a visible job while it waits')
           await execTool(ctx, 'job_kill', { job_id: jobId, reason: 'audit stop' })
@@ -6639,7 +6639,7 @@ console.log('\n[B] boot integration: a background job records the tool call that
             assert.equal(specs[0].toolCall?.callId, callId, 'the registry must receive the originating call id')
             assert.deepEqual(Object.keys(specs[0]).sort(), ['kind', 'label', 'output', 'run', 'toolCall'],
               'and no other JobSpec key changed')
-            assert.equal(specs[0].label, 'echo m1-witness', 'label unchanged')
+            assert.equal(specs[0].label, 'm1 git_bash', 'the label is the call description; that is what the job list shows')
             assert.equal(typeof specs[0].run, 'function', 'run unchanged')
             assert.ok(Array.isArray(specs[0].output), 'output unchanged')
             if (specs[0].toolCall.rootCallId !== undefined)
@@ -6668,7 +6668,7 @@ console.log('\n[B] boot integration: a background job records the tool call that
             assert.ok(view, 'job_output returns the job view')
             assert.equal(view.toolCall, undefined, 'the public job view keeps its shape')
             assert.equal(view.id, jobId)
-            assert.equal(view.label, 'echo m1-witness')
+            assert.equal(view.label, 'm1 git_bash')
             // 4. the identity tracks the CALL, not a constant: a foreground call
             //    registers its own job (timeout promotion) and reports its own id.
             const before = specs.length
