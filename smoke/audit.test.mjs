@@ -3266,8 +3266,13 @@ console.log('\n[A] unit: the ssh_shell remote script builder (POSIX, base64 payl
       '{ export A=1\n} || exit $?\nx\n')
     assert.equal(buildScript({ command: 'x', startupCommand: 'export A=1 ;' }).script,
       '{ export A=1\n} || exit $?\nx\n')
-    for (const startupCommand of [undefined, '', '   ', '\t', ';', ';;', ' ; '])
+    // A body that is ONLY comments leaves an EMPTY brace group, which bash rejects
+    // (measured: rc=2), so it is "no startup" like any blank snippet.
+    for (const startupCommand of [undefined, '', '   ', '\t', ';', ';;', ' ; ', '# disabled', '#   disabled  ', '# one\n# two'])
       assert.equal(buildScript({ command: 'x', startupCommand }).script, 'x\n', JSON.stringify(startupCommand))
+    // A comment NEXT TO a real command still runs that command inside the group.
+    assert.equal(buildScript({ command: 'x', startupCommand: '# note\nexport A=1' }).script,
+      '{ # note\nexport A=1\n} || exit $?\nx\n')
   })
 
   test('a workdir is cd -- single-quote escaped, and only when one is given', () => {
@@ -3317,6 +3322,31 @@ console.log('\n[A] unit: the ssh_shell remote script builder (POSIX, base64 payl
     assert.equal(built.script, command + '\n')
     assert.equal(built.payload, Buffer.from(command + '\n', 'utf8').toString('base64'))
   })
+
+  // The S7 cases above are string assertions; a shell-syntax mistake would still pass
+  // them. This one hands the generated text to the real Git Bash with -n (parse, run
+  // nothing), so a future layout regression fails HERE and not on a live host.
+  if (!HAS_GIT_BASH) {
+    skip('  … skipping the shell-syntax matrix: no Git Bash on this host')
+  } else {
+    test('the generated scripts parse under the resolved bash (bash -n matrix)', () => {
+      const scripts = [
+        ['plain', buildScript({ command: 'echo hi' })],
+        ['comment-only startup', buildScript({ command: 'echo hi', startupCommand: '# disabled' })],
+        ['heredoc startup', buildScript({ command: 'echo hi', startupCommand: 'cat <<EOF\nheredoc-body\nEOF' })],
+        ['background startup', buildScript({ command: 'echo hi', startupCommand: 'sleep 0 &' })],
+        ['empty body', buildScript({ command: 'echo hi', startupCommand: ';' })],
+        ['workdir with a trailing space', buildScript({ command: 'pwd', workdir: '/tmp/trim ' })],
+        ['startup + workdir + command', buildScript({ command: 'echo x', startupCommand: 'export A=1', workdir: '/w' })],
+      ]
+      for (const [name, built] of scripts) {
+        const result = spawnSync(GIT_BASH, ['-n'], { input: built.script, encoding: 'utf8', timeout: 30000 })
+        assert.equal(result.error, undefined, name + ': could not run bash -n: ' + String(result.error))
+        assert.equal(result.status, 0, name + ': bash -n rejected the script: ' + String(result.stderr || result.signal))
+        assert.equal(String(result.stderr).trim(), '', name + ': bash -n must be silent')
+      }
+    })
+  }
 }
 
 console.log('\n[A] unit: shared shell prompt section (one copy, gated facts)')
@@ -7944,3 +7974,10 @@ if (failed > 0) {
   for (const { name, error } of failures) console.log(`  - ${name}: ${error?.message ?? error}`)
   process.exit(1)
 }
+// Explicit success exit. The PTY fixtures can leave a native child handle alive on
+// Windows, and a runner that prints its verdict but then sits on a stray handle is a
+// hang: measured repeatedly on this host as an identical '0 failed' summary with the
+// process still alive minutes later. Every test has settled by this line, so the
+// verdict is complete and the runner ends here instead of waiting for handles it does
+// not own.
+process.exit(0)
