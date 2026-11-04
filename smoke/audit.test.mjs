@@ -3391,7 +3391,12 @@ console.log('\n[A] unit: the ssh_shell connection pool (one client per host) (S8
     })
   })
   const startServer = async () => {
+    // The server side counts TCP connections: "the pool reuses one client" and "the
+    // pool dialled again" are both claims about THIS counter, not about object identity
+    // alone.
+    let connectionsSeen = 0
     const server = new ssh2.Server({ hostKeys: [hostKey.private] }, (client) => {
+      connectionsSeen += 1
       // A refused handshake (mismatched host key, unknown host) makes the CLIENT hang
       // up mid-exchange; the server side then emits 'error' on this same emitter, and
       // an unhandled 'error' event aborts the whole suite instead of failing the case
@@ -3413,7 +3418,11 @@ console.log('\n[A] unit: the ssh_shell connection pool (one client per host) (S8
     })
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
     const port = server.address().port
-    return { port, close: () => new Promise((resolve) => server.close(resolve)) }
+    return {
+      port,
+      connections: () => connectionsSeen,
+      close: () => new Promise((resolve) => server.close(resolve)),
+    }
   }
 
   try {
@@ -3430,6 +3439,46 @@ console.log('\n[A] unit: the ssh_shell connection pool (one client per host) (S8
         assert.equal(result.stdout, 'fixture-stdout\n', 'stdout is the channel data')
         assert.equal(result.stderr, 'fixture-stderr\n', 'stderr is separate')
         assert.equal(result.code, 0, 'the channel exit status is reported')
+      } finally {
+        pool.dispose()
+        await fixture.close()
+      }
+    })
+
+    await testAsync('concurrent get() calls coalesce into ONE dial', async () => {
+      const fixture = await startServer()
+      const pool = new SshPool({ knownHostsPath: knownHostsFor(fixture.port) })
+      try {
+        const entry = entryFor(fixture.port)
+        // Both calls arrive before either dial settles: the record is published before
+        // its ready promise is awaited, so they share one connection.
+        const [left, right] = await Promise.all([pool.get(entry), pool.get(entry)])
+        assert.equal(left, right, 'both callers receive the same pooled client')
+        assert.equal(fixture.connections(), 1, 'the server saw exactly one TCP connection')
+        assert.equal(pool.size(), 1, 'and the pool holds one record for the alias')
+      } finally {
+        pool.dispose()
+        await fixture.close()
+      }
+    })
+
+    await testAsync('a reconnect is verified again: a rewritten known_hosts refuses the new dial', async () => {
+      const fixture = await startServer()
+      const path = knownHostsFor(fixture.port)
+      const pool = new SshPool({ knownHostsPath: path })
+      try {
+        const entry = entryFor(fixture.port)
+        const first = await pool.get(entry)
+        assert.equal(fixture.connections(), 1)
+        first.end()
+        await new Promise((resolve) => first.once('close', resolve))
+        // The host now presents the same key, but the trusted file says otherwise: the
+        // SECOND dial must be verified against the file as it is NOW, not cached.
+        const other = ssh2.utils.parseKey(ssh2.utils.generateKeyPairSync('ed25519').public)
+        writeFileSync(path, hostLine(fixture.port, other) + '\n')
+        await assert.rejects(() => pool.get(entry), /host key mismatch/)
+        assert.equal(fixture.connections(), 2, 'the second call really dialled again')
+        assert.equal(pool.size(), 0, 'a refused reconnect leaves no record behind')
       } finally {
         pool.dispose()
         await fixture.close()
@@ -3461,8 +3510,14 @@ console.log('\n[A] unit: the ssh_shell connection pool (one client per host) (S8
       const warnings = []
       const learning = new SshPool({ knownHostsPath: empty, log: (message) => warnings.push(message) })
       try {
+        // The refusing pool above already dialled once on this fixture, so the count
+        // that must not move is the DELTA the learning pool adds.
+        const baseline = fixture.connections()
         const client = await learning.get(entryFor(fixture.port, { acceptNewHostKeys: true }))
-        assert.ok(client === learning.get(entryFor(fixture.port, { acceptNewHostKeys: true })) || true)
+        const again = await learning.get(entryFor(fixture.port, { acceptNewHostKeys: true }))
+        assert.equal(again, client, 'the learned host reuses its pooled client')
+        assert.equal(learning.size(), 1, 'and it is the only record')
+        assert.equal(fixture.connections() - baseline, 1, 'no second dial happened')
         assert.equal(warnings.length, 1, 'the learned key warns exactly once for the connection')
         assert.match(warnings[0], /acceptNewHostKeys/)
       } finally {
