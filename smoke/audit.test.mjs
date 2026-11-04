@@ -2510,12 +2510,22 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
       'sshShell.sandbox', 'sshShell.probeTimeoutMs', 'sshShell.requireSandbox', 'sshShell.sandboxNotice',
     ])
     // The session pins are NOT on this row's page: a command never reads them, so
-    // a control here would be one that changes nothing. They stay in the schema
-    // because the terminal row builds this executor and seeds them into it, and
-    // the terminal row's own page is where they are edited (see the terminal
-    // block, which pins that projection).
-    for (const pin of ['sshPath', 'sshHost', 'sshUser', 'sshPort', 'acceptNewHostKeys', 'connectTimeoutMs'])
+    // a control here would be one that changes nothing. They must still EXIST in
+    // this schema — the terminal row builds this executor and seeds them into it,
+    // and the terminal row's own page is where they are edited (see the terminal
+    // block, which pins that projection) — so both halves are asserted.
+    for (const pin of ['sshPath', 'sshHost', 'sshUser', 'sshPort', 'acceptNewHostKeys', 'connectTimeoutMs']) {
       assert.ok(!volatilePaths(sshTool.Config).includes('sshShell.' + pin), pin + ' must not appear on the command row page')
+      assert.ok(pin in sshTool.Config.dict.sshShell.dict, pin + ' must stay in the row schema: the session row seeds it')
+    }
+    // A seeded pin really reaches the accessors the one-shot path still uses.
+    const seeded = sshTool.Config({ sshShell: { sshHost: 'seed.example', sshUser: 'u', sshPort: 2222 } })
+    const reader = Object.assign(Object.create(SshShellExecutor.prototype), {
+      config: { sshHost: seeded.sshShell.sshHost, sshUser: seeded.sshShell.sshUser, sshPort: seeded.sshShell.sshPort },
+    })
+    assert.equal(reader.pin('sshHost'), 'seed.example', 'a plain (non-volatile) pin reads as a value')
+    assert.equal(reader.target(), 'u@seed.example', 'the seeded host and user still form one target token')
+    assert.equal(reader.port(), 2222)
     const resolved = sshTool.Config({})
     assert.equal(resolved.sshShell.sandbox.get(), 'auto')
     assert.equal(resolved.sshShell.requireSandbox.get(), false, 'nothing is demanded by default')
@@ -5115,6 +5125,79 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
       revision: 7,
     }])
     assert.equal(form.project().dirty, false, 'an accepted save clears its drafts')
+  })
+
+  await testAsync('the hosts editor shows a draft as typed and saves the parsed array', async () => {
+    // The control is a controlled text field over a JSON array. A draft must be
+    // echoed back EXACTLY as typed (re-encoding it would show a quoted string and
+    // escape every keystroke), and only the save turns it into the array.
+    const sshRow = ROWS.find((row) => row.rowId === 'win-mb-tool-ssh')
+    const knob = sshRow.fields.find((entry) => entry.key === 'sshShell.hosts')
+    assert.equal(knob?.kind, 'hosts', 'the ssh row edits hosts through the hosts kind')
+    const scope = fakeScope()
+    const form = new RowConfigForm(scope, sshRow)
+    const hosts = [{ alias: 'prod', host: '10.0.0.5', user: 'deploy', keyPath: '~/.ssh/id_ed25519' }]
+    const draft = JSON.stringify(hosts, null, 2)
+    form.edit('sshShell.hosts', draft)
+    const field = () => form.project().fields.find((entry) => entry.key === 'sshShell.hosts')
+    assert.equal(field().text, draft, 'the draft is shown as typed, never JSON-encoded a second time')
+    assert.equal(field().invalid, false)
+    assert.equal(field().invalidReason, undefined)
+    assert.equal(form.project().dirty, true)
+    await form.save()
+    assert.deepEqual(scope.calls, [{
+      ops: [{ op: 'set', path: ['sshShell', 'hosts'], value: hosts }],
+      revision: 1,
+    }])
+    assert.equal(form.project().dirty, false, 'an accepted save clears the draft')
+    form.dispose()
+  })
+
+  test('a STORED hosts array renders as JSON text', () => {
+    const sshRow = ROWS.find((row) => row.rowId === 'win-mb-tool-ssh')
+    const stored = [{ alias: 'prod', host: 'h', user: 'u', keyPath: 'k' }]
+    const form = new RowConfigForm(fakeScope({
+      value: { sshShell: { hosts: stored } },
+      user: { sshShell: { hosts: stored } },
+    }), sshRow)
+    assert.equal(form.project().fields.find((entry) => entry.key === 'sshShell.hosts').text,
+      JSON.stringify(stored, null, 2))
+    form.dispose()
+  })
+
+  await testAsync('an unparseable hosts draft warns, stays dirty, and plans no write', async () => {
+    const sshRow = ROWS.find((row) => row.rowId === 'win-mb-tool-ssh')
+    const scope = fakeScope()
+    const form = new RowConfigForm(scope, sshRow)
+    form.edit('sshShell.hosts', '[{"alias": "prod",]')
+    const field = form.project().fields.find((entry) => entry.key === 'sshShell.hosts')
+    assert.equal(field.invalid, true, 'the warning is visible')
+    assert.equal(field.invalidReason, 'hosts')
+    assert.equal(form.project().invalid, false, 'a warning never blocks the save (A3)')
+    assert.equal(form.project().dirty, true, 'an unparseable draft keeps Save doing something')
+    await form.save()
+    assert.equal(scope.calls.length, 0, 'nothing to carry: a string must never be written into an array field')
+    form.dispose()
+    // Valid JSON that is not an array is refused the same way.
+    const scope2 = fakeScope()
+    const form2 = new RowConfigForm(scope2, sshRow)
+    form2.edit('sshShell.hosts', '{"alias": "prod"}')
+    assert.equal(form2.project().fields.find((entry) => entry.key === 'sshShell.hosts').invalidReason, 'hosts')
+    await form2.save()
+    assert.equal(scope2.calls.length, 0)
+    form2.dispose()
+  })
+
+  await testAsync('an emptied hosts control clears the override instead of writing an empty value', async () => {
+    const sshRow = ROWS.find((row) => row.rowId === 'win-mb-tool-ssh')
+    const scope = fakeScope({ user: { sshShell: { hosts: [{ alias: 'a' }] } } })
+    const form = new RowConfigForm(scope, sshRow)
+    form.edit('sshShell.hosts', '   ')
+    assert.equal(form.project().fields.find((entry) => entry.key === 'sshShell.hosts').text, '',
+      'a clear renders as the empty box')
+    await form.save()
+    assert.deepEqual(scope.calls[0].ops, [{ op: 'unset', path: ['sshShell', 'hosts'] }])
+    form.dispose()
   })
 
   await testAsync('an emptied text control clears the override, not writes an empty string', async () => {
