@@ -3220,6 +3220,83 @@ console.log('\n[A] unit: the ssh_shell known_hosts verifier (strict host keys) (
   }
 }
 
+console.log('\n[A] unit: the ssh_shell remote script builder (POSIX, base64 payload) (S7)')
+{
+  // The remote command line is the host's STATIC shellTemplate; the command itself
+  // travels as a base64 POSIX script on the channel's stdin (spec §8.2), so no
+  // command text is ever interpolated into a shell string. This builder is the ONE
+  // place that decides the script's shape, which is why its exact bytes are pinned:
+  // a missing trailing newline silently changes the last command, and a workdir
+  // that is not single-quote escaped is a shell injection.
+  const { buildScript, quoteShell } = await import(libUrl('ssh-shell', 'script.js'))
+
+  test('a plain command becomes the script itself, newline-terminated', () => {
+    const built = buildScript({ command: 'uname -a' })
+    assert.equal(built.script, 'uname -a\n')
+    assert.equal(built.payload, Buffer.from('uname -a\n', 'utf8').toString('base64'))
+    // A command that already ends with a newline keeps exactly one.
+    assert.equal(buildScript({ command: 'uname -a\n' }).script, 'uname -a\n')
+  })
+
+  test('an empty command is still one newline, never a malformed payload', () => {
+    const built = buildScript({ command: '' })
+    assert.equal(built.script, '\n')
+    assert.equal(Buffer.from(built.payload, 'base64').toString('utf8'), '\n')
+  })
+
+  test('startup runs first, guarded, and is normalised to ONE terminator', () => {
+    const built = buildScript({ command: 'echo hi', startupCommand: 'export A=1' })
+    assert.equal(built.script, '{ export A=1; } || exit $?\necho hi\n')
+    // A deployment that already wrote the semicolon does not get a second one
+    // (two consecutive semicolons are a syntax error in a POSIX shell).
+    assert.equal(buildScript({ command: 'x', startupCommand: 'export A=1;' }).script,
+      '{ export A=1; } || exit $?\nx\n')
+    assert.equal(buildScript({ command: 'x', startupCommand: 'export A=1 ;' }).script,
+      '{ export A=1; } || exit $?\nx\n')
+    // Whitespace-only means "no startup": the guard line is omitted entirely.
+    for (const startupCommand of [undefined, '', '   ', '\t'])
+      assert.equal(buildScript({ command: 'x', startupCommand }).script, 'x\n', JSON.stringify(startupCommand))
+  })
+
+  test('a workdir is cd -- single-quote escaped, and only when one is given', () => {
+    assert.equal(buildScript({ command: 'ls', workdir: '/srv/app' }).script,
+      "cd -- '/srv/app' || exit $?\nls\n")
+    // The classic injection: a quote in the path must not end the quoted word.
+    assert.equal(buildScript({ command: 'ls', workdir: "/tmp/it's here" }).script,
+      "cd -- '/tmp/it'\\''s here' || exit $?\nls\n")
+    // A value that is nothing but a quote: '/a' + \' + '' — the reopened empty
+    // quote is easy to drop when the expectation is hand-written.
+    assert.equal(buildScript({ command: 'ls', workdir: "/a'" }).script,
+      "cd -- '/a'\\''' || exit $?\nls\n")
+    assert.equal(quoteShell("it's"), "'it'\\''s'")
+    assert.equal(quoteShell('/plain'), "'/plain'")
+    assert.equal(quoteShell(undefined), "''")
+    // Both guard lines, in spec order: startup, then the working directory.
+    assert.equal(buildScript({ command: 'x', startupCommand: 'export A=1', workdir: '/w' }).script,
+      "{ export A=1; } || exit $?\ncd -- '/w' || exit $?\nx\n")
+  })
+
+  test('the payload is base64 of the script, UTF-8 safe and round-tripping', () => {
+    const command = "printf '%s\\n' 'héllo wörld'; echo \"quoted\";\nls -l"
+    const built = buildScript({ command, startupCommand: 'export LANG=C.UTF-8', workdir: '/tmp/ünïcode' })
+    assert.equal(Buffer.from(built.payload, 'base64').toString('utf8'), built.script)
+    assert.ok(built.script.includes("'héllo wörld'"), 'the command body is passed through untouched')
+    assert.ok(built.script.includes('/tmp/ünïcode'), 'a non-ASCII workdir survives the UTF-8 payload')
+    // No newlines in the payload itself: base64 -d reads one line happily.
+    assert.ok(!built.payload.includes('\n'))
+    assert.ok(built.script.endsWith('\n'), 'every script ends with one newline')
+  })
+
+  test('the command is never quoted or escaped: it IS the script body', () => {
+    // A quote, a $, a command substitution and a newline must reach the remote
+    // shell exactly as written — the channel's stdin is the script, not an argument.
+    const command = 'echo "$HOME" $(date); echo \'single\'\necho last'
+    const built = buildScript({ command })
+    assert.equal(built.script, command + '\n')
+    assert.equal(built.payload, Buffer.from(command + '\n', 'utf8').toString('base64'))
+  })
+}
+
 console.log('\n[A] unit: shared shell prompt section (one copy, gated facts)')
 {
   // One section carries everything the shell family shares, so it must hold
