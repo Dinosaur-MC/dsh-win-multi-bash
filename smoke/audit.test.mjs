@@ -2270,7 +2270,7 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
   const {
     CLIENT_ROWS: SSH_CLIENT_ROWS, PATCH_ROWS: SSH_PATCH_ROWS, EXPORT_SUBPATHS: SSH_EXPORT_SUBPATHS,
     SHELL_DIALECTS: SSH_DIALECTS, TERMINAL_BACKENDS: SSH_TERMINAL_BACKENDS,
-    REMOTE_FAMILY_TOOL_NAMES, dialectById: sshDialectById,
+    REMOTE_FAMILY_TOOL_NAMES, dialectById: sshDialectById, dialectTerminalFields: registryTerminalFields,
   } = await import(libUrl('tool-bash', 'types', 'registry.js'))
   const { validateShellDialects, REGISTRY_ERROR_PREFIX } = await import(libUrl('shell-dialects.js'))
   const sshTool = await import(libUrl('tool-bash', 'types', 'ssh-shell.js'))
@@ -2315,6 +2315,20 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
   const okResult = () => ({
     exitCode: 0, signal: null, timedOut: false, aborted: false, timeoutMs: 1,
     stdout: { text: 'ok', truncated: false }, stderr: { text: '', truncated: false },
+  })
+
+  test('the command row edits the host registry; the session row keeps the single-host pins', () => {
+    // One dialect, TWO field sets: a command call resolves an alias from the array,
+    // while a persistent session still runs the OpenSSH client against one pinned
+    // host. Keeping them in one list would either put a hosts table on the session
+    // row (which cannot use it) or hide the pins from the row that does.
+    assert.deepEqual(declaration.fields, [{ leaf: 'hosts', kind: 'hosts' }])
+    assert.deepEqual(declaration.terminalFields.map((own) => own.leaf),
+      ['sshPath', 'sshHost', 'sshUser', 'sshPort', 'acceptNewHostKeys', 'connectTimeoutMs'])
+    assert.deepEqual(registryTerminalFields(declaration), declaration.terminalFields)
+    // A dialect that ships one list for both still works through the fallback.
+    assert.deepEqual(registryTerminalFields({ fields: declaration.terminalFields }), declaration.terminalFields)
+    assert.deepEqual(registryTerminalFields(undefined), [])
   })
 
   test('the declaration reaches every derived surface, and the row ships opt-in', () => {
@@ -2492,17 +2506,26 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
       'enableRunInBackground', 'promoteOnTimeout',
       'sshShell.cwd', 'sshShell.timeoutMs', 'sshShell.maxTimeoutMs', 'sshShell.maxOutputBytes',
       'sshShell.maxSpillBytes', 'sshShell.graceMs',
-      'sshShell.sshPath', 'sshShell.sshHost', 'sshShell.sshUser', 'sshShell.sshPort',
-      'sshShell.acceptNewHostKeys', 'sshShell.connectTimeoutMs',
+      'sshShell.hosts',
       'sshShell.sandbox', 'sshShell.probeTimeoutMs', 'sshShell.requireSandbox', 'sshShell.sandboxNotice',
     ])
+    // The session pins are NOT on this row's page: a command never reads them, so
+    // a control here would be one that changes nothing. They stay in the schema
+    // because the terminal row builds this executor and seeds them into it, and
+    // the terminal row's own page is where they are edited (see the terminal
+    // block, which pins that projection).
+    for (const pin of ['sshPath', 'sshHost', 'sshUser', 'sshPort', 'acceptNewHostKeys', 'connectTimeoutMs'])
+      assert.ok(!volatilePaths(sshTool.Config).includes('sshShell.' + pin), pin + ' must not appear on the command row page')
     const resolved = sshTool.Config({})
     assert.equal(resolved.sshShell.sandbox.get(), 'auto')
     assert.equal(resolved.sshShell.requireSandbox.get(), false, 'nothing is demanded by default')
-    assert.equal(resolved.sshShell.acceptNewHostKeys.get(), false, 'no host key is ever accepted on the user behalf by default')
-    assert.equal(resolved.sshShell.connectTimeoutMs.get(), 15000)
-    assert.equal(resolved.sshShell.sshPort.get(), undefined, 'no port pin leaves ssh its own default')
-    assert.equal(resolved.sshShell.sshPath.get(), undefined, 'no client pin means discovery')
+    // The pins are plain fields (not volatile refs): a command row does not edit
+    // them, so `Config({})` resolves them as VALUES, not as live references.
+    assert.equal(resolved.sshShell.acceptNewHostKeys, false, 'no host key is ever accepted on the user behalf by default')
+    assert.equal(resolved.sshShell.connectTimeoutMs, 15000)
+    assert.equal(resolved.sshShell.sshPort, undefined, 'no port pin leaves ssh its own default')
+    assert.equal(resolved.sshShell.sshPath, undefined, 'no client pin means discovery')
+    assert.deepEqual(resolved.sshShell.hosts.get(), [], 'no hosts is the default inventory: every call then fails naming that fact')
     assert.deepEqual(unionOptions(sshTool.Config.dict.sshShell.dict.sandbox), ['auto', 'none'],
       'the vocabulary is the declaration, and bwrap is never advertised by a dialect that cannot honour it')
     assert.deepEqual(unionOptions(sshTool.Config.dict.sshShell.dict.sandbox), [...declaration.sandboxStances])
@@ -2759,6 +2782,115 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     }
   }
 }
+console.log('\n[A] unit: the ssh_shell host registry (validation, aliases, defaults) (S5)')
+{
+  // The registry is the ONE place a deployment names remote hosts. Everything the
+  // executor reads comes through here, so these guards are what turn a malformed
+  // or ambiguous inventory into a named refusal instead of a half-working row: a
+  // duplicate alias, two defaults, a bad port or a missing key path each fail with
+  // the FIELD and the ALIAS in the message.
+  const {
+    DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_PORT, DEFAULT_SHELL_TEMPLATE, HOST_ALIAS,
+    defaultHost, findHost, validateHosts,
+  } = await import(libUrl('ssh-shell', 'hosts.js'))
+
+  test('a minimal host normalizes to the documented defaults, and findHost resolves it', () => {
+    const good = validateHosts([
+      { alias: 'prod', host: '10.0.0.5', user: 'deploy', keyPath: '~/.ssh/id_ed25519' },
+    ])
+    assert.equal(good.ok, true)
+    assert.equal(good.hosts[0].port, 22)
+    assert.equal(good.hosts[0].approval, 'session', 'asking once per session is the default, not trust')
+    assert.equal(good.hosts[0].connectTimeoutMs, 30000)
+    assert.equal(good.hosts[0].shellTemplate, DEFAULT_SHELL_TEMPLATE)
+    assert.equal(good.hosts[0].acceptNewHostKeys, false, 'known_hosts is strict unless the host says otherwise')
+    assert.equal(good.hosts[0].default, false)
+    assert.equal(findHost(good.hosts, 'prod').host, '10.0.0.5')
+    assert.equal(findHost(good.hosts, 'nope'), undefined)
+    assert.equal(DEFAULT_PORT, 22)
+    assert.equal(DEFAULT_CONNECT_TIMEOUT_MS, 30000)
+    // The default launcher reads the base64 script from stdin; no command text is
+    // ever interpolated into it.
+    assert.equal(DEFAULT_SHELL_TEMPLATE, 'bash -c \'eval "$(base64 -d)"\'')
+  })
+
+  test('a declared host keeps its own values, and optional fields normalize away', () => {
+    const one = validateHosts([{
+      alias: 'win-box_1', host: 'example.lan', port: 2222, user: 'root', keyPath: 'C:/keys/id_ed25519',
+      passphraseEnv: 'SSH_PASS_WIN', startupCommand: 'export A=1', shellTemplate: 'C:/Git/bin/bash.exe -c "eval \\"$(base64 -d)\\""',
+      connectTimeoutMs: 5000, approval: 'trusted', acceptNewHostKeys: true, default: true, description: 'the build box',
+    }])
+    assert.equal(one.ok, true)
+    const host = one.hosts[0]
+    assert.equal(host.alias, 'win-box_1', 'an underscore and a dash are legal alias characters')
+    assert.equal(host.port, 2222)
+    assert.equal(host.approval, 'trusted')
+    assert.equal(host.acceptNewHostKeys, true)
+    assert.equal(host.passphraseEnv, 'SSH_PASS_WIN', 'an environment variable NAME is what the config carries')
+    assert.equal(host.startupCommand, 'export A=1')
+    assert.equal(host.description, 'the build box')
+    assert.equal(defaultHost(one.hosts).alias, 'win-box_1')
+    // Blank optional strings are cleared rather than stored as empty values, so a
+    // saved form field that the user emptied means "not set".
+    const blanks = validateHosts([{ alias: 'a', host: 'h', user: 'u', keyPath: 'k', passphraseEnv: '', startupCommand: '', shellTemplate: '' }])
+    assert.equal(blanks.hosts[0].passphraseEnv, undefined)
+    assert.equal(blanks.hosts[0].startupCommand, undefined)
+    assert.equal(blanks.hosts[0].shellTemplate, DEFAULT_SHELL_TEMPLATE)
+    // Every alias the grammar advertises really validates; a leading separator does not.
+    assert.ok(HOST_ALIAS.test('a'))
+    assert.ok(HOST_ALIAS.test('a.b-c_1'))
+    for (const bad of ['', '.a', '-a', '_a', 'a b', 'a/b', '\u00e9'])
+      assert.equal(HOST_ALIAS.test(bad), false, JSON.stringify(bad))
+  })
+
+  test('a duplicate alias is refused, naming the alias', () => {
+    const dup = validateHosts([
+      { alias: 'a', host: 'h', user: 'u', keyPath: 'k' },
+      { alias: 'a', host: 'h2', user: 'u', keyPath: 'k' },
+    ])
+    assert.equal(dup.ok, false)
+    assert.match(dup.error, /duplicate alias "a"/)
+  })
+
+  test('two defaults are refused: a call that names no alias must be unambiguous', () => {
+    const twoDefaults = validateHosts([
+      { alias: 'a', host: 'h', user: 'u', keyPath: 'k', default: true },
+      { alias: 'b', host: 'h', user: 'u', keyPath: 'k', default: true },
+    ])
+    assert.equal(twoDefaults.ok, false)
+    assert.match(twoDefaults.error, /more than one default/)
+    // Exactly one is fine.
+    const oneDefault = validateHosts([
+      { alias: 'a', host: 'h', user: 'u', keyPath: 'k', default: true },
+      { alias: 'b', host: 'h', user: 'u', keyPath: 'k' },
+    ])
+    assert.equal(oneDefault.ok, true)
+    assert.equal(defaultHost(oneDefault.hosts).alias, 'a')
+  })
+
+  test('every refusal names the field it is about, and the alias where there is one', () => {
+    const badAlias = validateHosts([{ alias: 'has space', host: 'h', user: 'u', keyPath: 'k' }])
+    assert.equal(badAlias.ok, false)
+    assert.match(badAlias.error, /alias/)
+    const badPort = validateHosts([{ alias: 'p', host: 'h', port: 70000, user: 'u', keyPath: 'k' }])
+    assert.equal(badPort.ok, false)
+    assert.match(badPort.error, /port/)
+    for (const port of [0, 1.5, 'x'])
+      assert.match(validateHosts([{ alias: 'p', host: 'h', port, user: 'u', keyPath: 'k' }]).error, /port/, JSON.stringify(port))
+    assert.match(validateHosts([{ alias: 'p', host: '', user: 'u', keyPath: 'k' }]).error, /host "p" must be a non-empty hostname or IP/)
+    assert.match(validateHosts([{ alias: 'p', host: 'a b', user: 'u', keyPath: 'k' }]).error, /host "p"/)
+    assert.match(validateHosts([{ alias: 'p', host: 'h', user: ' ', keyPath: 'k' }]).error, /host "p" needs a user/)
+    assert.match(validateHosts([{ alias: 'p', host: 'h', user: 'u', keyPath: '' }]).error, /host "p" needs a keyPath/)
+    assert.match(validateHosts([{ alias: 'p', host: 'h', user: 'u', keyPath: 'k', approval: 'always' }]).error, /approval must be trusted or session/)
+    // The array itself, and each entry, are checked before any field is read.
+    assert.match(validateHosts('nope').error, /hosts must be an array/)
+    assert.match(validateHosts([null]).error, /each host must be an object/)
+    assert.match(validateHosts([42]).error, /each host must be an object/)
+    assert.equal(validateHosts([]).ok, true, 'no hosts is a VALID (if useless) inventory; the call path says what it means')
+    assert.deepEqual(validateHosts([]).hosts, [])
+  })
+}
+
 console.log('\n[A] unit: shared shell prompt section (one copy, gated facts)')
 {
   // One section carries everything the shell family shares, so it must hold
@@ -3770,7 +3902,8 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
   // session mechanism's boundaries are pinned here against a fake PTY, so a real
   // shell is only needed for the state-persistence boot test further down.
   const { TERMINAL_BACKENDS, TERMINAL_ROWS: TERMINAL_FORM_ROWS, CLIENT_ROWS: TERMINAL_CLIENT_ROWS,
-    EXPORT_SUBPATHS: TERMINAL_EXPORTS, PATCH_ROWS: TERMINAL_PATCHES, TERMINAL_ROW, SHELL_DIALECTS: TERMINAL_DIALECTS } =
+    EXPORT_SUBPATHS: TERMINAL_EXPORTS, PATCH_ROWS: TERMINAL_PATCHES, TERMINAL_ROW, SHELL_DIALECTS: TERMINAL_DIALECTS,
+    dialectTerminalFields } =
     await import(libUrl('tool-bash', 'types', 'registry.js'))
   const terminalTool = await import(libUrl('tool-bash', 'types', 'terminal.js'))
   const { ShellExecutorBase } = await import(libUrl('shell-executor.js'))
@@ -3804,9 +3937,11 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
     assert.deepEqual(TERMINAL_FORM_ROWS[0].fields.map((knob) => knob.key),
       TERMINAL_CLIENT_ROWS[TERMINAL_CLIENT_ROWS.length - 1].fields.map((knob) => knob.key))
     assert.deepEqual(TERMINAL_FORM_ROWS[0].fields[0].options, TERMINAL_BACKENDS.map((backend) => backend.toolName))
-    // The pins are the dialects' OWN declared leaves, under their own partitions.
+    // The pins are the dialects' OWN session leaves, under their own partitions — the
+    // SESSION list, which for the ssh dialect is `terminalFields` (the ssh command row
+    // edits the host registry instead, so its `fields` is not what a session pins).
     for (const backend of TERMINAL_BACKENDS)
-      for (const own of (TERMINAL_DIALECTS.find((dialect) => dialect.id === backend.dialectId)?.fields ?? []))
+      for (const own of dialectTerminalFields(TERMINAL_DIALECTS.find((dialect) => dialect.id === backend.dialectId)))
         assert.ok(TERMINAL_FORM_ROWS[0].fields.some((knob) => knob.key === backend.configKey + '.' + own.leaf),
           backend.configKey + '.' + own.leaf + ' must be pinnable from the session row too')
   })
