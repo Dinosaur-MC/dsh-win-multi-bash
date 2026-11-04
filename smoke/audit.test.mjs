@@ -3745,6 +3745,55 @@ console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (
         assert.equal(proc.status, 'killed')
       } finally { pool.dispose(); await fixture.close() }
     })
+    await testAsync('a caller signal does not suppress the deadline: timeouts still fire', async () => {
+      const fixture = await startServer(() => {})
+      const { executor, pool } = await executorFor(fixture)
+      try {
+        await pool.get(entryFor(fixture.port))
+        const sent = observeSignals(pool)
+        // A production foreground call always carries exec.signal; the deadline must not
+        // depend on its absence (the review blocker: such a call could wait forever).
+        const controller = new AbortController()
+        const started = Date.now()
+        const proc = await executor.execute({ command: 'sleep 30', timeoutMs: 120, signal: controller.signal })
+        const result = await proc.result()
+        assert.deepEqual(sent, ['TERM', 'KILL'])
+        assert.equal(result.timedOut, true)
+        assert.equal(result.aborted, false)
+        assert.ok(Date.now() - started >= 2000, 'the TERM -> 2 s -> KILL sequence ran')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('a timeout and an abort at once cancel ONCE, and the first reason wins', async () => {
+      const fixture = await startServer(() => {})
+      const { executor, pool } = await executorFor(fixture)
+      try {
+        await pool.get(entryFor(fixture.port))
+        const sent = observeSignals(pool)
+        const controller = new AbortController()
+        const proc = await executor.execute({ command: 'sleep 30', timeoutMs: 100, signal: controller.signal })
+        setTimeout(() => controller.abort(), 20)
+        const result = await proc.result()
+        assert.deepEqual(sent, ['TERM', 'KILL'], 'one cancellation sequence, not two')
+        assert.equal(result.aborted, true, 'abort was the first reason')
+        assert.equal(result.timedOut, false, 'the later deadline does not relabel it')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('a channel that ends without an exit status fails as a LOST connection', async () => {
+      const fixture = await startServer((stream) => {
+        stream.write('partial\n')
+        // No exit status at all: the channel just closes, like a dropped link.
+        stream.close()
+      })
+      const { executor, pool } = await executorFor(fixture)
+      try {
+        const proc = await executor.execute({ command: 'x', timeoutMs: 5000 })
+        await assert.rejects(() => proc.result(), /connection to host "exec" was lost/)
+        assert.equal(proc.status, 'failed', 'a lost connection is a failed call, not a completed one')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
     await testAsync('a delayed writer never reaches the NEXT call (settle on exit, then destroy)', async () => {
       let call = 0
       const fixture = await startServer((stream) => {
