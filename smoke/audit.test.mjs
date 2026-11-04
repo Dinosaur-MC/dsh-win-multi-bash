@@ -2287,18 +2287,27 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
   /** The phrase the family's local-sandbox sentence carries; asserted by presence AND absence. */
   const LOCAL_SANDBOX_PHRASE = 'file access denied under'
 
+  /** One normalized host entry for the registry/alias cases. */
+  const sshHostEntry = (alias, over = {}) => ({
+    alias, host: over.sshHost ?? 'example.invalid', port: 22, user: 'tester', keyPath: 'k',
+    shellTemplate: 'bash -c \'eval "$(base64 -d)"\'', connectTimeoutMs: 1000,
+    acceptNewHostKeys: over.acceptNewHostKeys === true, approval: 'trusted',
+    default: over.default === true,
+  })
   /** A bare executor: prototype plus the config/ctx slices the hooks actually read. */
   const bareSsh = (over = {}) => Object.assign(Object.create(SshShellExecutor.prototype), {
     config: {
+      // The base executor's own knobs: resolve() reads these, so the remote-workdir
+      // cases stay a function of what the test states.
+      cwd: { get: () => undefined },
+      timeoutMs: { get: () => 120000 },
+      maxTimeoutMs: { get: () => 600000 },
+      maxOutputBytes: { get: () => 64000 },
+      maxSpillBytes: { get: () => 64 * 1024 * 1024 },
+      graceMs: { get: () => 2000 },
       // The command path resolves an ALIAS from the row's host registry (the ssh2 pool);
       // the single-host pins below are what the SESSION arm still reads.
-      hosts: {
-        get: () => over.hosts ?? [{
-          alias: 'h', host: over.sshHost ?? 'example.invalid', port: 22, user: 'tester', keyPath: 'k',
-          shellTemplate: 'bash -c \'eval "$(base64 -d)"\'', connectTimeoutMs: 1000,
-          acceptNewHostKeys: over.acceptNewHostKeys === true, approval: 'trusted', default: true,
-        }],
-      },
+      hosts: { get: () => over.hosts ?? [sshHostEntry('h', { sshHost: over.sshHost, acceptNewHostKeys: over.acceptNewHostKeys, default: true })] },
       sshPath: { get: () => over.sshPath ?? 'ssh.exe' },
       sshHost: { get: () => (over.sshHost === undefined ? 'example.invalid' : over.sshHost) },
       sshUser: { get: () => over.sshUser ?? '' },
@@ -2357,9 +2366,14 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     // Its facts are what tells the model this is not a local shell.
     const description = shellDescription('ssh')
     assert.match(description, /remote SSH/)
-    assert.match(description, /ssh <host> <command>/)
-    assert.match(description, /remote host's own paths/)
+    // The command row starts no local client and pools a connection per host; the
+    // facts have to say so, or the model reads "ssh <host> <command>" as a subprocess.
+    assert.match(description, /pooled SSH connection/)
+    assert.doesNotMatch(description, /ssh <host> <command>/, 'this row no longer spawns ssh.exe')
+    assert.match(description, /remote host's own POSIX paths/)
+    assert.match(description, /workdir` is a directory ON THAT HOST/)
     assert.match(description, /read on the remote host/)
+    assert.match(description, /TERM, then KILL/, 'a cancelled call signals the remote process')
     assert.doesNotMatch(description, /unknown shell dialect/)
   })
 
@@ -2596,6 +2610,39 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     assert.deepEqual(started.map((spec) => spec.command), ['uname -a'])
   })
 
+  test('resolve() keeps a REMOTE workdir and never falls back to the local session cwd', () => {
+    const executor = bareSsh()
+    const named = executor.resolve({ command: 'pwd', remoteWorkdir: '/srv/app', timeoutMs: 1000 })
+    assert.equal(named.workdir, '/srv/app', 'the reported cwd is the path on the host')
+    assert.equal(named.remoteWorkdir, '/srv/app', 'and the script builder gets the same path')
+    const none = executor.resolve({ command: 'pwd', timeoutMs: 1000 })
+    assert.equal(none.workdir, '', 'no workdir means the host login directory, reported as empty')
+    assert.equal('remoteWorkdir' in none, false)
+    assert.equal(none.alias, undefined)
+    assert.throws(() => executor.resolve({ command: 'pwd', remoteWorkdir: 'C:' + BS + 'ws' }), /local Windows path/)
+    assert.throws(() => executor.resolve({ command: 'pwd', remoteWorkdir: 'rel/x' }), /must be absolute/)
+    assert.equal(executor.resolve({ command: 'pwd', remoteWorkdir: '   ' }).workdir, '', 'blank is absent, not a cd')
+  })
+
+  test('an alias selects its host; an unknown one names the declared aliases', () => {
+    const executor = bareSsh({ hosts: [sshHostEntry('one'), sshHostEntry('two', { default: true })] })
+    assert.equal(executor.aliasHost('two').alias, 'two')
+    assert.equal(executor.hostFor({}).alias, 'two', 'the default host answers a call that names no alias')
+    assert.throws(() => executor.aliasHost('nope'), /no host with alias "nope"; this row declares one, two/)
+    assert.deepEqual(executor.aliasChoices(), { aliases: ['one', 'two'] })
+    assert.equal(executor.resolve({ command: 'pwd', alias: 'one' }).alias, 'one', 'the spec carries the alias')
+  })
+
+  test('a broken host registry reports the registry verdict, once', () => {
+    const warnings = []
+    const executor = bareSsh({ hosts: [sshHostEntry('dup'), sshHostEntry('dup', { sshHost: 'other.invalid' })] })
+    executor.ctx = { ...executor.ctx, logger: { warn: (message) => warnings.push(message) } }
+    assert.deepEqual(executor.aliasChoices(), { aliases: [], error: 'duplicate alias "dup"' })
+    assert.throws(() => executor.hostFor({}), /sshShell\.hosts is invalid \(duplicate alias "dup"\)/)
+    assert.equal(warnings.length, 1, 'the row warns ONCE for a broken registry, not once per call')
+    assert.match(warnings[0], /duplicate alias "dup"/)
+  })
+
   testAsync('requireSandbox fails closed on a remote dialect, and danger-full-access is the way out', async () => {
     const demanding = bareSsh({ requireSandbox: true, sshHost: 'h' })
     demanding.openChannel = async () => { throw new Error('this must never dial or spawn') }
@@ -2755,6 +2802,17 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
           assert.ok(!text.includes('[sandbox: not applicable'), text)
           assert.ok(!text.includes('denial dialect'), text)
           assert.ok(!text.includes('ran unconfined'), text)
+        }],
+        ['the tool serves an alias parameter from the row registry, and a typo names the declared aliases', async () => {
+          const definition = ctx.tools.get('ssh_shell')
+          const properties = definition.parameters?.properties ?? {}
+          assert.ok(properties.alias !== undefined, 'a host-registry row advertises alias: ' + Object.keys(properties).join(','))
+          assert.match(properties.alias.description, /blackhole/)
+          assert.match(properties.workdir.description, /POSIX/, 'workdir is a path on the remote host')
+          const result = await sshCall(ctx, { command: 'uname -a', alias: 'nope' })
+          const text = result.content.filter((block) => block.type === 'text').map((block) => block.text).join('')
+          assert.equal(result.isError, true, 'an unknown alias fails the call')
+          assert.match(text, /no host with alias "nope"; this row declares blackhole/, text)
         }],
         ['the tool advertises no sandbox_permissions it cannot honour', async () => {
           const definition = ctx.tools.get('ssh_shell')
@@ -3844,6 +3902,31 @@ console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (
         assert.equal(result.exitCode, null)
       } finally { pool.dispose(); await fixture.close() }
     })
+    await testAsync('a remote workdir is changed into on the HOST, and omitted when none is named', async () => {
+      const scripts = []
+      const fixture = await startServer((stream) => {
+        let payload = ''
+        stream.on('data', (chunk) => { payload += String(chunk) })
+        stream.on('end', () => {
+          // The script IS the payload: decode what the row actually sent.
+          scripts.push(Buffer.from(payload, 'base64').toString('utf8'))
+          stream.exit(0)
+          stream.end()
+        })
+      })
+      const { executor, pool } = await executorFor(fixture)
+      try {
+        const withDir = executor.resolve({ command: 'pwd', remoteWorkdir: '/srv/app', timeoutMs: 5000 })
+        await (await executor.execute(withDir)).result()
+        const without = executor.resolve({ command: 'pwd', timeoutMs: 5000 })
+        await (await executor.execute(without)).result()
+        assert.ok(scripts[0].includes("cd -- '/srv/app' || exit $?"), 'the cd is in the script: ' + scripts[0])
+        assert.ok(!scripts[1].includes('cd --'), 'no workdir means no cd at all: ' + scripts[1])
+        assert.equal(withDir.workdir, '/srv/app', 'the reported cwd is the host path')
+        assert.equal(without.workdir, '', 'and empty when the host login directory is what runs the command')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
     await testAsync('a missing host alias names the aliases this row declares', async () => {
       const fixture = await startServer(() => {})
       const { executor, pool } = await executorFor(fixture)
