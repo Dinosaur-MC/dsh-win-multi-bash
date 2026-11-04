@@ -3131,6 +3131,36 @@ console.log('\n[A] unit: the ssh_shell known_hosts verifier (strict host keys) (
       assert.equal(verifyHostKey({ host: 'a.example.com', port: 22, key: blob, knownHostsPath: later }).ok, false)
     })
 
+    test('a negation excludes the WHOLE entry, across the port-22 candidate pair', () => {
+      // The bug this pins: the synthetic port-22 pair (bare name + '[host]:22') must
+      // not let an exclusion be bypassed. On '*,!example.com' for example.com:22,
+      // ssh-keygen -F example.com reports "not found"; a per-candidate reading would
+      // have trusted the host through the '[example.com]:22' candidate.
+      const trusted = writeKnownHosts('negated-star', entryLine('*,!example.com', publicKey) + '\n')
+      const bypassed = verifyHostKey({ host: 'example.com', port: 22, key: blob, knownHostsPath: trusted })
+      assert.equal(bypassed.ok, false, 'any matching negation excludes the whole entry, not one candidate')
+      assert.match(bypassed.reason, /not found in known_hosts/)
+      // The same rule protects the OTHER direction: '*,!example.com' must not revoke
+      // example.com either, so the entry is not a revocation statement about it.
+      const revokedHalf = writeKnownHosts('negated-revoked', [
+        '@revoked *,!example.com ' + publicKey.type + ' ' + blob.toString('base64'),
+      ].join('\n') + '\n')
+      const learned = verifyHostKey({ host: 'example.com', port: 22, key: blob, knownHostsPath: revokedHalf, acceptNewHostKeys: true })
+      assert.equal(learned.ok, true, 'a negated host is not revoked: the entry does not apply to it')
+      assert.match(learned.warning, /acceptNewHostKeys/)
+      const refused = verifyHostKey({ host: 'example.com', port: 22, key: blob, knownHostsPath: revokedHalf })
+      assert.equal(refused.ok, false)
+      assert.ok(!refused.reason.includes('@revoked'), 'it is an unknown-key refusal, not a revocation')
+      assert.match(refused.reason, /not found in known_hosts/)
+      // A non-default port looks the host up as '[host]:port', so the negation has to
+      // name that spelling to exclude it — and then it excludes it for real.
+      const bracket = writeKnownHosts('negated-bracket', entryLine('*,![example.com]:2222', publicKey) + '\n')
+      assert.equal(verifyHostKey({ host: 'example.com', port: 2222, key: blob, knownHostsPath: bracket }).ok, false,
+        'the bracket candidate is excluded by a negation that matches it')
+      assert.equal(verifyHostKey({ host: 'example.com', port: 2222, key: blob, knownHostsPath: trusted }).ok, true,
+        'the bare-name negation does not cover another port, which is a different known_hosts identity')
+    })
+
     test('@revoked * covers every host and is refused with acceptNewHostKeys off and on', () => {
       const path = writeKnownHosts('revoked-star', [
         entryLine('example.com', publicKey),
