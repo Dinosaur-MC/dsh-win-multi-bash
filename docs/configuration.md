@@ -17,8 +17,8 @@ That is also why the bundle inserts its core row — `win-mb-plugin`, `name: 'ds
 | `git_bash` | Background jobs (`enableRunInBackground`); `cwd`, `timeoutMs`, `maxTimeoutMs`, `maxOutputBytes`, `maxSpillBytes`, `graceMs`; `bashPath`; sandbox stance (`auto` / `none`); `probeTimeoutMs`; `requireSandbox`; unwrapped-run notice (`sandboxNotice`: `once` by default, `always` to keep the short marker on every degraded run) |
 | `wsl_bash` | The same tool-layer switch plus the same set under `wslBash`, `wslPath` and `wslDistro`; the stance list adds `bwrap` |
 | `msys2_bash` | The same tool-layer switch plus the same set under `msys2Bash`, `bashPath`, and the sandbox knobs (its stance list is MSYS's, so no `bwrap`) |
-| `ssh_bash` | The same tool-layer switch plus the same set under `sshBash`: `sshPath`, `sshHost`, `sshUser`, `sshPort`, `acceptNewHostKeys`, `connectTimeoutMs`, and the sandbox knobs. `probeTimeoutMs` and `sandboxNotice` are structurally inert here — this dialect never probes and never degrades — and `requireSandbox` refuses every command rather than pretending |
-| `terminal` | Interactive sessions: `defaultShell` (which dialect `open` uses by default); `maxSessions`; `idleMs`; `quietNoticeMs` (active/quiet sampling interval, `0` off); `rows` / `cols`; `maxBufferBytes`; `waitMs` / `quietMs` / `maxWaitMs`; `allowUnconfined`; plus one executable pin per dialect (`gitBash.bashPath`, `wslBash.wslPath` / `wslDistro`, `msys2Bash.bashPath`, `sshBash.sshPath` / `sshHost` / `sshUser` / `sshPort` / `acceptNewHostKeys` / `connectTimeoutMs`) |
+| `ssh_shell` | The same tool-layer switch plus the shared command limits under `sshShell` (`cwd`, `timeoutMs`, `maxTimeoutMs`, `maxOutputBytes`, `maxSpillBytes`, `graceMs`) and the host registry `sshShell.hosts` — one entry per host, see [The `ssh_shell` host registry](#the-ssh_shell-host-registry). It keeps the sandbox knobs (`sandbox`, `probeTimeoutMs`, `requireSandbox`, `sandboxNotice`) like every row, but none of them can fence a remote effect: both stances mean the same thing here, the probe knobs are inert, and `requireSandbox` refuses every command under `read-only` / `workspace-write` |
+| `terminal` | Interactive sessions: `defaultShell` (which dialect `open` uses by default); `maxSessions`; `idleMs`; `quietNoticeMs` (active/quiet sampling interval, `0` off); `rows` / `cols`; `maxBufferBytes`; `waitMs` / `quietMs` / `maxWaitMs`; `allowUnconfined`; plus one executable pin per dialect (`gitBash.bashPath`, `wslBash.wslPath` / `wslDistro`, `msys2Bash.bashPath`, and the terminal row's own single-host SSH pin under `sshShell`: `sshPath` / `sshHost` / `sshUser` / `sshPort` / `acceptNewHostKeys` / `connectTimeoutMs` — it does not read the `hosts` table in 0.8.0) |
 | `win-mb-plugin` (core) | `guardSandboxTemp` (default on), `tempWatchMs` (default 10000 ms, floor 1000) |
 
 The list is exactly the volatile projection of each row's `Config` schema; the audit pins both sides (`volatilePaths` of the host configs against the browser half's field table), so a knob added to a backend without `.volatile()` cannot silently stay YAML-only, and the page cannot offer a field the Host would refuse.
@@ -36,7 +36,69 @@ Only `git_bash` and `terminal` are enabled by default; three dialects ship switc
 
 - `wsl_bash` is opt-in because a WSL deployment is a second toolchain a machine may not have, and the row's first load probes the distro. Enable `win-mb-tool-wsl`; pin `wslBash.wslDistro` when the default distribution is not the one you want.
 - `msys2_bash` is opt-in: enable `win-mb-tool-msys2`, and pin `msys2Bash.bashPath` when MSYS2 is installed outside its usual location. It inherits the MSYS mechanism rather than copying it and reports its own facts — `$MSYSTEM`, `pacman` — instead of Git Bash's.
-- `ssh_bash` is opt-in for a reason of its own: a deployment has to name the host. Enable `win-mb-tool-ssh` and pin `sshBash.sshHost` (plus `sshUser` / `sshPort` when they are not the client's defaults); a row with no host refuses every call and names that field. `sshPath` is trusted when it exists and otherwise warns once and falls back to discovery, exactly like `bashPath`. Escalation is advertised only while `requireSandbox` is on: without it the row advertises no confinement it cannot provide, so there is no `sandbox_permissions` argument to misuse.
+- `ssh_shell` is opt-in for a reason of its own: a deployment has to name its hosts. Enable `win-mb-tool-ssh` and list them under `sshShell.hosts`; a row with no hosts registers the tool and refuses every call with `no hosts are configured`. Authentication is key-only — `keyPath` names a private key file and `passphraseEnv` names an environment variable that holds its passphrase, never the passphrase itself — and host keys are checked against `known_hosts` instead of being trusted on first use. Every foreground result reports `sandbox: { mode, remote: true }`; `requireSandbox: true` makes the row refuse every remote command rather than pretend a local fence, and the documented way through is a per-call `danger-full-access` escalation (the only case where the row advertises `sandbox_permissions`).
+
+## The `ssh_shell` host registry
+
+`sshShell.hosts` is the row's whole host inventory: an array of objects, one per host, and the alias a call passes is the only way to choose one. It replaces the single-target pins of `ssh_bash` — the tool no longer drives an `ssh.exe` process, so its Configure page carries no client path, host, user or port.
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `alias` | yes | The name a call passes. Unique within the array, `/^[A-Za-z0-9][A-Za-z0-9._-]*$/`. |
+| `host` | yes | Hostname or IP address; no whitespace. |
+| `port` | no | `1`–`65535`, default `22`. |
+| `user` | yes | The login user. |
+| `keyPath` | yes | Absolute path, or `~/...`, to the private key file. Keys are the only credential form in 0.8.0 — no password and no ssh-agent. |
+| `passphraseEnv` | no | The name of the environment variable that holds the key's passphrase. The value is never stored: config carries the variable name only. |
+| `startupCommand` | no | A POSIX shell snippet run before every command on that host; see [Startup command and shell templates](#startup-command-and-shell-templates). |
+| `shellTemplate` | no | The remote command line that reads a base64 script from its stdin. Default `bash -c 'eval "$(base64 -d)"'`. |
+| `connectTimeoutMs` | no | Whole handshake and authentication ceiling for one connection, default `30000`. |
+| `approval` | no | `trusted` or `session` (default). Recorded on the host for the session-authorization gate, which is not part of this change: today neither value changes a call — no prompt is made, and `trusted` is not required to use a host. Neither the model nor a call argument can set it. |
+| `acceptNewHostKeys` | no | `false` by default. `true` accepts an unknown host key for that connection with a one-time warning; it never writes `known_hosts`. |
+| `default` | no | At most one host may carry it; a call may then omit `alias`. |
+| `description` | no | Free text for the human (the Configure page and the composition file); it never reaches a call's result. |
+
+Validation runs when the config is read and again at call time. A missing required field, a malformed or duplicated alias, a port outside the range, or two `default` hosts fails with a message naming the field and the alias. A broken array leaves the row registered with no hosts, and every call then fails with the same sentence — `sshShell.hosts is invalid (<the field and alias>)` — instead of letting "no host with alias X" hide the real cause. A valid empty array is a different state: `no hosts are configured; add them to the sshShell.hosts array on this row`.
+
+`alias` may be omitted from a call only when **exactly one** host carries `default: true`. With no default the call fails and names the declared aliases; running on the first host instead would be a guess about where a command runs.
+
+On the Plugins page the registry is edited as **JSON text** in one control: a draft that does not parse is reported and never saved, and an emptied control clears the override instead of writing an empty value. The array itself is never returned with secrets — it carries paths and an environment-variable name, never key material or a passphrase. The model sees only the alias list in the `alias` parameter's description.
+
+## Host keys and `known_hosts`
+
+The host key is verified during the handshake, before authentication completes and before any channel opens. ssh2 accepts whatever a server presents when no verifier is set, so the plugin parses `known_hosts` itself and fails closed. It reads `known_hosts` **and** `known_hosts2` together (`%USERPROFILE%\.ssh\` on Windows, `$HOME/.ssh/` elsewhere): an entry in either file counts, one missing file is not an error, and neither existing is the unknown-key case. Plain entries, `[host]:port` entries, several key types for one host, comments, hashed names (`|1|salt|hash`, HMAC-SHA1), OpenSSH host patterns (`*`, `?`, comma lists, `!` negation) and `@revoked` markers are honoured; the presented key's type and base64 blob must equal an entry's for the target and port.
+
+- **No entry** — refused with `host key not found in known_hosts`, the file(s) read, and the presented key's fingerprint.
+- **A different key for a known host** — refused with both SHA256 fingerprints.
+- **`@revoked`** — refused even when a plain entry would accept the key, and `acceptNewHostKeys` never overrides a revocation.
+- **`acceptNewHostKeys: true`** — an unknown key is accepted for that connection with one warning that prints the line to add. It never writes the file: 0.8.0 performs no trust-on-first-use.
+
+Two stated limits fall on the strict side — the call is refused, never accepted on an unverified key. `@cert-authority` lines are parsed but not honoured (certificate-signed host keys are a later release, so such a host needs a plain entry as well). And a host pattern that negates a bracketed host with a port can over-refuse at the default port — `*,![example.com]:22` excludes the bare host too.
+
+Add each entry deliberately before the first call — connect once with the OpenSSH client, or run `ssh-keyscan` — because the switch only covers a host with **no** entry, never a changed or revoked one.
+
+Authentication is key-only and the passphrase stays out of the file: an encrypted key needs `passphraseEnv` to name an environment variable that holds its passphrase, and a missing or wrong passphrase fails the call with a message naming that variable. No passphrase or key material is written to config, logs or a tool result.
+
+## Startup command and shell templates
+
+Each call sends its command to the remote host as a POSIX script on the channel's stdin, base64-encoded. The host's `shellTemplate` is the command line that decodes it; the default is `bash -c 'eval "$(base64 -d)"'`, and a Windows host whose login shell is `cmd.exe` pins a template that starts Git Bash, for example:
+
+```text
+"C:\Program Files\Git\bin\bash.exe" -c "eval \"$(base64 -d)\""
+```
+
+The template is static per host and no user text is interpolated into it, which is what makes command quoting safe on any host whose template can launch a POSIX shell; a host without a working `base64` reports that shell's error verbatim. The remote script is laid out as:
+
+```text
+{ <startupCommand>
+} || exit $?                     # omitted when the snippet is empty or only comments
+cd -- '<workdir>' || exit $?     # only when the call passes workdir
+<command>
+```
+
+The group closes on its **own line** on purpose: a one-line `{ …; }` cannot hold a snippet ending in a comment, a here-document, or an empty body — measured with bash, each of those either swallows the closing brace or fails outright. A snippet that is empty or only comments has nothing to run, so its guard line is omitted instead of producing an invalid `{ }`.
+
+`startupCommand` is a **per-call** snippet, not session state: it runs in the same fresh shell, before the command, guarded so a failure aborts the call with its own exit status, and exported variables or a `cd` it performs apply to that one command and vanish when the shell exits. `workdir` is an absolute POSIX path **on the remote host** — the local session's directory is not used — and it is single-quote escaped before it is placed in the script. The value is never trimmed (a directory whose name ends in a space is legal; a whitespace-only path must attempt the `cd` and fail honestly), a local Windows path (drive letter, backslash, UNC) or a relative path is refused by name, and the result's `cwd` is that remote path or the empty string. There is no cross-call state (that is what `terminal` sessions are for) and no stdin (an interactive command or a TUI belongs in `terminal`).
 
 ## Text and numeric fields
 
@@ -78,3 +140,45 @@ Background advertising is config-driven here, not registry-driven: `run_in_backg
 ## Staged saves
 
 The page stages drafts and writes only on **Save**, fenced by the revision it read; a save the Host refuses keeps the drafts. Emptying a path or a distro stages a clear, so the override drops and the built-in probe resolves again. A save already crossing the wire is not re-entered.
+
+## Migration from `ssh_bash` (0.8.0)
+
+0.8.0 renames the remote dialect and turns its configuration into a host registry. The old names are **not** honoured at runtime:
+
+| Surface | 0.7.x | 0.8.0 |
+| --- | --- | --- |
+| Tool | `ssh_bash` | `ssh_shell` |
+| Config partition | `sshBash` | `sshShell` |
+| Patch row | `.../tool-ssh-bash` | `.../tool-ssh-shell` |
+| Export subpath | `./tool-ssh-bash` | `./tool-ssh-shell` |
+| Terminal shell value | `ssh_bash` | `ssh_shell` |
+| Terminal pin partition | `sshBash` | `sshShell` |
+| Executor | `SshBashExecutor` | `SshShellExecutor` |
+
+A profile that still lists `sshBash:` under the ssh row is reported by the loader as an unknown key; the tool then runs with no hosts, and every call fails with `no hosts are configured; add them to the sshShell.hosts array on this row` — the honest diagnostic for a stale config rather than a silent fallback to one host.
+
+Replace the single-target pins (`sshPath`, `sshHost`, `sshUser`, `sshPort`, `acceptNewHostKeys`, `connectTimeoutMs`) with a hosts array, in the profile's YAML or on the row's Configure page:
+
+```yaml
+- id: win-mb-tool-ssh
+  name: 'dsh-win-multi-bash/tool-ssh-shell'
+  config:
+    sshShell:
+      hosts:
+        - alias: ubuntu
+          host: 10.0.0.5
+          port: 22
+          user: deploy
+          keyPath: '~/.ssh/id_ed25519'
+          startupCommand: 'export APP_ENV=production'
+        - alias: win-build
+          host: build.example.com
+          user: builder
+          keyPath: 'C:\Users\me\.ssh\id_ed25519'
+          shellTemplate: '"C:\Program Files\Git\bin\bash.exe" -c "eval \"$(base64 -d)\""'
+          default: true
+```
+
+Then update the calls — `ssh_shell` with `alias: "ubuntu"` and its `command`, or with no alias when exactly one host carries `default: true` — and move terminal sessions from `shell: "ssh_bash"` to `shell: "ssh_shell"`, with their pins under `sshShell.*`. The terminal row keeps its own single-host pin (`sshPath`, `sshHost`, `sshUser`, `sshPort`, `acceptNewHostKeys`, `connectTimeoutMs`); it does not read the hosts table in 0.8.0, and its `acceptNewHostKeys` is the OpenSSH client's `accept-new`, so a session's first connection is recorded into `known_hosts` — the host registry's switch only accepts a key for one connection and never writes the file. The tool row has no `sshPath` any more: its client is ssh2 (`~1.17.0`), not `ssh.exe`.
+
+Authentication is key-only: a password prompt or a live ssh-agent is not available to `ssh_shell`, and an encrypted key needs `passphraseEnv`. Host keys are strict — add each host to `known_hosts` first, or set `acceptNewHostKeys: true` on that host to accept an unknown key once with a warning. Neither a missing `known_hosts` entry nor a changed key is bypassed by that switch, and `@cert-authority` entries are not honoured in 0.8.0.

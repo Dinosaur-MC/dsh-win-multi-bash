@@ -22,13 +22,13 @@ A declaration that does not hold together **throws at load**: duplicate ids, a m
 
 ## 3. One prompt section, scope-aware
 
-The family's shared guidance lives in one `tool:win-mb-bash` section owned by the core row. It is resolved at every assembly from the mounted tools, so `git_bash` / `wsl_bash` / `msys2_bash` / `ssh_bash` stay independently switchable: any subset renders exactly one correct copy, and no tool renders guidance for a tool that is not present.
+The family's shared guidance lives in one `tool:win-mb-bash` section owned by the core row. It is resolved at every assembly from the mounted tools, so `git_bash` / `wsl_bash` / `msys2_bash` / `ssh_shell` stay independently switchable: any subset renders exactly one correct copy, and no tool renders guidance for a tool that is not present.
 
 Per-tool descriptions keep only dialect facts. If the core row is absent, the shared guidance falls back into each tool description (with a warning); the fallback text, not the log line, is what guarantees the model keeps the guidance.
 
 ## 4. Fail loud at load, degrade honestly at runtime
 
-Configuration mistakes that can be caught statically throw at load. A missing external toolchain (Git Bash, WSL, `bwrap`, an SSH client) is a runtime fact: the row loads, discovery/probing happens lazily, and a failed sandbox probe degrades to an honest unconfined run rather than pretending.
+Configuration mistakes that can be caught statically throw at load. A missing external toolchain (Git Bash, WSL, `bwrap`, and an SSH client for a session) is a runtime fact: the row loads, discovery/probing happens lazily, and a failed sandbox probe degrades to an honest unconfined run rather than pretending.
 
 `requireSandbox: true` flips that default for deployments that prefer fail-closed: `read-only` / `workspace-write` calls are refused when the probe fails, while `danger-full-access` still runs (it is equivalent to an explicit full-access grant). `sandbox: none` is a deliberate opt-out and stays allowed.
 

@@ -4,7 +4,7 @@ This is the map of the plugin: what is a row, what is a dialect, how a tool call
 
 ## Vocabulary
 
-- **Dialect** — one shell family: `git_bash`, `wsl_bash`, `msys2_bash`, `ssh_bash`.
+- **Dialect** — one shell family: `git_bash`, `wsl_bash`, `msys2_bash`, `ssh_shell`.
 - **Executor** — the object that turns one call's `command` / `workdir` / limits into a process, and decorates the result with sandbox facts. It extends `ShellExecutorBase`, which extends dsh's `LocalBashExecutor`.
 - **Tool row** — one `cordis.patch.yml` row that mounts one tool (a subpath export such as `./tool-git-bash`).
 - **Core row** — `win-mb-plugin`, named by the bare package specifier. It serves the browser half, owns the shared prompt section, and carries the deployment-wide self-heal switch.
@@ -20,7 +20,7 @@ The shipped `cordis.patch.yml` inserts:
 | `win-mb-tool-git` | `.../tool-git-bash` | on | `GitBashExecutor`, its config partition `gitBash` |
 | `win-mb-tool-wsl` | `.../tool-wsl-bash` | **off** | `WslBashExecutor`, `wslBash` |
 | `win-mb-tool-msys2` | `.../tool-msys2-bash` | **off** | `Msys2BashExecutor`, `msys2Bash` |
-| `win-mb-tool-ssh` | `.../tool-ssh-bash` | **off** | `SshBashExecutor`, `sshBash` |
+| `win-mb-tool-ssh` | `.../tool-ssh-shell` | **off** | `SshShellExecutor`, `sshShell` |
 | `win-mb-tool-terminal` | `.../tool-terminal` | on | `terminal`, `terminal` config partition |
 
 All rows are win32-only. A row inserts only its own tool; nothing of the base bundle's shell wiring is disabled. That is deliberate: the plugin never provides `ctx.shell`, so dsh's own `pwsh-sandbox` row keeps the seat and every plugin that injects `shell` is unaffected.
@@ -56,7 +56,7 @@ The four executors own their argv:
 - `lib/bash-git/index.js` — MSYS `bash.exe`; paths are passed by Node, so MSYS rewriting does not apply to the plugin's own paths.
 - `lib/bash-wsl/index.js` — `wsl.exe` driving Linux; the command travels as a base64 payload so quoting and Linux paths arrive verbatim.
 - `lib/bash-msys2/index.js` — MSYS2's own UCRT64 bash; discovery under the installation roots or a pinned `bashPath`.
-- `lib/bash-ssh/index.js` — one `ssh.exe` command per call, `-T`, `BatchMode=yes`; the target and host-key policy are deployment configuration, never call arguments.
+- `lib/ssh-shell/index.js` — pooled SSH over ssh2: one connection per host, one exec channel per call, a base64 POSIX script on the channel's stdin; hosts and host-key policy are deployment configuration, never call arguments (see [Remote execution](#remote-execution-ssh_shell)).
 
 ## The tool factory
 
@@ -64,7 +64,7 @@ The four executors own their argv:
 
 - the tool-layer `Config` (`enableRunInBackground`, `promoteOnTimeout`) and the backend partition the executor is built from;
 - the escalation surface (`sandbox_permissions`) advertised only where confinement exists;
-- background jobs: `run_in_background` starts a real job and returns `{ kind: 'background', jobId, cwd }`; a timed-out foreground command is promoted instead of killed (matching dsh's own bash);
+- background jobs: `run_in_background` starts a real job and returns `{ kind: 'background', jobId, cwd }`; a timed-out foreground command is promoted instead of killed (matching dsh's own bash); the job label is `description · command`, because the platform draws that one field both as the job row's title and as its expanded command line;
 - result rendering: exit/signal markers, sandbox markers, spill previews, promoted reads, the `(no output)` body;
 - the fallback description when the core row is absent (the shared guidance moves into each tool description).
 
@@ -96,19 +96,32 @@ The browser half cannot import the package (the client module loader resolves su
 
 ```text
 model tool call
-  → tool instance (factory) resolves the policy and the workdir
-  → executor builds argv and asks the sandbox seam (confine / none / remote)
-  → subprocess spawns the shell; stdout/stderr are bounded and spilled
+  → tool instance (factory) resolves the policy and the workdir (the alias, for `ssh_shell`)
+  → executor builds argv and asks the sandbox seam (confine / none), or opens a pooled channel (remote)
+  → subprocess spawns the shell, or the ssh channel runs the script remotely; stdout/stderr are bounded and spilled
   → renderer writes markers ([exit code: N], sandbox facts, promotion, spill)
-  → tool result (content + structured sandbox fact)
+  → tool result (content + structured sandbox fact; `{ remote: true }` for `ssh_shell`)
   → client slot tool.call.toolview renders the shell card
 ```
+
+## Remote execution (`ssh_shell`)
+
+The SSH dialect keeps the family's tool contract but replaces the local spawn with a pooled exec channel:
+
+- **One engine per tool row, one client per host.** `lib/ssh-shell/pool.js` owns an `ssh2.Client` per alias, dialled lazily and reused across calls (two concurrent first calls share one dial); the host key is verified on every dial, a client that errors or closes is dropped so the next call redials instead of inheriting a dead socket, and row teardown closes every client. There is no idle timer.
+- **One exec channel per call.** `execute` / `resolve` open a channel, send the base64 POSIX script built by `script.js` on its stdin, collect stdout and stderr separately, and settle on the exit status ssh2 delivers (the `exit` event or the `close` arguments). Settlement waits at most 100 ms for trailing bytes, then destroys the channel; bytes that arrive afterwards are counted and discarded, so a background child cannot leak output into the next call.
+- **The host registry decides the target.** `hosts.js` validates `sshShell.hosts` and resolves the call's alias (or the single `default` host); `known-hosts.js` supplies the `hostVerifier` that refuses an unknown, changed or `@revoked` key before authentication completes. `pool.js` reads the private key from `keyPath` and a passphrase only from the environment variable the host names.
+- **No plugin-level concurrency cap.** Concurrency is bounded by the job registry's limits (background), the agent loop's parallel calls and the number of sessions (foreground), and the server's `MaxSessions` per connection. A channel the server refuses is reported verbatim today; retrying it with backoff once a slot frees is planned for the scp work and is not part of this release.
+- **Jobs are the factory's, not a second implementation.** The channel handle exposes the same `result()` / `kill()` / output-source contract as the local executors, so `run_in_background` (register immediately, stream into the job ring, settle on exit), timeout promotion (register before starting, return a job id, leave it running), `job_kill` (TERM, 2 s, KILL, close) and the admission-refusal fallback all reuse the existing factory path. A channel that closes with no exit status is an infrastructure failure: the handle is `failed`, the job settles **failed** with a sentence naming the host, never completed with exit 0.
+- **Cancellation is a remote signal.** On timeout or caller abort the runner sends `SIGTERM`, waits up to 2 s, sends `SIGKILL` and closes the channel; a lost connection tears the remote session down with it. Commands that detach themselves (`nohup`, `setsid`) survive by design, and are documented that way. The transport is `ssh2 ~1.17.0`: the version is pinned because the cancellation path uses the protocol-level signal request after stdin is half-closed (the public `signal()` becomes a no-op there). If a future build lacks that path, the result's stderr carries a loud marker that the remote command may still be running.
+- **Remote effects are stated, not sandboxed.** The result carries `sandbox: { mode, remote: true }` and no local verdict; the local file sandbox is not applied to a command that runs on another host. `cwd` is the remote `workdir` when one was given and the empty string otherwise.
+- **The PTY path is unchanged.** `terminal` still runs a real PTY over the OpenSSH client (`ssh.exe -t`), configured by its own `sshShell` single-host pin; it does not read the `hosts` table in 0.8.0, so interactive host-key questions and terminal semantics stay exactly as they were. Sharing the registry with `terminal` is future work.
 
 ## Path conversion and workdir
 
 Git Bash rewrites leading-slash POSIX paths into Windows paths whenever a native Windows program is called. That is MSYS behavior, not a plugin defect: `wsl.exe -e ls /root` inside `git_bash` becomes `...\Git\root`. Prefix the call with `MSYS_NO_PATHCONV=1` (or `MSYS2_ARG_CONV_EXCL="*"`) to pass arguments verbatim; for WSL work, prefer `wsl_bash`, which ships the command as a base64 payload.
 
-`workdir` accepts native, MSYS (`/c/...`) and WSL automount (`/mnt/c/...`) forms. The resolver translates a single-letter drive form and the automount form to native before `spawn`; MSYS POSIX roots (`/etc`, `/usr`, `/tmp`) and distro-side paths such as `/mnt/data` are left alone, and a relative `workdir` resolves against the session workspace. The conversation card's prompt cwd applies the same resolution plus `.`/`..` normalization, so a `workdir: "lib/.."` displays the actual directory, not `..`.
+`workdir` accepts native, MSYS (`/c/...`) and WSL automount (`/mnt/c/...`) forms. The resolver translates a single-letter drive form and the automount form to native before `spawn`; MSYS POSIX roots (`/etc`, `/usr`, `/tmp`) and distro-side paths such as `/mnt/data` are left alone, and a relative `workdir` resolves against the session workspace. None of this applies to `ssh_shell`: its `workdir` is an absolute POSIX path on the remote host, taken verbatim (never resolved against the local session) and refused by name when it is a Windows or relative path. The conversation card's prompt cwd applies the same resolution plus `.`/`..` normalization, so a `workdir: "lib/.."` displays the actual directory, not `..`.
 
 ## Package layout
 
@@ -117,7 +130,8 @@ lib/
 ├── bash-git/       GitBashExecutor (MSYS)
 ├── bash-wsl/       WslBashExecutor (WSL, base64 payloads)
 ├── bash-msys2/     Msys2BashExecutor (MSYS2 UCRT64)
-├── bash-ssh/       SshBashExecutor (remote shell over OpenSSH)
+├── ssh-shell/      SshShellExecutor (pooled ssh2 channels), hosts, known_hosts,
+│                   script builder, connection pool
 ├── tool-bash/      factory + one instance per dialect; registry, shell-family,
 │                   render, terminal, backend ownership
 ├── terminal-session.js   PTY registry: bounded output, readiness, reclamation

@@ -11,7 +11,7 @@
 ![dialects: MSYS, WSL, MSYS2, SSH](https://img.shields.io/badge/dialects-MSYS%20%7C%20WSL%20%7C%20MSYS2%20%7C%20SSH-4c1.svg)
 [![Listed on dsh-plugin.org](https://dsh-plugin.org/badges/listed.svg)](https://dsh-plugin.org/plugins/dinosaur-mc/dsh-win-multi-bash)
 
-DeepSeek Harness 的 Windows 多 bash 插件。**`git_bash`**（Git for Windows / MSYS）默认开启；**`wsl_bash`**（WSL）、**`msys2_bash`**（MSYS2 UCRT64）与 **`ssh_bash`**（经 OpenSSH 的远端 shell）按需开启。**`terminal`** 在调用之间保留一个真正的 PTY 会话。
+DeepSeek Harness 的 Windows 多 bash 插件。**`git_bash`**（Git for Windows / MSYS）默认开启；**`wsl_bash`**（WSL）、**`msys2_bash`**（MSYS2 UCRT64）与 **`ssh_shell`**（池化 SSH 通道、仅密钥、多主机）按需开启。**`terminal`** 在调用之间保留一个真正的 PTY 会话。
 
 每个方言持有自己的执行器，且**没有任何工具注册 `ctx.shell`**——该席位始终归基座自带的 pwsh，因此 pwsh 的行为与未装本插件时完全一致。
 
@@ -22,18 +22,18 @@ DeepSeek Harness 的 Windows 多 bash 插件。**`git_bash`**（Git for Windows 
 | `git_bash` | Git for Windows（MSYS） | **默认开启**；持有 `GitBashExecutor` |
 | `wsl_bash` | WSL Linux | **按需开启**；持有 `WslBashExecutor`；首次加载会探测发行版 |
 | `msys2_bash` | MSYS2 UCRT64 | **按需开启**；持有 `Msys2BashExecutor`；MSYS2 自己的 `$MSYSTEM` 与 `pacman` |
-| `ssh_bash` | 远端（SSH） | **按需开启**；持有 `SshBashExecutor`；每次调用一条命令；目标属于部署配置 |
+| `ssh_shell` | 远端（SSH） | **按需开启**；持有 `SshShellExecutor`；每主机一条池化连接，每次调用一条通道 |
 | `terminal` | 以上任意后端 | 持久 PTY 会话：`open` / `send` / `read` / `signal` / `close` / `list` |
 | `pwsh` | dsh 自带 | 不受影响；由基座的 `pwsh-sandbox` 行提供 |
 
-只有 `git_bash` 与 `terminal` 默认开启。另外三行默认关闭，因为每行都挂载一台机器未必具备的工具链（或主机）；请在**插件**页按需启用。在许多 Git for Windows 主机上，windows-acl runner 无法启动 MSYS bash，所以 `git_bash` 会以未包裹方式运行并如实说明——需要沙箱时请用 `wsl_bash`（bwrap）或 dsh 自带的 pwsh。详见[沙箱行为](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/sandbox.md)。
+只有 `git_bash` 与 `terminal` 默认开启；另外三行按需开启，因为每行都挂载一台机器未必具备的工具链（或主机）。在许多 Git for Windows 主机上 `git_bash` 会以未包裹方式运行——详见[沙箱行为](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/sandbox.md)。
 
 ## 环境要求
 
 - dsh `0.1.7-rc.2` 到 `0.2.x` —— `package.json` 的 `engines.dsh` 声明的就是这个窗口。更新的 dsh 会拒绝本插件，直到有针对该版本线的重新验证发布。
 - Windows，以及一个提供已发布 `@deepseek-ai` 基础包的 dsh 部署。
 - Git Bash / WSL / MSYS2 只在启用对应后端时需要；缺后端不会影响 pwsh。
-- `ssh_bash` 需要 OpenSSH 客户端、可达主机，以及无需交互提示的凭据。
+- `ssh_shell` 需要 `sshShell.hosts` 中主机的仅密钥访问权限，且每台主机密钥已在 `known_hosts` 中。
 - Node `^22.19.0 || >=24.0.0`（本包声明范围），安装需要 `pnpm`。
 
 ## 安装
@@ -52,14 +52,15 @@ dsh plugin --profile web remove dsh-win-multi-bash                 # 卸载
 
 - **`git_bash`** 装好即可用。每次调用启动一个全新的 MSYS bash；`workdir` 接受原生、MSYS（`/c/...`）与 WSL automount（`/mnt/c/...`）三种写法。
 - **`wsl_bash` / `msys2_bash`**：在插件页启用 `win-mb-tool-wsl` / `win-mb-tool-msys2`。只有自动探测不够时才需要 pin `wslBash.wslDistro` 或 `msys2Bash.bashPath`。
-- **`ssh_bash`**：启用 `win-mb-tool-ssh` 并 pin `sshBash.sshHost`（主机名或 `~/.ssh/config` 别名），需要时再设 `sshUser` / `sshPort`。目标永远不是工具参数；没有主机的行会拒绝每一次调用。单次调用使用 `BatchMode=yes`，请用密钥认证；要回答首次连接提问，用 `terminal` 的 `shell: "ssh_bash"` 会话形态。
-- **`terminal`**：`open` 开会话，`send`（`submit: true`）发命令，`read` 读回复，`close` 结束。工作目录、导出的变量与别名会跨调用保留。会话是进程内的、有上限、空闲会被回收，且**不是**后台任务；Session 头部面板会列出运行中与已结束的会话，并可停止其中一个。
+- **`ssh_shell`**：启用 `win-mb-tool-ssh`，在 `sshShell.hosts` 下添加主机（`alias`、`host`、`user`、`keyPath`；需要时再加 `port` / `startupCommand` / `default`）。调用时指定别名；只有一台主机标 `default` 时才可以省略；没有主机的行会拒绝每一次调用。认证与主机密钥都严格且仅用密钥——迁移说明见[配置](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/configuration.md)。
+- **`terminal`**：`open` 开会话，`send`（`submit: true`）发命令，`read` 读回复，`close` 结束。工作目录、导出的变量与别名会跨调用保留。会话是进程内的、有上限、空闲会被回收，且**不是**后台任务；Session 头部面板会列出并停止它们。
 - 每行在插件页都有**配置**入口：路径、超时、沙箱立场、会话上限，以及部署级的自愈开关。除非某个旋钮决定工具 schema，改动都是即时的。
 
 ## 设计概览
 
 - **只说不曾观测到的事实。** 成功且被包裹的运行报 `denied: false`；失败且匹配后端拒绝方言的报 `denied: true`；失败但匹配不上的不报 `denied`。未包裹运行报 `unconfined: true`。远端 SSH 运行报 `sandbox: { mode, remote: true }`，绝不借用本地判词。
 - **平台原生的调用卡片。** 本插件的工具调用渲染成平台自己的 shell 卡：完整的终端 labels、座位提供的 `useDisclosure`、仅头部的后台卡，以及平台的 exit capsule。见[会话行](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/conversation-rows.md)。
+- **每主机一条连接，每次调用一条通道。** `ssh_shell` 复用池化的 ssh2 客户端，并为每次调用开一条独立 exec 通道——相互隔离、可并行、可取消；超时会向远端进程发信号。
 - **一个方言一条声明。** 方言 = 一个执行器文件 + 一条注册表声明；工具模块、提示词成员、patch 行、配置分区、包 exports 与客户端行都由它派生。声明不自洽会在加载时直接报错。见[架构](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/architecture.md)与[设计原则](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/principles.md)。
 - **只有一段共享提示词。** 核心行拥有唯一的 `tool:win-mb-bash` 小节，其文本随实际挂载的工具变化；每个工具描述只保留自己的方言事实。
 - **配置即时生效，用户输入优先。** 能即时的旋钮都声明为 `.volatile()`；页面从不改写或删除你输入的值，保存带 revision 围栏。见[配置](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/configuration.md)。

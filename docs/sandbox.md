@@ -7,7 +7,7 @@ The DSH file sandbox constrains **file effects** of a command this host runs (`w
 | `pwsh` | windows-acl restricted-token runner | partial | no probe — always confined (dsh's own executor) |
 | `wsl_bash` | `bwrap` inside the distro | full | runs unconfined, no sandbox facts |
 | `git_bash` | windows-acl runner wrapping MSYS bash | partial (when the probe passes) | runs unconfined, no sandbox facts |
-| `ssh_bash` | none applies — the command runs on another host | n/a | no probe, no wrapper: no local verdict |
+| `ssh_shell` | none applies — the command runs on another host | n/a | no probe, no wrapper: no local verdict |
 
 ## Facts, not guesses
 
@@ -48,7 +48,7 @@ wsl.exe -d Ubuntu-24.04 -e bash -c "command -v bwrap && bwrap --version"
 
 ## SSH: outside the local file sandbox, by design
 
-A file sandbox fences the **local** effects of a command this host runs. An SSH command's effects are on the other host, so the row applies **no wrapper at all** — wrapping `ssh.exe` would only restrict which local keys and `known_hosts` the client may read, and would break the client, which must read `~/.ssh/*` outside the workspace root.
+A file sandbox fences the **local** effects of a command this host runs. An SSH command's effects are on the other host, and `ssh_shell` never spawns a local process that could be wrapped: it opens an exec channel on a pooled ssh2 connection (see [Architecture](architecture.md#remote-execution-ssh_shell)).
 
 Consequences:
 
@@ -56,10 +56,11 @@ Consequences:
 - a promoted result reports the same fact **inside its returned text** (a promotion's seeded read has no structured `sandbox` field in the base tool's shape);
 - a background acknowledgement carries **no `sandbox` field** — the same shape dsh's own `pwsh`/`bash` use for that branch;
 - `denied`, `enforcement`, `runnerFailed` and `unconfined` are all absent;
-- `requireSandbox: true` **refuses every command** on that row; the documented way through is a per-call `danger-full-access` escalation;
+- `requireSandbox: true` **refuses every command** on that row under `read-only` / `workspace-write`; the documented way through is a per-call `danger-full-access` escalation, and that is the only case where the row advertises `sandbox_permissions`;
+- the sandbox stance list is inert for this dialect — both `auto` and `none` mean "nothing local to wrap" — and `probeTimeoutMs` / `sandboxNotice` never fire because there is no probe and no degraded run;
 - the family prompt section drops its local file-sandbox sentence when no locally-sandboxable family tool is mounted.
 
-A **stopped SSH call stops the client, not the remote command** (measured). `ssh -T host 'sleep N'` survives a `kill -9` of the local client: with no remote tty, sshd closes the channel and never signals the command. Make long remote work self-limiting on the remote side (`timeout`, `systemd-run`), or run it in a `terminal` session with `shell: ssh_bash`, whose PTY teardown does reap the remote process group.
+A **stopped SSH call now stops the remote command**, which is why the transport is a channel rather than a client process: on timeout or caller abort the runner sends `SIGTERM` through the SSH signal request, waits up to 2 s, sends `SIGKILL`, then closes the channel. A lost connection tears the remote session down with it. A command that detached itself (`nohup`, `setsid`) survives by design — make long remote work self-limiting on the remote side (`timeout`, `systemd-run`). The one-shot OpenSSH form could only stop `ssh.exe`; it is gone in 0.8.0, while a `terminal` session (`shell: ssh_shell`) keeps the OpenSSH PTY and its teardown reaps the remote process group.
 
 ## `requireSandbox`
 

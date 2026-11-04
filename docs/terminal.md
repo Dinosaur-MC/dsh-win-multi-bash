@@ -15,13 +15,15 @@ Every session result carries `shell` and `remote` (value and `output.schema`), s
 
 ## Backends
 
-The backend is the dialect registry. `shell` names one of the dialects that declare interactive-session capability — `git_bash`, `wsl_bash`, `msys2_bash`, `ssh_bash` — and each executor supplies its own interactive argv:
+The backend is the dialect registry. `shell` names one of the dialects that declare interactive-session capability — `git_bash`, `wsl_bash`, `msys2_bash`, `ssh_shell` — and each executor supplies its own interactive argv:
 
 - `bash.exe -i`
 - `wsl.exe --cd <dir> [-d <distro>] -- bash -i`
 - `ssh.exe -t <options> -- <host>` (no `-T`, no `BatchMode`, so the PTY can answer a first-connect prompt)
 
 `terminal.defaultShell` picks the default; a dialect that declares no session is never offered.
+
+**An SSH session is configured on this row, not on the `ssh_shell` row.** The session keeps its own single-host pin under `sshShell` — `sshPath`, `sshHost`, `sshUser`, `sshPort`, `acceptNewHostKeys`, `connectTimeoutMs` — and does **not** read the command row's `sshShell.hosts` table in 0.8.0. A session therefore covers one host, while `ssh_shell` can reach many; sharing the registry is future work. The session's `acceptNewHostKeys` is the OpenSSH client's `accept-new`, so a first connect records the key into `known_hosts`, whereas the host registry's switch only accepts a key for one connection and never writes the file. There is no startup command for a session in this release.
 
 **One shell per session, using the user's own startup files.** `-i` only — no `--noprofile --norc` — because the aliases and exported functions a session exists to preserve are exactly what those files set up.
 
@@ -91,10 +93,10 @@ Two provider facts: `pid` is `0` on Windows (ConPTY) and is display-only; `inspe
 
 ## SSH sessions
 
-An SSH session is where a first-connect question can be answered — and the only form that reaps the remote side:
+An SSH session is where a first-connect question can be answered — it is the only OpenSSH form left in 0.8.0, now that the command tool runs over ssh2:
 
-- `open` with `shell: "ssh_bash"` runs `ssh.exe -t … -- <host>` with no `BatchMode`, so the real PTY lets ssh ask for an unknown host's fingerprint, a password or a key passphrase — answer with `send`;
-- the same PTY makes sshd reap the remote process group when the session ends, while a one-shot `ssh -T` command outlives its killed client;
+- `open` with `shell: "ssh_shell"` runs `ssh.exe -t … -- <host>` with no `BatchMode`, so the real PTY lets ssh ask for an unknown host's fingerprint, a password or a key passphrase — answer with `send`;
+- the same PTY makes sshd reap the remote process group when the session ends, while `ssh_shell` never starts an `ssh.exe` process at all (its own channel cancellation signals the remote command);
 - two honest limits: anything typed through `send` becomes part of the tool call, so authenticate with a key rather than typing a secret; and a session's `cwd` is where `ssh.exe` runs locally, never a remote directory.
 
 ## Measured defaults
