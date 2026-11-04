@@ -1451,6 +1451,20 @@ console.log('\n[A] unit: job reads carry their loss/sandbox notices; the exporte
       { status: 'completed', detail: 'exit code: 3' })
     assert.deepEqual(processOutcome({ status: 'killed', exitCode: null, signal: 'SIGTERM' }),
       { status: 'killed', detail: 'signal: SIGTERM' })
+    // An INFRASTRUCTURE failure is a FAILED task, not "exit code: 0": a lost ssh
+    // channel is exactly that (its reason names the host and the phase), and a real
+    // nonzero command exit above stays completed — a command that ran and failed is
+    // a result, not a broken call.
+    const lost = processOutcome({
+      status: 'failed', exitCode: null, signal: null,
+      failureReason: 'ssh-shell: the connection to host "box" was lost while the command was running (the exec channel closed without an exit status)',
+    })
+    assert.equal(lost.status, 'failed')
+    assert.match(lost.detail, /connection to host "box" was lost/)
+    assert.doesNotMatch(lost.detail, /exit code: 0/, 'never reported as a completed exit 0')
+    const silent = processOutcome({ status: 'failed', exitCode: null, signal: null })
+    assert.equal(silent.status, 'failed')
+    assert.match(silent.detail, /failed before reporting an exit status/, 'a reasonless failure still says so')
     const denied = processOutcome(
       { status: 'completed', exitCode: 1, signal: null, sandbox: { mode: 'read-only', denied: true } },
       ['workspace-write'],
@@ -3866,6 +3880,14 @@ console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (
         const proc = await executor.execute({ command: 'x', timeoutMs: 5000 })
         await assert.rejects(() => proc.result(), /connection to host "exec" was lost/)
         assert.equal(proc.status, 'failed', 'a lost connection is a failed call, not a completed one')
+        // The SAME handle is what a background/promoted call hands to the job layer: its
+        // failure must settle the job FAILED with the host-named sentence, never a
+        // completed exit 0 (the reviewer's carry-forward).
+        assert.match(proc.failureReason, /connection to host "exec" was lost/)
+        const outcome = processOutcome(proc)
+        assert.equal(outcome.status, 'failed', 'a lost channel is a FAILED job')
+        assert.match(outcome.detail, /connection to host "exec" was lost/)
+        assert.doesNotMatch(outcome.detail, /exit code: 0/)
       } finally { pool.dispose(); await fixture.close() }
     })
 
@@ -3919,6 +3941,54 @@ console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (
         assert.equal(result.exitCode, null)
       } finally { pool.dispose(); await fixture.close() }
     })
+    await testAsync('a job kill stops the remote command with TERM then KILL and settles killed', async () => {
+      const fixture = await startServer(() => {})
+      const { executor, pool } = await executorFor(fixture)
+      try {
+        await pool.get(entryFor(fixture.port))
+        const sent = observeSignals(pool)
+        const proc = await executor.execute({ command: 'sleep 30', timeoutMs: 60000 })
+        assert.equal(proc.kill(), true, 'kill is accepted while the channel is live')
+        assert.equal(proc.kill(), false, 'a settled or cancelling handle refuses a second kill')
+        await proc.done
+        assert.deepEqual(sent, ['TERM', 'KILL'], 'the same TERM -> KILL sequence a timeout uses')
+        assert.equal(proc.status, 'killed')
+        assert.equal(processOutcome(proc).status, 'killed', 'and the job layer reads killed, not failed')
+        const result = await proc.result()
+        assert.equal(result.exitCode, null)
+        assert.equal(result.timedOut, false, 'a job kill is not a timeout')
+        assert.equal(result.aborted, false, 'nor a caller abort')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('stdout is readable by byte offset while the command runs (job streaming)', async () => {
+      let wrote
+      const seen = new Promise((resolve) => { wrote = resolve })
+      const fixture = await startServer((stream) => {
+        stream.write('chunk-one\n')
+        wrote()
+        // Hold the channel open: the reader below runs while the command is live.
+        setTimeout(() => { stream.write('chunk-two\n'); stream.exit(0); stream.end() }, 150)
+      })
+      const { executor, pool } = await executorFor(fixture)
+      try {
+        const proc = await executor.execute({ command: 'stream', timeoutMs: 5000 })
+        await seen
+        // The server's write resolves before the client's data event lands: give the
+        // channel one tick so this case never depends on scheduling.
+        await new Promise((resolve) => setTimeout(resolve, 80))
+        const first = proc.observed.stdout.readFrom(0)
+        assert.match(first.text, /chunk-one/)
+        assert.ok(first.nextOffset >= 'chunk-one\n'.length, 'the reader reports a resumable offset')
+        const [stdoutSource] = processSources(() => proc)
+        const rest = stdoutSource.read(first.nextOffset)
+        await proc.done
+        const tail = rest.text + proc.observed.stdout.readFrom(rest.nextOffset).text
+        assert.match(tail, /chunk-two/, 'the second read picks up exactly where the first stopped')
+        assert.ok(!tail.includes('chunk-one'), 'a resumable read never repeats what was already consumed: ' + tail)
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
     await testAsync('a remote workdir is changed into on the HOST, and omitted when none is named', async () => {
       const scripts = []
       const fixture = await startServer((stream) => {
