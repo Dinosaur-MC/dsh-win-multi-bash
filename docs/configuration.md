@@ -40,7 +40,7 @@ Only `git_bash` and `terminal` are enabled by default; three dialects ship switc
 
 ## The `ssh_shell` host registry
 
-`sshShell.hosts` is the row's whole host inventory: an array of objects, one per host, and the alias a call passes is the only way to choose one. It replaces the single-target pins of `ssh_bash` — the tool no longer drives an `ssh.exe` process, so its Configure page carries no client path, host, user or port.
+`sshShell.hosts` is the row's whole host inventory: an array of objects, one per host, and the alias a call passes is the only way to choose one. It replaces the previous single-target pins — the tool no longer drives an `ssh.exe` process, so its Configure page carries no client path, host, user or port.
 
 | Field | Required | Meaning |
 | --- | --- | --- |
@@ -58,7 +58,7 @@ Only `git_bash` and `terminal` are enabled by default; three dialects ship switc
 | `default` | no | At most one host may carry it; a call may then omit `alias`. |
 | `description` | no | Free text for the human (the Configure page and the composition file); it never reaches a call's result. |
 
-Validation runs when the config is read and again at call time. A missing required field, a malformed or duplicated alias, a port outside the range, or two `default` hosts fails with a message naming the field and the alias. A broken array leaves the row registered with no hosts, and every call then fails with the same sentence — `sshShell.hosts is invalid (<the field and alias>)` — instead of letting "no host with alias X" hide the real cause. A valid empty array is a different state: `no hosts are configured; add them to the sshShell.hosts array on this row`.
+The registry is validated once per stored `hosts` value — a live edit re-validates it, and a call reuses that verdict instead of re-reading the array. A missing required field, a malformed or duplicated alias, a port outside the range, or two `default` hosts fails with a message naming the field and the alias. A broken array leaves the row registered with no hosts, and every call then fails with the same sentence — `sshShell.hosts is invalid (<the field and alias>)` — instead of letting "no host with alias X" hide the real cause. A valid empty array is a different state: `no hosts are configured; add them to the sshShell.hosts array on this row`.
 
 `alias` may be omitted from a call only when **exactly one** host carries `default: true`. With no default the call fails and names the declared aliases; running on the first host instead would be a guess about where a command runs.
 
@@ -155,7 +155,7 @@ The page stages drafts and writes only on **Save**, fenced by the revision it re
 | Terminal pin partition | `sshBash` | `sshShell` |
 | Executor | `SshBashExecutor` | `SshShellExecutor` |
 
-A profile that still lists `sshBash:` under the ssh row is reported by the loader as an unknown key; the tool then runs with no hosts, and every call fails with `no hosts are configured; add them to the sshShell.hosts array on this row` — the honest diagnostic for a stale config rather than a silent fallback to one host.
+A profile that still lists `sshBash:` under the ssh row keeps that key **unread**: neither this tool nor the terminal row looks at it any more (the stale key is preserved silently — no throw and no loader warning; naming it in the loader is Plan 4 work). The row therefore comes up with no hosts, and the diagnostic is the call error — `no hosts are configured; add them to the sshShell.hosts array on this row` — rather than a silent fallback to one host.
 
 Replace the single-target pins (`sshPath`, `sshHost`, `sshUser`, `sshPort`, `acceptNewHostKeys`, `connectTimeoutMs`) with a hosts array, in the profile's YAML or on the row's Configure page:
 
