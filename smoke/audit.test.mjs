@@ -3287,10 +3287,14 @@ console.log('\n[A] unit: the ssh_shell known_hosts verifier (strict host keys) (
       // is impossible, so accepting it would be a fail-open footgun.
       const verdict = verifyHostKey({ host: 'example.com', port: 22, key: blob })
       assert.equal(verdict.ok, false)
-      assert.match(verdict.reason, /no known_hosts file is configured/)
+      // The message must name WHERE the plugin looks (there is no per-row knob to
+      // point it elsewhere), or the reader is told to set something that does not exist.
+      assert.match(verdict.reason, /no known_hosts file was found for this host/)
+      assert.match(verdict.reason, /HOME\/USERPROFILE/)
+      assert.match(verdict.reason, /~\/\.ssh\/known_hosts/)
       const learned = verifyHostKey({ host: 'example.com', port: 22, key: blob, acceptNewHostKeys: true })
       assert.equal(learned.ok, false, 'acceptNewHostKeys never bypasses a missing configuration')
-      assert.match(learned.reason, /no known_hosts file is configured/)
+      assert.match(learned.reason, /no known_hosts file was found for this host/)
     })
 
     test('an unreadable known_hosts file fails closed, and acceptNewHostKeys does not bypass it', () => {

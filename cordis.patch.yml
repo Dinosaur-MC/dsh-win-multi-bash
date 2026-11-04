@@ -2,11 +2,12 @@
 #
 # This patch is the whole plugin: it inserts the plugin's own rows. Every
 # inserted row loads code from THIS package through its BARE package name (the core
-# row, which serves ./client and ./factory) or through ./tool-{git,wsl,msys2,ssh}-bash
-# and ./tool-terminal — nothing
-# depends on runtime packages
-# beyond the published @deepseek-ai base packages (dsh-bash-local, dsh-sandbox,
-# dsh-tools, dsh-shell, dsh-llm, ...).
+# row, which serves ./client and ./factory), through ./tool-git-bash,
+# ./tool-wsl-bash, ./tool-msys2-bash and ./tool-ssh-shell, or through
+# ./tool-terminal — nothing depends on runtime packages beyond the published
+# @deepseek-ai base packages (dsh-bash-local, dsh-sandbox, dsh-tools, dsh-shell,
+# dsh-llm, ...). `ssh_shell` additionally uses the `ssh2` package for its transport
+# (see THIRD_PARTY_NOTICES).
 #
 # ── What the rows do ─────────────────────────────────────────────────────────
 #   win-mb-plugin       — the package row: the plugin's core row. `name` is the
@@ -160,25 +161,34 @@
 
     - id: win-mb-tool-ssh
       name: 'dsh-win-multi-bash/tool-ssh-shell'
-      # OPT-IN and Windows-only: a deployment has to name its host before this
-      # tool can do anything, so the row ships switched OFF and the user enables
-      # it in the panel. It drives a remote shell through the OpenSSH client, and
-      # it is the family's only REMOTE dialect: its file effects are on the other
-      # host, so no local file sandbox is applied to it: every FOREGROUND result
-      # carries `sandbox: { mode, remote: true }` instead of a sandbox verdict, a
-      # promoted (timed-out) call says it inside the returned text, and a background
-      # acknowledgement carries no `sandbox` field — the same two branches the base
-      # bundle's `pwsh`/`bash` tools shape that way. The
-      # `terminal` row offers the same dialect for a PERSISTENT session (a real
-      # PTY is what lets ssh ask for a fingerprint, a password or a passphrase).
-      # Pin the target (and the client, when it is not the Windows OpenSSH one):
+      # OPT-IN and Windows-only: the row ships switched OFF until a deployment
+      # declares at least one host in `sshShell.hosts`. It is the family's only
+      # REMOTE dialect: its file effects are on the other host, so no local file
+      # sandbox is applied and every FOREGROUND result carries
+      # `sandbox: { mode, remote: true }` instead of a sandbox verdict; a promoted
+      # (timed-out) call says so in its text, and a background acknowledgement
+      # carries no `sandbox` field — the same two branches the base bundle's
+      # `pwsh`/`bash` tools shape that way.
+      #
+      # Commands do NOT start a local ssh.exe: each call takes its own exec channel
+      # on a connection POOLED per host (ssh2), sends the script on stdin and
+      # reports the exit status with stdout and stderr separate. A call names its
+      # host with `alias`; omitting it uses the one host marked `default: true`
+      # (never "the first one"). The `terminal` row offers the same dialect for a
+      # PERSISTENT session, and THAT form is the one that drives the OpenSSH client
+      # with its own single-host pins (see the terminal row below).
+      #
+      # Declare the hosts this row may reach:
       #   sshShell:
-      #     sshHost: '<host or an ssh_config alias>'
-      #     sshUser: '<user>'
-      #     sshPort: 22
-      #     sshPath: '<path to ssh.exe>'
-      #     acceptNewHostKeys: false   # trust-on-first-use; a CHANGED key still fails
-      #     connectTimeoutMs: 15000    # connection-phase bound (ConnectTimeout)
+      #     hosts:
+      #       - alias: box
+      #         host: '10.0.0.5'               # hostname or IP; no ssh_config aliases
+      #         user: 'me'
+      #         keyPath: '~/.ssh/id_ed25519'   # the KEY FILE is the only credential
+      #         port: 22                       # optional, default 22
+      #         default: true                  # what a call without `alias` uses
+      #         acceptNewHostKeys: false       # learn an UNKNOWN key once; a CHANGED key still fails
+      #         connectTimeoutMs: 15000        # handshake + authentication ceiling
       disabled: true
 
     # The interactive-session row: it registers the model-facing `terminal`
@@ -205,4 +215,19 @@
       #       idleMs: 600000
       #       maxBufferBytes: 1048576
       #       allowUnconfined: true
+      #
+      # An SSH SESSION is the OpenSSH form: it does NOT read the command row's
+      # `hosts` registry, it runs a local ssh.exe against ONE target, and its pins
+      # live here. A real PTY is what lets ssh ask for a fingerprint, a password or
+      # a passphrase.
+      #   config:
+      #     terminal:
+      #       defaultShell: ssh_shell
+      #       sshShell:
+      #         sshPath: '<path to ssh.exe>'   # omit for the Windows OpenSSH client
+      #         sshHost: '<host or ssh_config alias>'
+      #         sshUser: '<user>'
+      #         sshPort: 22
+      #         acceptNewHostKeys: false       # learn an UNKNOWN key once; a CHANGED key still fails
+      #         connectTimeoutMs: 15000        # connection-phase bound (ConnectTimeout)
 
