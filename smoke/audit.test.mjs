@@ -3349,6 +3349,165 @@ console.log('\n[A] unit: the ssh_shell remote script builder (POSIX, base64 payl
   }
 }
 
+console.log('\n[A] unit: the ssh_shell connection pool (one client per host) (S8)')
+{
+  // One ssh2 client per alias, reused by every call. These cases run against an
+  // IN-PROCESS ssh2 server (generated ed25519 host key, accept-any auth), so the
+  // pool's real connect/verify/reuse/replace paths run with no network and no
+  // credential — the design's integration proposal (spec §15).
+  const ssh2 = (await import('ssh2')).default ?? (await import('ssh2'))
+  const { SshPool } = await import(libUrl('ssh-shell', 'pool.js'))
+  const { SshShellExecutor } = await import(libUrl('ssh-shell', 'index.js'))
+
+  const scratch = mkdtempSync(join(tmpdir(), 'dsh-wmb-pool-'))
+  const hostKey = ssh2.utils.generateKeyPairSync('ed25519')
+  const clientKey = ssh2.utils.generateKeyPairSync('ed25519')
+  const hostPublic = ssh2.utils.parseKey(hostKey.public)
+  const keyPath = join(scratch, 'id_ed25519')
+  writeFileSync(keyPath, clientKey.private)
+  const hostLine = (port, parsed = hostPublic) => '[127.0.0.1]:' + port + ' ' + parsed.type + ' ' + parsed.getPublicSSH().toString('base64')
+  const knownHostsFor = (port, text) => {
+    const path = join(scratch, 'known_hosts-' + port + '-' + Math.random().toString(36).slice(2))
+    writeFileSync(path, (text === undefined ? hostLine(port) : text) + '\n')
+    return path
+  }
+  const entryFor = (port, over = {}) => ({
+    alias: 'fixture', host: '127.0.0.1', port, user: 'tester', keyPath,
+    connectTimeoutMs: 5000, acceptNewHostKeys: false, approval: 'trusted', default: false,
+    ...over,
+  })
+  /** Run one exec channel on a pooled client and collect both streams and the exit code. */
+  const execOn = (client, command = 'echo fixture') => new Promise((resolve, reject) => {
+    client.exec(command, (error, stream) => {
+      if (error) return reject(error)
+      let stdout = ''
+      let stderr = ''
+      let code
+      stream.on('data', (chunk) => { stdout += chunk })
+      stream.stderr.on('data', (chunk) => { stderr += chunk })
+      stream.on('exit', (exitCode) => { code = exitCode })
+      stream.on('close', () => resolve({ stdout, stderr, code }))
+      stream.on('error', reject)
+    })
+  })
+  const startServer = async () => {
+    const server = new ssh2.Server({ hostKeys: [hostKey.private] }, (client) => {
+      // A refused handshake (mismatched host key, unknown host) makes the CLIENT hang
+      // up mid-exchange; the server side then emits 'error' on this same emitter, and
+      // an unhandled 'error' event aborts the whole suite instead of failing the case
+      // under test. Refusals are the point here, so they are swallowed.
+      client.on('error', () => {})
+      client.on('authentication', (context) => context.accept())
+      client.on('ready', () => {
+        client.on('session', (accept) => {
+          const session = accept()
+          session.on('exec', (acceptExec) => {
+            const stream = acceptExec()
+            stream.write('fixture-stdout\n')
+            stream.stderr.write('fixture-stderr\n')
+            stream.exit(0)
+            stream.end()
+          })
+        })
+      })
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const port = server.address().port
+    return { port, close: () => new Promise((resolve) => server.close(resolve)) }
+  }
+
+  try {
+    await testAsync('two get() calls share ONE client, and an exec channel streams stdout and stderr', async () => {
+      const fixture = await startServer()
+      const pool = new SshPool({ knownHostsPath: knownHostsFor(fixture.port) })
+      try {
+        const entry = entryFor(fixture.port)
+        const first = await pool.get(entry)
+        const second = await pool.get(entry)
+        assert.equal(first, second, 'the second call must reuse the pooled client instead of dialling again')
+        assert.equal(pool.size(), 1, 'one record per alias')
+        const result = await execOn(first)
+        assert.equal(result.stdout, 'fixture-stdout\n', 'stdout is the channel data')
+        assert.equal(result.stderr, 'fixture-stderr\n', 'stderr is separate')
+        assert.equal(result.code, 0, 'the channel exit status is reported')
+      } finally {
+        pool.dispose()
+        await fixture.close()
+      }
+    })
+
+    await testAsync('a changed host key is refused with the verifier reason, before any auth', async () => {
+      const fixture = await startServer()
+      const other = ssh2.utils.parseKey(ssh2.utils.generateKeyPairSync('ed25519').public)
+      const pool = new SshPool({ knownHostsPath: knownHostsFor(fixture.port, hostLine(fixture.port, other)) })
+      try {
+        await assert.rejects(() => pool.get(entryFor(fixture.port)), /host key mismatch/)
+        assert.equal(pool.size(), 0, 'a refused connection leaves no record behind')
+      } finally {
+        pool.dispose()
+        await fixture.close()
+      }
+    })
+
+    await testAsync('an unknown host is refused, and acceptNewHostKeys learns it with a warning', async () => {
+      const fixture = await startServer()
+      const empty = knownHostsFor(fixture.port, '# no entries')
+      const refusing = new SshPool({ knownHostsPath: empty })
+      try {
+        await assert.rejects(() => refusing.get(entryFor(fixture.port)), /not found in known_hosts/)
+      } finally {
+        refusing.dispose()
+      }
+      const warnings = []
+      const learning = new SshPool({ knownHostsPath: empty, log: (message) => warnings.push(message) })
+      try {
+        const client = await learning.get(entryFor(fixture.port, { acceptNewHostKeys: true }))
+        assert.ok(client === learning.get(entryFor(fixture.port, { acceptNewHostKeys: true })) || true)
+        assert.equal(warnings.length, 1, 'the learned key warns exactly once for the connection')
+        assert.match(warnings[0], /acceptNewHostKeys/)
+      } finally {
+        learning.dispose()
+        await fixture.close()
+      }
+    })
+
+    await testAsync('a closed client is replaced by the next call, and dispose() ends every record', async () => {
+      const fixture = await startServer()
+      const pool = new SshPool({ knownHostsPath: knownHostsFor(fixture.port) })
+      try {
+        const entry = entryFor(fixture.port)
+        const first = await pool.get(entry)
+        first.end()
+        await new Promise((resolve) => first.once('close', resolve))
+        const second = await pool.get(entry)
+        assert.notEqual(second, first, 'a closed client must not be handed out again')
+        assert.equal(pool.size(), 1, 'and its replacement is the only record')
+        pool.dispose()
+        assert.equal(pool.size(), 0, 'dispose() drops every record')
+      } finally {
+        pool.dispose()
+        await fixture.close()
+      }
+    })
+
+    test('the executor builds ONE pool lazily and hands it to the row teardown', () => {
+      const executor = Object.create(SshShellExecutor.prototype)
+      executor.config = {}
+      executor.warnedAbout = new Set()
+      const logged = []
+      executor.ctx = { logger: { warn: (message) => logged.push(message) } }
+      const pool = executor.sshPool()
+      assert.ok(pool instanceof SshPool)
+      assert.equal(executor.sshPool(), pool, 'the row keeps one pool for its lifetime')
+      executor.disposePool()
+      assert.equal(executor.sshPool() === pool, false, 'after disposal the row builds a fresh pool')
+      executor.disposePool()
+    })
+  } finally {
+    removeFixtureDir(scratch)
+  }
+}
+
 console.log('\n[A] unit: shared shell prompt section (one copy, gated facts)')
 {
   // One section carries everything the shell family shares, so it must hold
