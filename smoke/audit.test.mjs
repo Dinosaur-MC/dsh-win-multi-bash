@@ -2374,6 +2374,8 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     assert.match(description, /workdir` is a directory ON THAT HOST/)
     assert.match(description, /read on the remote host/)
     assert.match(description, /TERM, then KILL/, 'a cancelled call signals the remote process')
+    assert.match(description, /verified against known_hosts/, 'the host key contract is stated')
+    assert.match(description, /non-interactive/, 'and the no-stdin/no-TTY contract, so a prompt is not expected here')
     assert.doesNotMatch(description, /unknown shell dialect/)
   })
 
@@ -2624,13 +2626,26 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     assert.equal(executor.resolve({ command: 'pwd', remoteWorkdir: '   ' }).workdir, '', 'blank is absent, not a cd')
   })
 
-  test('an alias selects its host; an unknown one names the declared aliases', () => {
-    const executor = bareSsh({ hosts: [sshHostEntry('one'), sshHostEntry('two', { default: true })] })
-    assert.equal(executor.aliasHost('two').alias, 'two')
-    assert.equal(executor.hostFor({}).alias, 'two', 'the default host answers a call that names no alias')
-    assert.throws(() => executor.aliasHost('nope'), /no host with alias "nope"; this row declares one, two/)
-    assert.deepEqual(executor.aliasChoices(), { aliases: ['one', 'two'] })
-    assert.equal(executor.resolve({ command: 'pwd', alias: 'one' }).alias, 'one', 'the spec carries the alias')
+  test('an alias selects its host; an omitted one needs exactly one default (spec §8.1)', () => {
+    const oneDefault = bareSsh({ hosts: [sshHostEntry('one'), sshHostEntry('two', { default: true })] })
+    assert.equal(oneDefault.hostFor({}).alias, 'two', 'the single default host answers a call that names no alias')
+    assert.equal(oneDefault.resolve({ command: 'pwd' }).alias, undefined)
+    assert.equal(oneDefault.aliasHost('one').alias, 'one', 'an explicit alias always wins over the default')
+    assert.throws(() => oneDefault.aliasHost('nope'), /no host with alias "nope"; this row declares one, two/)
+    assert.deepEqual(oneDefault.aliasChoices(), { aliases: ['one', 'two'] })
+    assert.equal(oneDefault.resolve({ command: 'pwd', alias: 'one' }).alias, 'one', 'the spec carries the alias')
+
+    // No default: an omitted alias is an ERROR naming the aliases, never a guess at
+    // the first host — the guess would decide where a command runs.
+    const noDefault = bareSsh({ hosts: [sshHostEntry('one'), sshHostEntry('two')] })
+    assert.throws(() => noDefault.hostFor({}),
+      /the alias is required; this row declares one, two and no host has default:true/)
+    assert.equal(noDefault.aliasHost('two').alias, 'two', 'an explicit alias needs no default')
+
+    // A BROKEN registry reports its verdict even when an alias was named: "no host
+    // with alias" over an array that never parsed would hide the real cause.
+    const broken = bareSsh({ hosts: [sshHostEntry('dup'), sshHostEntry('dup', { sshHost: 'other.invalid' })] })
+    assert.throws(() => broken.aliasHost('dup'), /sshShell\.hosts is invalid \(duplicate alias "dup"\)/)
   })
 
   test('a broken host registry reports the registry verdict, once', () => {
@@ -2781,6 +2796,7 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
           user: 'tester'
           keyPath: '${keyPath.split(BS).join(BS + BS)}'
           connectTimeoutMs: 1000
+          default: true
 `
     const sshCall = (ctx, args) => ctx.tools.execute({
       signal: new AbortController().signal,
@@ -2844,6 +2860,7 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
           user: '${process.env.DSH_AUDIT_SSH_USER ?? 'root'}'
           keyPath: '${(process.env.DSH_AUDIT_SSH_KEY ?? '~/.ssh/id_ed25519').split(BS).join(BS + BS)}'
           connectTimeoutMs: 15000
+          default: true
 `
       let liveCtx
       try {
@@ -3447,7 +3464,7 @@ console.log('\n[A] unit: the ssh_shell connection pool (one client per host) (S8
   }
   const entryFor = (port, over = {}) => ({
     alias: 'fixture', host: '127.0.0.1', port, user: 'tester', keyPath,
-    connectTimeoutMs: 5000, acceptNewHostKeys: false, approval: 'trusted', default: false,
+    connectTimeoutMs: 5000, acceptNewHostKeys: false, approval: 'trusted', default: true,
     ...over,
   })
   /** Run one exec channel on a pooled client and collect both streams and the exit code. */
@@ -3662,7 +3679,7 @@ console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (
   const entryFor = (port) => ({
     alias: 'exec', host: '127.0.0.1', port, user: 'tester', keyPath,
     shellTemplate: DEFAULT_SHELL_TEMPLATE, connectTimeoutMs: 5000,
-    acceptNewHostKeys: false, approval: 'trusted', default: false,
+    acceptNewHostKeys: false, approval: 'trusted', default: true,
   })
   /**
    * An in-process ssh2 server whose exec behaviour each case supplies.
