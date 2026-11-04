@@ -2290,6 +2290,15 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
   /** A bare executor: prototype plus the config/ctx slices the hooks actually read. */
   const bareSsh = (over = {}) => Object.assign(Object.create(SshShellExecutor.prototype), {
     config: {
+      // The command path resolves an ALIAS from the row's host registry (the ssh2 pool);
+      // the single-host pins below are what the SESSION arm still reads.
+      hosts: {
+        get: () => over.hosts ?? [{
+          alias: 'h', host: over.sshHost ?? 'example.invalid', port: 22, user: 'tester', keyPath: 'k',
+          shellTemplate: 'bash -c \'eval "$(base64 -d)"\'', connectTimeoutMs: 1000,
+          acceptNewHostKeys: over.acceptNewHostKeys === true, approval: 'trusted', default: true,
+        }],
+      },
       sshPath: { get: () => over.sshPath ?? 'ssh.exe' },
       sshHost: { get: () => (over.sshHost === undefined ? 'example.invalid' : over.sshHost) },
       sshUser: { get: () => over.sshUser ?? '' },
@@ -2560,9 +2569,9 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
   testAsync('a remote run reports remote, and NONE of the borrowed verdicts', async () => {
     const executor = bareSsh({ sshHost: 'blackhole.invalid' })
     executor.internals = { resolveSshPath: () => winPath('C:', 'OpenSSH', 'ssh.exe') }
-    const spawned = []
-    executor.executeArgv = async (spec, argv, onStarted) => {
-      spawned.push(argv)
+    const started = []
+    executor.openChannel = async (spec, onStarted) => {
+      started.push(spec)
       const proc = remoteHandle({
         exitCode: 255, signal: null, timedOut: false, aborted: false, timeoutMs: 120000,
         stdout: { text: '', truncated: false },
@@ -2582,14 +2591,14 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     for (const borrowed of ['denied', 'enforcement', 'runnerFailed', 'unconfined'])
       assert.ok(!(borrowed in result.sandbox), 'a remote run must not carry \"' + borrowed + '\"')
     assert.deepEqual(Object.keys(result.sandbox).sort(), ['mode', 'remote'], 'and nothing else either')
-    // The argv it really used is the one-shot shape, with the command as one element.
-    assert.deepEqual(spawned, [['C:' + BS + 'OpenSSH' + BS + 'ssh.exe', '-T', '-o', 'BatchMode=yes',
-      '-o', 'ConnectTimeout=15', '-o', 'StrictHostKeyChecking=yes', '--', 'blackhole.invalid', 'uname -a']])
+    // The run went through the channel path (the OpenSSH one-shot argv is gone): the
+    // spec it saw is the caller's own, untouched.
+    assert.deepEqual(started.map((spec) => spec.command), ['uname -a'])
   })
 
   testAsync('requireSandbox fails closed on a remote dialect, and danger-full-access is the way out', async () => {
     const demanding = bareSsh({ requireSandbox: true, sshHost: 'h' })
-    demanding.executeArgv = async () => { throw new Error('this must never spawn') }
+    demanding.openChannel = async () => { throw new Error('this must never dial or spawn') }
     await assert.rejects(
       () => demanding.remoteRun({ command: 'id' }, { mode: 'read-only', workspaceRoot: winPath('C:', 'ws') }),
       /no sandbox can be applied to a command that runs on a remote host/)
@@ -2597,7 +2606,7 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     const allowed = bareSsh({ requireSandbox: true, sshHost: 'h' })
     allowed.internals = { resolveSshPath: () => 'ssh.exe' }
     let spawned = 0
-    allowed.executeArgv = async (spec, argv, onStarted) => {
+    allowed.openChannel = async (spec, onStarted) => {
       spawned += 1
       const proc = remoteHandle(okResult())
       onStarted?.(proc)
@@ -2704,19 +2713,27 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     skip('  … skipping the SSH boot cases: no ssh client found on this machine')
   } else {
     /**
-     * The one-shot row against TEST-NET-1 (RFC 5737, guaranteed unroutable), so the
-     * real spawn -> result -> schema -> render path is exercised with NO network and
-     * no credential. The connect fails; what is asserted is the FACT a failure carries,
-     * which is exactly where a borrowed verdict used to be able to reappear.
+     * The row against TEST-NET-1 (RFC 5737, guaranteed unroutable), so the REAL
+     * pool -> dial -> error -> render path is exercised with NO network and no
+     * credential. The dial fails; what is asserted is that the failure is reported
+     * honestly — the alias, the phase, and NO sandbox verdict for a command that
+     * never reached a host.
      */
-    const BLACKHOLE_ROWS = (sshPath) => CORE_ROW_ONLY + `
+    const ssh2 = (await import('ssh2')).default ?? (await import('ssh2'))
+    const keyDir = mkdtempSync(join(tmpdir(), 'dsh-wmb-pool-key-'))
+    const keyPath = join(keyDir, 'id_ed25519')
+    writeFileSync(keyPath, ssh2.utils.generateKeyPairSync('ed25519').private)
+    const BLACKHOLE_ROWS = () => CORE_ROW_ONLY + `
 - id: win-mb-tool-ssh
   name: 'dsh-win-multi-bash/tool-ssh-shell'
   config:
     sshShell:
-      sshPath: '${sshPath.split(BS).join(BS + BS)}'
-      sshHost: '192.0.2.1'
-      connectTimeoutMs: 1000
+      hosts:
+        - alias: blackhole
+          host: '192.0.2.1'
+          user: 'tester'
+          keyPath: '${keyPath.split(BS).join(BS + BS)}'
+          connectTimeoutMs: 1000
 `
     const sshCall = (ctx, args) => ctx.tools.execute({
       signal: new AbortController().signal,
@@ -2726,22 +2743,18 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     })
     let ctx
     try {
-      ctx = await bootFixture(BLACKHOLE_ROWS(localSsh), 'ssh-blackhole.yml')
+      ctx = await bootFixture(BLACKHOLE_ROWS(), 'ssh-blackhole.yml')
       await runTests(ctx, [
-        ['ssh_shell reports the remote sandbox fact through the REAL spawn/result/render path', async () => {
+        ['an unreachable host fails the call, naming the alias, and claims no sandbox verdict', async () => {
           const result = await sshCall(ctx, { command: 'uname -a' })
-          const value = result.value
-          assert.ok(value !== undefined, 'the tool must return its structured value, not a schema violation')
-          assert.equal(value.kind, 'foreground')
-          assert.notEqual(value.exitCode, 0, 'an unroutable address must fail: ' + JSON.stringify(value.sandbox))
-          assert.equal(value.sandbox.remote, true)
-          assert.equal(typeof value.sandbox.mode, 'string')
-          for (const borrowed of ['denied', 'enforcement', 'runnerFailed', 'unconfined'])
-            assert.ok(!(borrowed in value.sandbox), 'the schema must not carry \"' + borrowed + '\" for a remote run')
           const text = result.content.filter((block) => block.type === 'text').map((block) => block.text).join('')
-          assert.ok(text.includes('[sandbox: not applicable'), text)
+          assert.equal(result.isError, true, 'a host that never answers must fail the call: ' + text)
+          assert.match(text, /blackhole/, 'the failure names the host alias: ' + text)
+          assert.match(text, /connecting to host/, 'and the phase, so the reader knows the command never ran: ' + text)
+          // Nothing ran, so nothing may claim a sandbox: not a verdict, not a degradation.
+          assert.ok(!text.includes('[sandbox: not applicable'), text)
           assert.ok(!text.includes('denial dialect'), text)
-          assert.ok(!text.includes('ran unconfined'), 'a remote run is not a degraded confinement: ' + text)
+          assert.ok(!text.includes('ran unconfined'), text)
         }],
         ['the tool advertises no sandbox_permissions it cannot honour', async () => {
           const definition = ctx.tools.get('ssh_shell')
@@ -2767,9 +2780,12 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
   name: 'dsh-win-multi-bash/tool-ssh-shell'
   config:
     sshShell:
-      sshPath: '${localSsh.split(BS).join(BS + BS)}'
-      sshHost: '${liveHost}'
-      connectTimeoutMs: 15000
+      hosts:
+        - alias: live
+          host: '${liveHost}'
+          user: '${process.env.DSH_AUDIT_SSH_USER ?? 'root'}'
+          keyPath: '${(process.env.DSH_AUDIT_SSH_KEY ?? '~/.ssh/id_ed25519').split(BS).join(BS + BS)}'
+          connectTimeoutMs: 15000
 `
       let liveCtx
       try {
@@ -3557,6 +3573,236 @@ console.log('\n[A] unit: the ssh_shell connection pool (one client per host) (S8
       executor.disposePool()
       assert.equal(executor.sshPool() === pool, false, 'after disposal the row builds a fresh pool')
       executor.disposePool()
+    })
+  } finally {
+    removeFixtureDir(scratch)
+  }
+}
+
+console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (S9)')
+{
+  // One exec channel per call over the pooled client. These cases pin the three
+  // things a shell-family command must get right (spec §8.3–§8.5): the exit status
+  // and separated streams, the 100 ms settle/destroy isolation (a late writer can
+  // never leak into the NEXT call), and the TERM -> 2 s -> KILL cancellation order.
+  const ssh2 = (await import('ssh2')).default ?? (await import('ssh2'))
+  const { SshPool } = await import(libUrl('ssh-shell', 'pool.js'))
+  const { SshShellExecutor } = await import(libUrl('ssh-shell', 'index.js'))
+  const { DEFAULT_SHELL_TEMPLATE } = await import(libUrl('ssh-shell', 'hosts.js'))
+
+  const scratch = mkdtempSync(join(tmpdir(), 'dsh-wmb-exec-'))
+  const hostKey = ssh2.utils.generateKeyPairSync('ed25519')
+  const clientKey = ssh2.utils.generateKeyPairSync('ed25519')
+  const hostPublic = ssh2.utils.parseKey(hostKey.public)
+  const keyPath = join(scratch, 'id_ed25519')
+  writeFileSync(keyPath, clientKey.private)
+  const knownHostsFor = (port) => {
+    const path = join(scratch, 'known_hosts-' + port + '-' + Math.random().toString(36).slice(2))
+    writeFileSync(path, '[127.0.0.1]:' + port + ' ' + hostPublic.type + ' ' + hostPublic.getPublicSSH().toString('base64') + '\n')
+    return path
+  }
+  const entryFor = (port) => ({
+    alias: 'exec', host: '127.0.0.1', port, user: 'tester', keyPath,
+    shellTemplate: DEFAULT_SHELL_TEMPLATE, connectTimeoutMs: 5000,
+    acceptNewHostKeys: false, approval: 'trusted', default: false,
+  })
+  /**
+   * An in-process ssh2 server whose exec behaviour each case supplies.
+   * @param handler - called with the accepted channel and the exec request info.
+   */
+  const startServer = async (handler) => {
+    const signals = []
+    const commands = []
+    const server = new ssh2.Server({ hostKeys: [hostKey.private] }, (client) => {
+      client.on('error', () => {})
+      client.on('authentication', (context) => context.accept())
+      client.on('ready', () => {
+        client.on('session', (accept) => {
+          const session = accept()
+          // Record every signal request the client sends (the cancellation contract).
+          session.on('signal', (acceptSignal, _rejectSignal, info) => {
+            signals.push(info.name)
+            acceptSignal?.()
+          })
+          session.on('exec', (acceptExec, _rejectExec, info) => {
+            const stream = acceptExec()
+            commands.push(info.command)
+            handler(stream)
+          })
+        })
+      })
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const port = server.address().port
+    return {
+      port,
+      signals,
+      commands,
+      close: () => new Promise((resolve) => server.close(resolve)),
+    }
+  }
+  /**
+   * Record the signals the executor sends on the pooled client's protocol object.
+   *
+   * ssh2's client Channel.signal() no-ops once stdin is half-closed (the state every
+   * call is in after its script has been sent), so the executor sends the request on
+   * the protocol object instead — and ssh2's own SERVER drops such a request after
+   * EOF, so the server fixture cannot observe it. The transport call is what is
+   * asserted here: the ORDER and the count are the contract.
+   * @param pool - the pool whose client has already been dialled.
+   * @returns the array the signal names are appended to.
+   */
+  const observeSignals = (pool) => {
+    const sent = [];
+    for (const record of pool.records.values()) {
+      const protocol = record.client?._protocol;
+      if (protocol === undefined) continue;
+      const original = protocol.signal.bind(protocol);
+      protocol.signal = (chan, name) => {
+        sent.push(name);
+        return original(chan, name);
+      };
+    }
+    return sent;
+  };
+  const executorFor = async (fixture, over = {}) => {
+    const pool = new SshPool({ knownHostsPath: knownHostsFor(fixture.port) })
+    const config = SshShellExecutor.Config({ hosts: [entryFor(fixture.port)], timeoutMs: 5000, maxTimeoutMs: 60000 })
+    const executor = Object.assign(Object.create(SshShellExecutor.prototype), {
+      config,
+      poolInstance: pool,
+      internals: {},
+      processFacts: new Map(),
+      warnedAbout: new Set(),
+      ctx: {
+        sandboxPolicy: { defaultMode: 'workspace-write', resolve: () => ({ mode: 'workspace-write', workspaceRoot: 'C:/ws' }) },
+        logger: { warn: () => {} },
+      },
+    })
+    return { executor, pool, ...over }
+  }
+
+  try {
+    await testAsync('the channel reports the exit status and keeps stdout and stderr apart', async () => {
+      const fixture = await startServer((stream) => {
+        stream.write('out-seven\n')
+        stream.stderr.write('err-seven\n')
+        stream.exit(7)
+        stream.end()
+      })
+      const { executor, pool } = await executorFor(fixture)
+      try {
+        const proc = await executor.execute({ command: 'exit 7', timeoutMs: 5000 })
+        const result = await proc.result()
+        assert.equal(result.exitCode, 7, 'the channel exit status is the result exit code')
+        assert.equal(result.signal, null)
+        assert.equal(result.timedOut, false)
+        assert.equal(result.aborted, false)
+        assert.equal(result.stdout.text, 'out-seven\n')
+        assert.equal(result.stderr.text, 'err-seven\n', 'stderr is its own stream, never merged into stdout')
+        assert.equal(typeof result.timeoutMs, 'number')
+        assert.ok(result.durationMs >= 0, 'a duration is reported')
+        assert.deepEqual(Object.keys(result.stdout).sort(), ['text', 'truncated'])
+        // The remote command line is the host's STATIC shellTemplate, and the script
+        // travels on stdin — no command text is ever interpolated into it.
+        assert.deepEqual(fixture.commands, [DEFAULT_SHELL_TEMPLATE])
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('the result carries the sandbox remote fact through the real handle', async () => {
+      const fixture = await startServer((stream) => {
+        stream.write('ok\n')
+        stream.exit(0)
+        stream.end()
+      })
+      const { executor, pool } = await executorFor(fixture)
+      try {
+        const result = await (await executor.execute({ command: 'echo ok', timeoutMs: 5000 })).result()
+        assert.deepEqual(result.sandbox, { mode: 'workspace-write', remote: true })
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('a timeout sends TERM, then KILL, and reports timedOut with no exit code', async () => {
+      const fixture = await startServer(() => {
+        // A command that never exits: the fixture holds the channel open, so only the
+        // client's TERM -> 2 s -> KILL sequence can end the call.
+      })
+      const { executor, pool } = await executorFor(fixture)
+      try {
+        const entry = entryFor(fixture.port)
+        await pool.get(entry)
+        const sent = observeSignals(pool)
+        const started = Date.now()
+        const proc = await executor.execute({ command: 'sleep 30', timeoutMs: 120 })
+        const result = await proc.result()
+        const elapsed = Date.now() - started
+        assert.deepEqual(sent, ['TERM', 'KILL'], 'cancellation is TERM, then KILL')
+        assert.equal(result.timedOut, true)
+        assert.equal(result.aborted, false)
+        assert.equal(result.exitCode, null, 'a killed channel has no exit status')
+        assert.ok(elapsed >= 2000, 'the 2 s grace between TERM and KILL is honoured: ' + elapsed + ' ms')
+        assert.ok(elapsed < 8000, 'and the whole sequence is bounded: ' + elapsed + ' ms')
+        assert.equal(proc.status, 'killed')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+    await testAsync('a delayed writer never reaches the NEXT call (settle on exit, then destroy)', async () => {
+      let call = 0
+      const fixture = await startServer((stream) => {
+        call += 1
+        if (call === 1) {
+          stream.write('first-line\n')
+          stream.exit(0)
+          // The background writer: exits now but keeps writing on the SAME channel
+          // afterwards, like a child that inherited the stdout.
+          setTimeout(() => {
+            try {
+              stream.write('late-output\n')
+              stream.end()
+            }
+            catch { /* the channel was destroyed, which is the point */ }
+          }, 250)
+          return
+        }
+        stream.write('second-call\n')
+        stream.exit(0)
+        stream.end()
+      })
+      const { executor, pool } = await executorFor(fixture)
+      try {
+        const first = await (await executor.execute({ command: 'first', timeoutMs: 5000 })).result()
+        assert.equal(first.stdout.text, 'first-line\n', 'the channel settles on exit and drops what arrives later')
+        // Give the fixture time to try the late write before the next call opens.
+        await new Promise((resolve) => setTimeout(resolve, 350))
+        const second = await (await executor.execute({ command: 'second', timeoutMs: 5000 })).result()
+        assert.equal(second.stdout.text, 'second-call\n', 'the next call starts clean')
+        assert.ok(!second.stdout.text.includes('late-output'), 'a late writer is never attributed to the next call')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('a caller abort cancels the channel the same way, and reports aborted', async () => {
+      const fixture = await startServer(() => {})
+      const { executor, pool } = await executorFor(fixture)
+      try {
+        await pool.get(entryFor(fixture.port))
+        const sent = observeSignals(pool)
+        const controller = new AbortController()
+        const proc = await executor.execute({ command: 'sleep 30', timeoutMs: 60000, signal: controller.signal })
+        setTimeout(() => controller.abort(), 50)
+        const result = await proc.result()
+        assert.deepEqual(sent, ['TERM', 'KILL'])
+        assert.equal(result.aborted, true, 'an abort is reported as aborted, not timedOut')
+        assert.equal(result.timedOut, false)
+        assert.equal(result.exitCode, null)
+      } finally { pool.dispose(); await fixture.close() }
+    })
+    await testAsync('a missing host alias names the aliases this row declares', async () => {
+      const fixture = await startServer(() => {})
+      const { executor, pool } = await executorFor(fixture)
+      try {
+        await assert.rejects(
+          () => executor.execute({ command: 'echo x', alias: 'nope', timeoutMs: 5000 }),
+          /no host with alias "nope"/)
+      } finally { pool.dispose(); await fixture.close() }
     })
   } finally {
     removeFixtureDir(scratch)
