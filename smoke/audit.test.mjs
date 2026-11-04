@@ -2906,10 +2906,14 @@ console.log('\n[A] unit: the ssh_shell known_hosts verifier (strict host keys) (
   // Host-key verification is the one place the design refuses to trust by default
   // (spec §7.1): a missing or changed key must fail CLOSED with both fingerprints
   // and the expected file, and only \`acceptNewHostKeys: true\` may learn an
-  // unknown key — never a changed one, and never by writing the file.
+  // unknown key — never a changed one, never a revoked one, and never by writing
+  // the file. known_hosts AND known_hosts2 are read together, the way OpenSSH
+  // reads them.
   const { createHash, createHmac } = await import('node:crypto')
   const ssh2 = (await import('ssh2')).default ?? (await import('ssh2'))
-  const { defaultKnownHostsPath, parseKnownHosts, verifyHostKey } = await import(libUrl('ssh-shell', 'known-hosts.js'))
+  const {
+    candidateNames, defaultKnownHostsPath, displayName, hostFiles, parseKnownHosts, verifyHostKey,
+  } = await import(libUrl('ssh-shell', 'known-hosts.js'))
 
   const keypair = ssh2.utils.generateKeyPairSync('ed25519')
   const publicKey = ssh2.utils.parseKey(keypair.public)
@@ -2925,7 +2929,7 @@ console.log('\n[A] unit: the ssh_shell known_hosts verifier (strict host keys) (
     return path
   }
   try {
-    test('the parser reads plain entries, splits the host list and skips comments and markers', () => {
+    test('the parser reads plain entries and reports markers instead of dropping them', () => {
       const text = [
         '# a comment',
         '',
@@ -2937,13 +2941,17 @@ console.log('\n[A] unit: the ssh_shell known_hosts verifier (strict host keys) (
         entryLine('[bracketed.example]:2222', publicKey) + ' trailing-comment',
       ].join('\n')
       const entries = parseKnownHosts(text)
-      assert.equal(entries.length, 2, 'comments, blank lines, markers and malformed lines are not entries')
+      assert.equal(entries.length, 4, 'comments, blank lines and malformed lines are not entries; markers are')
       assert.deepEqual(entries[0].hosts, ['alpha.example', 'beta.example'])
       assert.equal(entries[0].type, 'ssh-ed25519')
       assert.ok(entries[0].blob.equals(blob))
       assert.equal(entries[0].line, 4, 'the 1-based line number of the entry is reported')
-      assert.deepEqual(entries[1].hosts, ['[bracketed.example]:2222'], 'a bracket entry keeps its port')
-      assert.equal(entries[1].line, 8)
+      assert.equal(entries[0].marker, undefined, 'a plain entry carries no marker')
+      assert.equal(entries[1].marker, 'cert-authority', 'a marker is parsed, not silently dropped')
+      assert.equal(entries[2].marker, 'revoked')
+      assert.equal(entries[1].line, 5)
+      assert.deepEqual(entries[3].hosts, ['[bracketed.example]:2222'], 'a bracket entry keeps its port')
+      assert.equal(entries[3].line, 8)
       // An empty or all-comment file parses to no entries rather than throwing.
       assert.deepEqual(parseKnownHosts(''), [])
       assert.deepEqual(parseKnownHosts('# only a comment\n'), [])
@@ -2968,17 +2976,48 @@ console.log('\n[A] unit: the ssh_shell known_hosts verifier (strict host keys) (
       const wrongPort = verifyHostKey({ host: 'example.com', port: 2200, key: blob, knownHostsPath: path })
       assert.equal(wrongPort.ok, false, 'the same host on another port is a different entry')
       assert.match(wrongPort.reason, /not found in known_hosts/)
-      // The bare form is what a default-port connection looks up.
+      // The bare form is what a default-port connection looks up, and what a
+      // bracket-only entry does NOT match (that is a different port's entry).
       const plain = writeKnownHosts('plain', entryLine('example.com', publicKey) + '\n')
       assert.equal(verifyHostKey({ host: 'example.com', port: 22, key: blob, knownHostsPath: plain }).ok, true)
+      assert.deepEqual(candidateNames('Example.COM', 22), ['example.com', '[example.com]:22'])
+      assert.deepEqual(candidateNames('Example.COM', 2222), ['[example.com]:2222'])
+    })
+
+    test('messages name the BARE host on the default port, never the [host]:22 candidate', () => {
+      // ssh-keygen -F host does not match a '[host]:22' entry, so a refusal that
+      // suggested one would send the reader to an entry their own tool cannot find.
+      assert.equal(displayName('Example.COM', 22), 'example.com')
+      assert.equal(displayName('Example.COM', 2222), '[example.com]:2222')
+      const path = writeKnownHosts('bare-label', entryLine('elsewhere.example', publicKey) + '\n')
+      const refused = verifyHostKey({ host: 'Example.COM', port: 22, key: blob, knownHostsPath: path })
+      assert.equal(refused.ok, false)
+      assert.match(refused.reason, /for example\.com;/)
+      assert.ok(!refused.reason.includes('[example.com]:22'), 'the port-22 candidate is never the name a message suggests')
+      assert.ok(!refused.reason.includes('[Example.COM]'), 'and the message is lowercased')
+      const accepted = verifyHostKey({ host: 'Example.COM', port: 22, key: blob, knownHostsPath: path, acceptNewHostKeys: true })
+      assert.equal(accepted.ok, true)
+      assert.ok(accepted.warning.includes('example.com ssh-ed25519 '), 'the suggested line uses the bare lowercased host')
+      assert.ok(!accepted.warning.includes('[example.com]:22'))
+    })
+
+    test('literal host matching is case-insensitive in both directions', () => {
+      const path = writeKnownHosts('mixed-literal', entryLine('EXAMPLE.com', publicKey) + '\n')
+      assert.equal(verifyHostKey({ host: 'example.com', port: 22, key: blob, knownHostsPath: path }).ok, true,
+        'an uppercase entry matches a lowercase connection')
+      assert.equal(verifyHostKey({ host: 'Example.COM', port: 22, key: blob, knownHostsPath: path }).ok, true)
     })
 
     test('a hashed entry (|1|salt|hmac, HMAC-SHA1) matches its host and no other', () => {
       const salt = Buffer.from('00112233445566778899aabbccddeeff', 'hex')
-      const digest = createHmac('sha1', salt).update('hashed.example').digest()
-      const hashed = '|1|' + salt.toString('base64') + '|' + digest.toString('base64')
-      const path = writeKnownHosts('hashed', entryLine(hashed, publicKey) + '\n')
+      const hashedFor = (name, saltBuffer) => '|1|' + saltBuffer.toString('base64') + '|'
+        + createHmac('sha1', saltBuffer).update(name).digest().toString('base64')
+      const path = writeKnownHosts('hashed', entryLine(hashedFor('hashed.example', salt), publicKey) + '\n')
       assert.equal(verifyHostKey({ host: 'hashed.example', port: 22, key: blob, knownHostsPath: path }).ok, true)
+      // ssh-keygen -H hashes the lowercased name, so a mixed-case connection spelling
+      // must match the same entry.
+      assert.equal(verifyHostKey({ host: 'Hashed.Example', port: 22, key: blob, knownHostsPath: path }).ok, true,
+        'a mixed-case connection spelling matches a lowercased hashed entry')
       const other = verifyHostKey({ host: 'other.example', port: 22, key: blob, knownHostsPath: path })
       assert.equal(other.ok, false, 'a hashed entry must not match a different host')
       assert.match(other.reason, /not found in known_hosts/)
@@ -2992,6 +3031,7 @@ console.log('\n[A] unit: the ssh_shell known_hosts verifier (strict host keys) (
       assert.ok(verdict.reason.includes(fingerprintOf(blob)), 'the presented fingerprint is named')
       assert.ok(verdict.reason.includes(fingerprintOf(otherKey.getPublicSSH())), 'and the stored one is named')
       assert.ok(verdict.reason.includes('example.com'))
+      assert.ok(verdict.reason.includes(path), 'and the file that disagrees is named')
     })
 
     test('an unknown key fails closed naming the file; acceptNewHostKeys learns it with a warning', () => {
@@ -3013,6 +3053,60 @@ console.log('\n[A] unit: the ssh_shell known_hosts verifier (strict host keys) (
       const missingAccepted = verifyHostKey({ host: 'example.com', port: 22, key: blob, knownHostsPath: missing, acceptNewHostKeys: true })
       assert.equal(missingAccepted.ok, true)
       assert.match(missingAccepted.warning, /acceptNewHostKeys/)
+    })
+
+    test('known_hosts and known_hosts2 are read together; one missing file is not an error', () => {
+      const dir = join(scratch, 'merge')
+      mkdirSync(dir, { recursive: true })
+      const primary = join(dir, 'known_hosts')
+      const sibling = join(dir, 'known_hosts2')
+      writeFileSync(primary, entryLine('one.example', publicKey) + '\n')
+      writeFileSync(sibling, entryLine('two.example', otherKey) + '\n')
+      assert.deepEqual(hostFiles({ knownHostsPath: primary }), [primary, sibling])
+      assert.equal(verifyHostKey({ host: 'one.example', port: 22, key: blob, knownHostsPath: primary }).ok, true)
+      assert.equal(verifyHostKey({ host: 'two.example', port: 22, key: otherKey.getPublicSSH(), knownHostsPath: primary }).ok, true,
+        'an entry in known_hosts2 counts for the same verification')
+      // Only known_hosts2 exists: naming the missing known_hosts still works.
+      const only2 = join(scratch, 'only2')
+      mkdirSync(only2, { recursive: true })
+      writeFileSync(join(only2, 'known_hosts2'), entryLine('two.example', publicKey) + '\n')
+      assert.equal(verifyHostKey({ host: 'two.example', port: 22, key: blob, knownHostsPath: join(only2, 'known_hosts') }).ok, true)
+      // A custom path is never widened into its directory, and an explicit list wins.
+      assert.deepEqual(hostFiles({ knownHostsPath: join(scratch, 'match') }), [join(scratch, 'match')])
+      assert.deepEqual(hostFiles({ knownHostsPath: primary, knownHostsPaths: [primary] }), [primary])
+      assert.deepEqual(hostFiles({}), [], 'no configured path is an empty file list, not a directory probe')
+    })
+
+    test('a @revoked key is refused unconditionally, even when a plain entry would accept it', () => {
+      const path = writeKnownHosts('revoked', [
+        entryLine('example.com', publicKey),
+        '@revoked example.com ' + publicKey.type + ' ' + blob.toString('base64'),
+      ].join('\n') + '\n')
+      for (const acceptNewHostKeys of [false, true]) {
+        const verdict = verifyHostKey({ host: 'example.com', port: 22, key: blob, knownHostsPath: path, acceptNewHostKeys })
+        assert.equal(verdict.ok, false, 'revocation outranks a plain entry and the learn switch (' + String(acceptNewHostKeys) + ')')
+        assert.match(verdict.reason, /@revoked/)
+        assert.ok(verdict.reason.includes(path), 'the file carrying the revocation is named')
+        assert.ok(verdict.reason.includes(fingerprintOf(blob)))
+      }
+      // A revocation for another host does not touch this one.
+      const other = writeKnownHosts('revoked-other', [
+        '@revoked other.example ' + publicKey.type + ' ' + blob.toString('base64'),
+        entryLine('example.com', publicKey),
+      ].join('\n') + '\n')
+      assert.equal(verifyHostKey({ host: 'example.com', port: 22, key: blob, knownHostsPath: other }).ok, true)
+    })
+
+    test('an unreadable known_hosts file fails closed, and acceptNewHostKeys does not bypass it', () => {
+      const dirPath = join(scratch, 'a-directory')
+      mkdirSync(dirPath, { recursive: true })
+      const verdict = verifyHostKey({ host: 'example.com', port: 22, key: blob, knownHostsPath: dirPath })
+      assert.equal(verdict.ok, false)
+      assert.match(verdict.reason, /cannot read known_hosts/)
+      assert.ok(verdict.reason.includes(dirPath))
+      // The file EXISTS, so this is a configuration error, not an unknown key.
+      const learned = verifyHostKey({ host: 'example.com', port: 22, key: blob, knownHostsPath: dirPath, acceptNewHostKeys: true })
+      assert.equal(learned.ok, false, 'the learn switch never papers over an unreadable file')
     })
 
     test('defaultKnownHostsPath prefers an existing file and otherwise names the canonical one', () => {
