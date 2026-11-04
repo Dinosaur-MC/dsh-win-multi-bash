@@ -2912,7 +2912,7 @@ console.log('\n[A] unit: the ssh_shell known_hosts verifier (strict host keys) (
   const { createHash, createHmac } = await import('node:crypto')
   const ssh2 = (await import('ssh2')).default ?? (await import('ssh2'))
   const {
-    candidateNames, defaultKnownHostsPath, displayName, hostFiles, parseKnownHosts, verifyHostKey,
+    candidateNames, defaultKnownHostsPath, displayName, hostFiles, hostPatternMatches, parseKnownHosts, verifyHostKey,
   } = await import(libUrl('ssh-shell', 'known-hosts.js'))
 
   const keypair = ssh2.utils.generateKeyPairSync('ed25519')
@@ -3095,6 +3095,67 @@ console.log('\n[A] unit: the ssh_shell known_hosts verifier (strict host keys) (
         entryLine('example.com', publicKey),
       ].join('\n') + '\n')
       assert.equal(verifyHostKey({ host: 'example.com', port: 22, key: blob, knownHostsPath: other }).ok, true)
+    })
+
+    test('host patterns support wildcards, ? and ! negation, case-insensitively', () => {
+      // Measured on this host against ssh-keygen 10.3p1: '*.example.com' matches
+      // a.example.com, and does NOT match the bare example.com (the literal dot
+      // still has to match) — so the verifier follows OpenSSH here, not a looser
+      // "prefix domain" reading.
+      assert.equal(hostPatternMatches('*.example.com', 'a.example.com'), true)
+      assert.equal(hostPatternMatches('*.example.com', 'example.com'), false)
+      assert.equal(hostPatternMatches('?x.example.com', 'ax.example.com'), true)
+      assert.equal(hostPatternMatches('?x.example.com', 'abx.example.com'), false)
+      assert.equal(hostPatternMatches('*.EXAMPLE.com', 'A.example.COM'), true, 'patterns are case-insensitive')
+      assert.equal(hostPatternMatches('[*.example.com]:2222', '[a.example.com]:2222'), true,
+        'a bracket wildcard covers a non-default port')
+      assert.equal(hostPatternMatches('*', '[a.example.com]:2222'), true)
+      assert.equal(hostPatternMatches('', 'example.com'), false)
+      // Through the verifier: a wildcard entry is a trust statement for its names.
+      const path = writeKnownHosts('wild', entryLine('*.example.com', publicKey) + '\n')
+      assert.equal(verifyHostKey({ host: 'a.example.com', port: 22, key: blob, knownHostsPath: path }).ok, true)
+      assert.equal(verifyHostKey({ host: 'example.com', port: 22, key: blob, knownHostsPath: path }).ok, false,
+        'the bare domain is not covered by *.<domain>, exactly as ssh-keygen -F reports it')
+    })
+
+    test('a negated pattern excludes its host from the entry', () => {
+      const path = writeKnownHosts('negated', entryLine('!bad.example.com,*.example.com', publicKey) + '\n')
+      assert.equal(verifyHostKey({ host: 'a.example.com', port: 22, key: blob, knownHostsPath: path }).ok, true,
+        'the positive pattern still covers the other names')
+      const excluded = verifyHostKey({ host: 'bad.example.com', port: 22, key: blob, knownHostsPath: path })
+      assert.equal(excluded.ok, false, 'a matching negation excludes the entry for that host')
+      assert.match(excluded.reason, /not found in known_hosts/)
+      // A negation also excludes a later matching positive pattern: the entry is
+      // simply not a statement about that host.
+      const later = writeKnownHosts('negated-later', entryLine('*.example.com,!a.example.com', publicKey) + '\n')
+      assert.equal(verifyHostKey({ host: 'a.example.com', port: 22, key: blob, knownHostsPath: later }).ok, false)
+    })
+
+    test('@revoked * covers every host and is refused with acceptNewHostKeys off and on', () => {
+      const path = writeKnownHosts('revoked-star', [
+        entryLine('example.com', publicKey),
+        '@revoked * ' + publicKey.type + ' ' + blob.toString('base64'),
+      ].join('\n') + '\n')
+      for (const acceptNewHostKeys of [false, true]) {
+        const verdict = verifyHostKey({ host: 'anything.example', port: 22, key: blob, knownHostsPath: path, acceptNewHostKeys })
+        assert.equal(verdict.ok, false, 'a wildcard revocation covers every hostname (' + String(acceptNewHostKeys) + ')')
+        assert.match(verdict.reason, /@revoked/)
+      }
+      // The same wildcard covers a host that also has a plain entry: the revocation wins.
+      const named = verifyHostKey({ host: 'example.com', port: 22, key: blob, knownHostsPath: path, acceptNewHostKeys: true })
+      assert.equal(named.ok, false)
+      assert.match(named.reason, /@revoked/)
+    })
+
+    test('no known_hosts path at all is a configuration error, never a learnable host', () => {
+      // A missing FILE is the unknown-key case; a missing PATH is not — verifying
+      // is impossible, so accepting it would be a fail-open footgun.
+      const verdict = verifyHostKey({ host: 'example.com', port: 22, key: blob })
+      assert.equal(verdict.ok, false)
+      assert.match(verdict.reason, /no known_hosts file is configured/)
+      const learned = verifyHostKey({ host: 'example.com', port: 22, key: blob, acceptNewHostKeys: true })
+      assert.equal(learned.ok, false, 'acceptNewHostKeys never bypasses a missing configuration')
+      assert.match(learned.reason, /no known_hosts file is configured/)
     })
 
     test('an unreadable known_hosts file fails closed, and acceptNewHostKeys does not bypass it', () => {
