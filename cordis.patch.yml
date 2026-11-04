@@ -59,7 +59,7 @@
 #                         and the user enables it. It exists to prove the
 #                         skeleton: adding a shell is one executor file plus one
 #                         declaration in lib/shell-dialects.js.
-#   win-mb-tool-ssh     — the `ssh_bash` tool, owning its own SshBashExecutor: the
+#   win-mb-tool-ssh     — the `ssh_shell` tool, owning its own SshShellExecutor: the
 #                         family's only REMOTE dialect (`effects: 'remote'` in the
 #                         registry). **Opt-in** for the same reason plus one of
 #                         its own — it needs a host, which only a deployment can
@@ -159,7 +159,7 @@
       disabled: true
 
     - id: win-mb-tool-ssh
-      name: 'dsh-win-multi-bash/tool-ssh-bash'
+      name: 'dsh-win-multi-bash/tool-ssh-shell'
       # OPT-IN and Windows-only: a deployment has to name its host before this
       # tool can do anything, so the row ships switched OFF and the user enables
       # it in the panel. It drives a remote shell through the OpenSSH client, and
@@ -172,7 +172,7 @@
       # `terminal` row offers the same dialect for a PERSISTENT session (a real
       # PTY is what lets ssh ask for a fingerprint, a password or a passphrase).
       # Pin the target (and the client, when it is not the Windows OpenSSH one):
-      #   sshBash:
+      #   sshShell:
       #     sshHost: '<host or an ssh_config alias>'
       #     sshUser: '<user>'
       #     sshPort: 22

@@ -2273,12 +2273,12 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     REMOTE_FAMILY_TOOL_NAMES, dialectById: sshDialectById,
   } = await import(libUrl('tool-bash', 'types', 'registry.js'))
   const { validateShellDialects, REGISTRY_ERROR_PREFIX } = await import(libUrl('shell-dialects.js'))
-  const sshTool = await import(libUrl('tool-bash', 'types', 'ssh-bash.js'))
+  const sshTool = await import(libUrl('tool-bash', 'types', 'ssh-shell.js'))
   const terminalTool = await import(libUrl('tool-bash', 'types', 'terminal.js'))
   const {
-    DEFAULT_CONNECT_TIMEOUT_MS, SshBashExecutor, assertConnectTimeoutMs, assertSshPort, assertSshTarget, buildSshArgv,
+    DEFAULT_CONNECT_TIMEOUT_MS, SshShellExecutor, assertConnectTimeoutMs, assertSshPort, assertSshTarget, buildSshArgv,
     candidateSshPaths, connectTimeoutSeconds, declaredSshPaths, resolveSshPath,
-  } = await import(libUrl('bash-ssh', 'index.js'))
+  } = await import(libUrl('ssh-shell', 'index.js'))
   const { SHELL_REMOTE_SCOPE_SECTION, shellFamilySectionTextFor } =
     await import(libUrl('tool-bash', 'types', 'shell-family.js'))
   const { remoteSandboxMarker } = await import(libUrl('tool-bash', 'types', 'render.js'))
@@ -2288,7 +2288,7 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
   const LOCAL_SANDBOX_PHRASE = 'file access denied under'
 
   /** A bare executor: prototype plus the config/ctx slices the hooks actually read. */
-  const bareSsh = (over = {}) => Object.assign(Object.create(SshBashExecutor.prototype), {
+  const bareSsh = (over = {}) => Object.assign(Object.create(SshShellExecutor.prototype), {
     config: {
       sshPath: { get: () => over.sshPath ?? 'ssh.exe' },
       sshHost: { get: () => (over.sshHost === undefined ? 'example.invalid' : over.sshHost) },
@@ -2318,19 +2318,19 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
   })
 
   test('the declaration reaches every derived surface, and the row ships opt-in', () => {
-    assert.equal(declaration.toolName, 'ssh_bash')
-    assert.equal(sshTool.name, 'tool-ssh_bash')
-    assert.ok(SHELL_FAMILY_TOOL_NAMES.includes('ssh_bash'), 'it joins the shared section family')
-    assert.ok(!SHELL_FAMILY_SECTION_NAME.includes('ssh_bash'), 'the section name is not per-tool')
+    assert.equal(declaration.toolName, 'ssh_shell')
+    assert.equal(sshTool.name, 'tool-ssh_shell')
+    assert.ok(SHELL_FAMILY_TOOL_NAMES.includes('ssh_shell'), 'it joins the shared section family')
+    assert.ok(!SHELL_FAMILY_SECTION_NAME.includes('ssh_shell'), 'the section name is not per-tool')
     assert.ok(SSH_CLIENT_ROWS.some((row) => row.rowId === 'win-mb-tool-ssh'), 'it has a Configure page')
     assert.equal(SSH_PATCH_ROWS.find((row) => row.id === 'win-mb-tool-ssh')?.disabledByDefault, true,
       'the row ships opt-in: it needs a host only a deployment can name')
-    assert.ok(SSH_EXPORT_SUBPATHS['./tool-ssh-bash'], 'its subpath is exported')
+    assert.ok(SSH_EXPORT_SUBPATHS['./tool-ssh-shell'], 'its subpath is exported')
     // Appended LAST: ROWS[0]/ROWS[1] stay the git and wsl rows, and the session row
     // stays last of all — nothing a reader already depends on got renumbered.
     assert.deepEqual(SSH_CLIENT_ROWS.slice(3).map((row) => row.rowId), ['win-mb-tool-ssh', 'win-mb-tool-terminal'])
     // The persistent form is the SESSION row offering this dialect (decision 1).
-    assert.ok(SSH_TERMINAL_BACKENDS.some((backend) => backend.toolName === 'ssh_bash'))
+    assert.ok(SSH_TERMINAL_BACKENDS.some((backend) => backend.toolName === 'ssh_shell'))
     // Its facts are what tells the model this is not a local shell.
     const description = shellDescription('ssh')
     assert.match(description, /remote SSH/)
@@ -2344,8 +2344,8 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     assert.equal(declaration.effects, 'remote')
     for (const dialect of SSH_DIALECTS.filter((entry) => entry.id !== 'ssh'))
       assert.equal(dialect.effects, 'local', dialect.id + ' runs its command on this host')
-    assert.deepEqual(REMOTE_FAMILY_TOOL_NAMES, ['ssh_bash'], 'exactly one remote dialect is shipped')
-    assert.equal(SshBashExecutor.remoteEffects, true)
+    assert.deepEqual(REMOTE_FAMILY_TOOL_NAMES, ['ssh_shell'], 'exactly one remote dialect is shipped')
+    assert.equal(SshShellExecutor.remoteEffects, true)
     assert.equal(GitBashExecutor.remoteEffects, false)
     assert.equal(WslBashExecutor.remoteEffects, false)
     // A declaration that forgets to say is REFUSED at boot rather than defaulted to
@@ -2421,17 +2421,17 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
   })
 
   test('a target can never be read as an option, and a port is bounded', () => {
-    assert.equal(assertSshTarget('host.example', 'sshBash.sshHost'), 'host.example')
-    assert.equal(assertSshTarget('ubuntu_tx', 'sshBash.sshHost'), 'ubuntu_tx')
+    assert.equal(assertSshTarget('host.example', 'sshShell.sshHost'), 'host.example')
+    assert.equal(assertSshTarget('ubuntu_tx', 'sshShell.sshHost'), 'ubuntu_tx')
     // The classic injection: an option smuggled in through the target.
-    assert.throws(() => assertSshTarget('-oProxyCommand=calc', 'sshBash.sshHost'), /must not begin with \"-\"/)
-    assert.throws(() => assertSshTarget('a b', 'sshBash.sshHost'), /whitespace or a control character/)
-    assert.throws(() => assertSshTarget('h' + String.fromCharCode(9), 'sshBash.sshHost'), /whitespace or a control character/)
-    assert.throws(() => assertSshTarget('h' + String.fromCharCode(0), 'sshBash.sshHost'), /whitespace or a control character/)
-    assert.throws(() => assertSshTarget('', 'sshBash.sshHost'), /is not configured/)
-    assert.throws(() => assertSshTarget(undefined, 'sshBash.sshHost'),
-      /ssh_bash row OR on the terminal row/, 'the refusal must name BOTH rows: a session reads the terminal row')
-    assert.throws(() => assertSshTarget(undefined, 'sshBash.sshHost'), /is not configured/)
+    assert.throws(() => assertSshTarget('-oProxyCommand=calc', 'sshShell.sshHost'), /must not begin with \"-\"/)
+    assert.throws(() => assertSshTarget('a b', 'sshShell.sshHost'), /whitespace or a control character/)
+    assert.throws(() => assertSshTarget('h' + String.fromCharCode(9), 'sshShell.sshHost'), /whitespace or a control character/)
+    assert.throws(() => assertSshTarget('h' + String.fromCharCode(0), 'sshShell.sshHost'), /whitespace or a control character/)
+    assert.throws(() => assertSshTarget('', 'sshShell.sshHost'), /is not configured/)
+    assert.throws(() => assertSshTarget(undefined, 'sshShell.sshHost'),
+      /ssh_shell row OR on the terminal row/, 'the refusal must name BOTH rows: a session reads the terminal row')
+    assert.throws(() => assertSshTarget(undefined, 'sshShell.sshHost'), /is not configured/)
     assert.equal(assertSshPort(22), 22)
     assert.equal(assertSshPort(65535), 65535)
     for (const bad of [0, 65536, 22.5, Number.NaN, 'x'])
@@ -2478,7 +2478,7 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     stale.internals = { resolveSshPath: (configured) => (configured === undefined ? winPath('C:', 'found', 'ssh.exe') : configured) }
     assert.equal(stale.sshPath(), winPath('C:', 'found', 'ssh.exe'))
     assert.equal(warnings.length, 1)
-    assert.ok(warnings[0].startsWith('bash-ssh: sshBash.sshPath \"'), warnings[0])
+    assert.ok(warnings[0].startsWith('ssh-shell: sshShell.sshPath \"'), warnings[0])
     assert.ok(warnings[0].includes('does not exist'), warnings[0])
     assert.equal(stale.sshPath(), winPath('C:', 'found', 'ssh.exe'))
     assert.equal(warnings.length, 1, 'the warning is once per row, not once per call')
@@ -2487,25 +2487,25 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     assert.throws(() => missing.sshPath(), /no ssh client was found/)
   })
 
-  test('the ssh_bash row exposes the shared knobs and its own, and nothing else', () => {
+  test('the ssh_shell row exposes the shared knobs and its own, and nothing else', () => {
     assert.deepEqual(volatilePaths(sshTool.Config), [
       'enableRunInBackground', 'promoteOnTimeout',
-      'sshBash.cwd', 'sshBash.timeoutMs', 'sshBash.maxTimeoutMs', 'sshBash.maxOutputBytes',
-      'sshBash.maxSpillBytes', 'sshBash.graceMs',
-      'sshBash.sshPath', 'sshBash.sshHost', 'sshBash.sshUser', 'sshBash.sshPort',
-      'sshBash.acceptNewHostKeys', 'sshBash.connectTimeoutMs',
-      'sshBash.sandbox', 'sshBash.probeTimeoutMs', 'sshBash.requireSandbox', 'sshBash.sandboxNotice',
+      'sshShell.cwd', 'sshShell.timeoutMs', 'sshShell.maxTimeoutMs', 'sshShell.maxOutputBytes',
+      'sshShell.maxSpillBytes', 'sshShell.graceMs',
+      'sshShell.sshPath', 'sshShell.sshHost', 'sshShell.sshUser', 'sshShell.sshPort',
+      'sshShell.acceptNewHostKeys', 'sshShell.connectTimeoutMs',
+      'sshShell.sandbox', 'sshShell.probeTimeoutMs', 'sshShell.requireSandbox', 'sshShell.sandboxNotice',
     ])
     const resolved = sshTool.Config({})
-    assert.equal(resolved.sshBash.sandbox.get(), 'auto')
-    assert.equal(resolved.sshBash.requireSandbox.get(), false, 'nothing is demanded by default')
-    assert.equal(resolved.sshBash.acceptNewHostKeys.get(), false, 'no host key is ever accepted on the user behalf by default')
-    assert.equal(resolved.sshBash.connectTimeoutMs.get(), 15000)
-    assert.equal(resolved.sshBash.sshPort.get(), undefined, 'no port pin leaves ssh its own default')
-    assert.equal(resolved.sshBash.sshPath.get(), undefined, 'no client pin means discovery')
-    assert.deepEqual(unionOptions(sshTool.Config.dict.sshBash.dict.sandbox), ['auto', 'none'],
+    assert.equal(resolved.sshShell.sandbox.get(), 'auto')
+    assert.equal(resolved.sshShell.requireSandbox.get(), false, 'nothing is demanded by default')
+    assert.equal(resolved.sshShell.acceptNewHostKeys.get(), false, 'no host key is ever accepted on the user behalf by default')
+    assert.equal(resolved.sshShell.connectTimeoutMs.get(), 15000)
+    assert.equal(resolved.sshShell.sshPort.get(), undefined, 'no port pin leaves ssh its own default')
+    assert.equal(resolved.sshShell.sshPath.get(), undefined, 'no client pin means discovery')
+    assert.deepEqual(unionOptions(sshTool.Config.dict.sshShell.dict.sandbox), ['auto', 'none'],
       'the vocabulary is the declaration, and bwrap is never advertised by a dialect that cannot honour it')
-    assert.deepEqual(unionOptions(sshTool.Config.dict.sshBash.dict.sandbox), [...declaration.sandboxStances])
+    assert.deepEqual(unionOptions(sshTool.Config.dict.sshShell.dict.sandbox), [...declaration.sandboxStances])
   })
 
   test('the session row types a dialect pin by the kind the declaration states', () => {
@@ -2513,15 +2513,15 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     // Config reject the seeded value at open time — a broken session for a perfectly
     // well declared dialect. The type is the invariant; what schemastery PRINTS for a
     // number is its own business, so only the string type is asserted by name.
-    const pins = terminalTool.Config.dict.sshBash.dict
+    const pins = terminalTool.Config.dict.sshShell.dict
     assert.equal(String(pins.sshHost), 'string', 'a text leaf stays a text pin')
     assert.notEqual(String(pins.sshPort), 'string', 'a number leaf is NOT a string pin')
     assert.notEqual(String(pins.acceptNewHostKeys), 'string', 'a boolean leaf is NOT a string pin')
     assert.notEqual(String(pins.connectTimeoutMs), 'string')
     // And the seeded round trip really resolves through the backend schema.
-    const pinned = terminalTool.Config({ sshBash: { sshPort: 2222, acceptNewHostKeys: true, sshHost: 'h' } })
-    assert.equal(pinned.sshBash.sshPort.get(), 2222, 'a numeric pin survives the session row')
-    assert.equal(pinned.sshBash.acceptNewHostKeys.get(), true, 'a boolean pin survives too')
+    const pinned = terminalTool.Config({ sshShell: { sshPort: 2222, acceptNewHostKeys: true, sshHost: 'h' } })
+    assert.equal(pinned.sshShell.sshPort.get(), 2222, 'a numeric pin survives the session row')
+    assert.equal(pinned.sshShell.acceptNewHostKeys.get(), true, 'a boolean pin survives too')
   })
 
   testAsync('a remote run reports remote, and NONE of the borrowed verdicts', async () => {
@@ -2654,9 +2654,9 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     assert.equal(shellFamilySectionTextFor(fakeCtx([]), 's'), '')
     const gitOnly = shellFamilySectionTextFor(fakeCtx(['git_bash']), 's')
     assert.ok(gitOnly.includes(LOCAL_SANDBOX_PHRASE) && !gitOnly.includes(SHELL_REMOTE_SCOPE_SECTION))
-    const sshOnly = shellFamilySectionTextFor(fakeCtx(['ssh_bash']), 's')
+    const sshOnly = shellFamilySectionTextFor(fakeCtx(['ssh_shell']), 's')
     assert.ok(!sshOnly.includes(LOCAL_SANDBOX_PHRASE) && sshOnly.includes(SHELL_REMOTE_SCOPE_SECTION))
-    const both = shellFamilySectionTextFor(fakeCtx(['git_bash', 'ssh_bash']), 's')
+    const both = shellFamilySectionTextFor(fakeCtx(['git_bash', 'ssh_shell']), 's')
     assert.ok(both.includes(LOCAL_SANDBOX_PHRASE) && both.includes(SHELL_REMOTE_SCOPE_SECTION))
     // The fallback path (no prompt section composed) must not claim a local sandbox
     // for the remote tool either — that is the whole point of the flag.
@@ -2678,9 +2678,9 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
      */
     const BLACKHOLE_ROWS = (sshPath) => CORE_ROW_ONLY + `
 - id: win-mb-tool-ssh
-  name: 'dsh-win-multi-bash/tool-ssh-bash'
+  name: 'dsh-win-multi-bash/tool-ssh-shell'
   config:
-    sshBash:
+    sshShell:
       sshPath: '${sshPath.split(BS).join(BS + BS)}'
       sshHost: '192.0.2.1'
       connectTimeoutMs: 1000
@@ -2688,14 +2688,14 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     const sshCall = (ctx, args) => ctx.tools.execute({
       signal: new AbortController().signal,
       callId: ToolCallId('audit-ssh-' + Math.random().toString(36).slice(2)),
-      name: 'ssh_bash',
+      name: 'ssh_shell',
       arguments: { description: 'audit ssh', ...args },
     })
     let ctx
     try {
       ctx = await bootFixture(BLACKHOLE_ROWS(localSsh), 'ssh-blackhole.yml')
       await runTests(ctx, [
-        ['ssh_bash reports the remote sandbox fact through the REAL spawn/result/render path', async () => {
+        ['ssh_shell reports the remote sandbox fact through the REAL spawn/result/render path', async () => {
           const result = await sshCall(ctx, { command: 'uname -a' })
           const value = result.value
           assert.ok(value !== undefined, 'the tool must return its structured value, not a schema violation')
@@ -2711,7 +2711,7 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
           assert.ok(!text.includes('ran unconfined'), 'a remote run is not a degraded confinement: ' + text)
         }],
         ['the tool advertises no sandbox_permissions it cannot honour', async () => {
-          const definition = ctx.tools.get('ssh_bash')
+          const definition = ctx.tools.get('ssh_shell')
           assert.ok(definition !== undefined)
           const properties = definition.parameters?.properties ?? {}
           assert.equal(properties.sandbox_permissions, undefined,
@@ -2731,9 +2731,9 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     } else {
       const LIVE_ROWS = CORE_ROW_ONLY + `
 - id: win-mb-tool-ssh
-  name: 'dsh-win-multi-bash/tool-ssh-bash'
+  name: 'dsh-win-multi-bash/tool-ssh-shell'
   config:
-    sshBash:
+    sshShell:
       sshPath: '${localSsh.split(BS).join(BS + BS)}'
       sshHost: '${liveHost}'
       connectTimeoutMs: 15000
@@ -2742,7 +2742,7 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
       try {
         liveCtx = await bootFixture(LIVE_ROWS, 'ssh-live.yml')
         await runTests(liveCtx, [
-          ['ssh_bash really reaches ' + liveHost + ': exit status, stdout and no DSH_* leak', async () => {
+          ['ssh_shell really reaches ' + liveHost + ': exit status, stdout and no DSH_* leak', async () => {
             const result = await sshCall(liveCtx, { command: 'uname -sr; echo SSH-ROUNDTRIP-OK; exit 7' })
             const value = result.value
             assert.equal(value.exitCode, 7, 'the remote exit status is propagated: ' + JSON.stringify(value.stdout))
@@ -4517,7 +4517,7 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
       // the shell the model is typing into is on this host.
       const renderOpen = (value) => definition.output.render({ action: 'open' }, value).map((block) => block.text).join('')
       const openValue = (remote) => ({
-        kind: 'open', sessionId: 's1', shell: remote ? 'ssh_bash' : 'git_bash', pid: 7, cwd: 'C:/ws',
+        kind: 'open', sessionId: 's1', shell: remote ? 'ssh_shell' : 'git_bash', pid: 7, cwd: 'C:/ws',
         sandboxMode: 'none', unconfined: true, remote, output: 'ready', truncated: false, lossy: false, nextOffset: 5,
       })
       const openSchema = definition.output.schema.oneOf.find((branch) => branch.properties?.kind?.const === 'open')
@@ -4663,7 +4663,7 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
     // This is the only coverage of the PERSISTENT remote form — the form that exists so a
     // fingerprint, a password or a passphrase can be answered at all (a remote tty).
     const liveSshHost = process.env.DSH_AUDIT_SSH_HOST
-    const liveSshPath = (await import(libUrl('bash-ssh', 'index.js'))).resolveSshPath(undefined)
+    const liveSshPath = (await import(libUrl('ssh-shell', 'index.js'))).resolveSshPath(undefined)
     if (liveSshHost === undefined || liveSshHost.length === 0) {
       skip('  … skipping the live SSH terminal session: set DSH_AUDIT_SSH_HOST to run it')
     } else if (liveSshPath === undefined) {
@@ -4674,12 +4674,12 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
         "  name: 'dsh-win-multi-bash/tool-terminal'",
         '  config:',
         '    terminal:',
-        '      defaultShell: ssh_bash',
+        '      defaultShell: ssh_shell',
         '      maxSessions: 1',
         '      waitMs: 12000',
         '      quietMs: 600',
         '      idleMs: 120000',
-        '    sshBash:',
+        '    sshShell:',
         "      sshPath: '" + liveSshPath.replaceAll(String.fromCharCode(92), String.fromCharCode(92) + String.fromCharCode(92)) + "'",
         "      sshHost: '" + liveSshHost + "'",
         '      connectTimeoutMs: 15000',
@@ -4692,7 +4692,7 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
           const opened = await runTerminal(live, { action: 'open' })
           assert.ok(!opened.isError, opened.text)
           assert.equal(opened.value.kind, 'open')
-          assert.equal(opened.value.shell, 'ssh_bash')
+          assert.equal(opened.value.shell, 'ssh_shell')
           assert.equal(opened.value.remote, true, 'a session on another host must say so, not carry a local sandbox sentence')
           const id = opened.value.sessionId
           const sent = async (text, waitMs) => (await runTerminal(live, { action: 'send', sessionId: id, text, waitMs })).value.output
@@ -4700,7 +4700,7 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
           const probe = await runTerminal(live, { action: 'send', sessionId: id, text: 'uname -sr', waitMs: 12000 })
           assert.match(probe.value.output, /Linux/, "the remote kernel is not this host's")
           assert.equal(probe.value.remote, true, 'a later result repeats the remote fact, not just `open`')
-          assert.equal(probe.value.shell, 'ssh_bash')
+          assert.equal(probe.value.shell, 'ssh_shell')
           // State across calls is the reason a session exists; the echoed command text
           // cannot satisfy either match on its own.
           await sent('export WMB_PTY_PROBE=42', 8000)
@@ -4708,7 +4708,7 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
           await sent('cd /tmp', 8000)
           assert.match(await sent('pwd', 8000), /^[^\n]*\/tmp/m, 'the remote working directory survived too')
           const listed = await runTerminal(live, { action: 'list' })
-          assert.ok(listed.value.sessions.some((session) => session.sessionId === id && session.shell === 'ssh_bash'), 'list names the remote session')
+          assert.ok(listed.value.sessions.some((session) => session.sessionId === id && session.shell === 'ssh_shell'), 'list names the remote session')
           const closed = await runTerminal(live, { action: 'close', sessionId: id })
           assert.equal(closed.value.kind, 'closed')
         })
@@ -5295,11 +5295,11 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
         assert.ok(title.length > 0, `${language} tool.title.${name} is empty`)
       }
       // The shells read the SAME in every language: a reader tells git_bash from wsl_bash
-      // from msys2_bash from ssh_bash at a glance, whatever the UI language is.
+      // from msys2_bash from ssh_shell at a glance, whatever the UI language is.
       if (SHELL_TOOL_NAMES.includes(name)) assert.equal(en[`tool.title.${name}`], zh[`tool.title.${name}`])
     }
     assert.equal(cardTitle({ toolName: 'git_bash' }, (key) => en[key] ?? key), 'Git Bash')
-    assert.equal(cardTitle({ toolName: 'ssh_bash' }, (key) => zh[key] ?? key), 'SSH remote shell')
+    assert.equal(cardTitle({ toolName: 'ssh_shell' }, (key) => zh[key] ?? key), 'SSH remote shell')
     assert.equal(cardTitle({ toolName: 'not_ours' }, (key) => key), 'tool.title.other', 'an unlisted name falls back instead of showing a raw locale key')
   })
 
@@ -7277,7 +7277,7 @@ console.log('\n[A] unit: repository records (bilingual pair, LF discipline, publ
       assert.ok(section.includes(heading), `the newest section must carry ${heading}`)
     // ...and the globs are checked against the files they must actually cover: the
     // assertions above only compare their STRINGS, so a file the tarball would drop
-    // (the way `lib/bash-ssh/index.js` was missing from a stale pack) stayed invisible.
+    // (the way `lib/ssh-shell/index.js` was missing from a stale pack) stayed invisible.
     const covered = (rel) => manifest.files.some((entry) => {
       if (entry === rel) return true
       // Only the shape this manifest uses: `lib/**/*.js` (root + suffix). A new glob
