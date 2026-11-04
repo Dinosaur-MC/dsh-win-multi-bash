@@ -3244,17 +3244,29 @@ console.log('\n[A] unit: the ssh_shell remote script builder (POSIX, base64 payl
     assert.equal(Buffer.from(built.payload, 'base64').toString('utf8'), '\n')
   })
 
-  test('startup runs first, guarded, and is normalised to ONE terminator', () => {
-    const built = buildScript({ command: 'echo hi', startupCommand: 'export A=1' })
-    assert.equal(built.script, '{ export A=1; } || exit $?\necho hi\n')
-    // A deployment that already wrote the semicolon does not get a second one
-    // (two consecutive semicolons are a syntax error in a POSIX shell).
+  test('startup runs first in a group that CLOSES ON ITS OWN LINE', () => {
+    // The one-line form '{ cmd; }' breaks three legal POSIX snippets under real
+    // bash: a trailing comment swallows the closing brace, a here-document needs
+    // its terminator alone on a line, and an empty body leaves '{ ; }'. The pinned
+    // bytes below are the shape that survives all of them.
+    assert.equal(buildScript({ command: 'echo hi', startupCommand: 'export A=1' }).script,
+      '{ export A=1\n} || exit $?\necho hi\n')
+    // A comment at the end of the snippet runs; the command MUST still execute.
+    assert.equal(buildScript({ command: 'echo $PROBE', startupCommand: 'export PROBE=42 # setup' }).script,
+      '{ export PROBE=42 # setup\n} || exit $?\necho $PROBE\n')
+    // A here-document keeps its terminator line intact.
+    assert.equal(buildScript({ command: 'echo hi', startupCommand: 'cat <<EOF\nheredoc-body\nEOF' }).script,
+      '{ cat <<EOF\nheredoc-body\nEOF\n} || exit $?\necho hi\n')
+    // A backgrounded snippet is still one group statement.
+    assert.equal(buildScript({ command: 'echo hi', startupCommand: 'sleep 0 &' }).script,
+      '{ sleep 0 &\n} || exit $?\necho hi\n')
+    // A configured trailing semicolon is normalised away (a doubled one is a
+    // syntax error), and a snippet with NO body after normalisation omits the guard.
     assert.equal(buildScript({ command: 'x', startupCommand: 'export A=1;' }).script,
-      '{ export A=1; } || exit $?\nx\n')
+      '{ export A=1\n} || exit $?\nx\n')
     assert.equal(buildScript({ command: 'x', startupCommand: 'export A=1 ;' }).script,
-      '{ export A=1; } || exit $?\nx\n')
-    // Whitespace-only means "no startup": the guard line is omitted entirely.
-    for (const startupCommand of [undefined, '', '   ', '\t'])
+      '{ export A=1\n} || exit $?\nx\n')
+    for (const startupCommand of [undefined, '', '   ', '\t', ';', ';;', ' ; '])
       assert.equal(buildScript({ command: 'x', startupCommand }).script, 'x\n', JSON.stringify(startupCommand))
   })
 
@@ -3271,9 +3283,19 @@ console.log('\n[A] unit: the ssh_shell remote script builder (POSIX, base64 payl
     assert.equal(quoteShell("it's"), "'it'\\''s'")
     assert.equal(quoteShell('/plain'), "'/plain'")
     assert.equal(quoteShell(undefined), "''")
-    // Both guard lines, in spec order: startup, then the working directory.
+    // Both guard lines, in spec order: startup (two-line group), then the directory.
     assert.equal(buildScript({ command: 'x', startupCommand: 'export A=1', workdir: '/w' }).script,
-      "{ export A=1; } || exit $?\ncd -- '/w' || exit $?\nx\n")
+      "{ export A=1\n} || exit $?\ncd -- '/w' || exit $?\nx\n")
+    // The value is quoted EXACTLY: a trailing space is part of the directory name,
+    // so trimming it would cd somewhere else without saying so.
+    assert.equal(buildScript({ command: 'ls', workdir: '/tmp/trim ' }).script,
+      "cd -- '/tmp/trim ' || exit $?\nls\n")
+    assert.equal(buildScript({ command: 'ls', workdir: ' /tmp/lead' }).script,
+      "cd -- ' /tmp/lead' || exit $?\nls\n")
+    // Whitespace-only is a CONFIGURED directory that does not exist: attempt the cd
+    // (and fail honestly at runtime) instead of silently running elsewhere.
+    assert.equal(buildScript({ command: 'ls', workdir: '   ' }).script,
+      "cd -- '   ' || exit $?\nls\n")
   })
 
   test('the payload is base64 of the script, UTF-8 safe and round-tripping', () => {
