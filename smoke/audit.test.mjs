@@ -5072,6 +5072,24 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
     "      bashPath: '" + GIT_BASH.replaceAll(String.fromCharCode(92), String.fromCharCode(92) + String.fromCharCode(92)) + "'",
     '',
   ].join('\n')
+  /**
+   * Wait (bounded) until no ConPTY worker thread is left alive.
+   *
+   * node-pty reads a Windows pty through a worker thread, which the kernel reports as
+   * a MessagePort. Killing the pty releases it asynchronously, so the close call can
+   * return while the worker is still winding down; a suite that ends in that window
+   * keeps a handle alive and hangs. This waits for that window to close.
+   * @param limitMs - the longest teardown may take before the caller must fail.
+   * @returns true when no MessagePort is left, false on the deadline.
+   */
+  const waitForPtyTeardown = async (limitMs) => {
+    const deadline = Date.now() + limitMs
+    while (Date.now() < deadline) {
+      if (!process.getActiveResourcesInfo().includes('MessagePort')) return true
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    return !process.getActiveResourcesInfo().includes('MessagePort')
+  }
   const runTerminal = async (ctx, args) => {
     const result = await ctx.tools.execute({
       signal: new AbortController().signal,
@@ -5238,6 +5256,14 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
       })
     } finally {
       if (ctx) await ctx.fiber.dispose()
+      // The PTY provider kills the shell, but node-pty's Windows ConPTY "conout"
+      // worker thread outlives the kill for a moment: measured here, a MessagePort
+      // was still live right after the first close and cleared only later in the run.
+      // Waiting for it is TEARDOWN, not a correctness sleep — every session is already
+      // closed above — and failing (not quietly continuing) means a genuinely stuck
+      // worker is named instead of turning into a hung suite on another machine.
+      const settled = await waitForPtyTeardown(10000)
+      assert.ok(settled, 'a terminal PTY worker outlived its close/dispose; live handles: ' + process.getActiveResourcesInfo().join(','))
     }
     let strict
     try {
@@ -7974,10 +8000,13 @@ if (failed > 0) {
   for (const { name, error } of failures) console.log(`  - ${name}: ${error?.message ?? error}`)
   process.exit(1)
 }
-// Explicit success exit. The PTY fixtures can leave a native child handle alive on
-// Windows, and a runner that prints its verdict but then sits on a stray handle is a
-// hang: measured repeatedly on this host as an identical '0 failed' summary with the
-// process still alive minutes later. Every test has settled by this line, so the
-// verdict is complete and the runner ends here instead of waiting for handles it does
-// not own.
-process.exit(0)
+process.exitCode = 0
+// Bounded teardown: a CLEAN run exits naturally and this timer never fires (it is
+// unref'd, so it cannot keep the loop alive by itself). A leaked fixture handle still
+// must not hang CI — the watchdog names the live handles and forces the exit, so the
+// leak is diagnosable instead of showing up as a silent hang on another machine.
+const teardownWatchdog = setTimeout(() => {
+  process.stderr.write('audit: forced exit after summary; active handles: ' + process.getActiveResourcesInfo().join(',') + '\n')
+  process.stdout.write('', () => process.exit(0))
+}, 2000)
+teardownWatchdog.unref()
