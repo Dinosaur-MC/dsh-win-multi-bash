@@ -2672,6 +2672,18 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     assert.match(warnings[0], /duplicate alias "dup"/)
   })
 
+  test('the ssh row mounts exactly two tools through ONE sshShell partition', () => {
+    // ONE patch row for the ssh specifier: a second row would mean a second executor and
+    // therefore a second pool, which is the one thing Plan 2 forbids.
+    const sshRows = PATCH_ROWS.filter((row) => row.name === 'dsh-win-multi-bash/tool-ssh-shell')
+    assert.equal(sshRows.length, 1, 'one row serves both ssh_shell and ssh_scp')
+    assert.equal(sshRows[0].id, 'win-mb-tool-ssh')
+    // ONE Config partition behind those two tools: the tool module exposes a single
+    // Config object whose only backend key is sshShell (the tool-layer knobs aside).
+    const backendKeys = Object.keys(sshTool.Config.dict).filter((key) => key !== 'enableRunInBackground' && key !== 'promoteOnTimeout')
+    assert.deepEqual(backendKeys, ['sshShell'], 'ssh_shell and ssh_scp read the same partition')
+  })
+
   testAsync('requireSandbox fails closed on a remote dialect, and danger-full-access is the way out', async () => {
     const demanding = bareSsh({ requireSandbox: true, sshHost: 'h' })
     demanding.openChannel = async () => { throw new Error('this must never dial or spawn') }
@@ -2867,6 +2879,12 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
           assert.match(definition.description, /blackhole/, 'the alias hint comes from the row registry')
           const output = definition.output?.schema?.properties ?? {}
           assert.deepEqual(Object.keys(output).sort(), ['bytes', 'error', 'files', 'ok'])
+          // The row's own tools are the ones serving the registry's alias parameter;
+          // other composed plugins register their own (the jobs tools, for one).
+          const rowTools = ctx.tools.schemas()
+            .filter((tool) => tool.parameters?.properties?.alias !== undefined)
+            .map((tool) => tool.name).sort()
+          assert.deepEqual(rowTools, ['ssh_scp', 'ssh_shell'], 'the host-registry row mounts exactly its two tools')
           // The row still serves exactly the shell tool and this one.
           assert.ok(ctx.tools.get('ssh_shell') !== undefined)
         }],
@@ -4068,6 +4086,65 @@ console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (
     })
   } finally {
     removeFixtureDir(scratch)
+  }
+}
+
+console.log('\n[A] unit: ssh_scp local paths (workspace rule, danger-full-access) (S10)')
+if (process.platform !== 'win32') {
+  skip('  … skipping the ssh_scp local-path cases: they pin Windows drive and volume behaviour')
+} else {
+  // A transfer's LOCAL side is an ordinary file effect on this host, so it obeys the
+  // session's sandbox mode. The resolver is lexical on purpose: it must answer without
+  // touching the filesystem, or it would be a second racy access next to the transfer.
+  const BS = String.fromCharCode(92)
+  const { resolveLocalPath, isInsideRoot } = await import(libUrl('ssh-shell', 'local-path.js'))
+  const root = 'C:' + BS + 'workspace'
+  const ww = 'workspace-write'
+  const inside = (requested, over = {}) => resolveLocalPath({ sessionCwd: root, requested, workspaceRoot: root, sandboxMode: ww, ...over })
+
+  try {
+    test('a relative path resolves against the session cwd, normalized, inside the workspace', () => {
+      assert.deepEqual(inside('notes' + BS + 'a.txt'),
+        { path: 'C:' + BS + 'workspace' + BS + 'notes' + BS + 'a.txt', outsideWorkspace: false, mode: ww })
+      assert.equal(inside('a' + BS + '.' + BS + 'b' + BS + '..' + BS + 'c.txt').path,
+        'C:' + BS + 'workspace' + BS + 'a' + BS + 'c.txt', 'the lexical walk is normalized')
+      assert.equal(inside('C:' + BS + 'workspace' + BS + 'already' + BS + 'abs.txt').path,
+        'C:' + BS + 'workspace' + BS + 'already' + BS + 'abs.txt', 'an absolute path inside is used as-is')
+      assert.equal(isInsideRoot(root, root), true, 'the root itself is inside')
+    })
+
+    test('a path outside the workspace is refused with the standard sandbox sentence', () => {
+      // The escape shapes: a .. walk, and a path on another volume (Windows).
+      for (const requested of ['..' + BS + 'evil.txt', 'C:' + BS + 'elsewhere' + BS + 'x.txt']) {
+        assert.throws(() => inside(requested), (error) => {
+          assert.match(error.message, /\[sandbox: file access denied under workspace-write mode\]/, 'the family sentence, not a new wording')
+          assert.match(error.message, /outside this session's workspace/)
+          assert.match(error.message, /danger-full-access allows/)
+          return true
+        })
+      }
+      // A sibling that merely shares a prefix is still outside: same-volume, not inside.
+      assert.equal(isInsideRoot(root, 'C:' + BS + 'workspace-evil' + BS + 'x'), false)
+      if (process.platform === 'win32')
+        assert.equal(isInsideRoot(root, 'C:' + BS + 'workspace' + BS + 'x'), true, 'Windows paths compare case-insensitively')
+    })
+
+    test('danger-full-access allows an outside path and SAYS it is outside', () => {
+      const outside = 'C:' + BS + 'elsewhere' + BS + 'dump.bin'
+      const allowed = inside(outside, { sandboxMode: 'danger-full-access' })
+      assert.deepEqual(allowed, { path: outside, outsideWorkspace: true, mode: 'danger-full-access' })
+      const stillInside = inside('local.txt', { sandboxMode: 'danger-full-access' })
+      assert.equal(stillInside.outsideWorkspace, false, 'inside stays inside under full access')
+    })
+
+    test('a blank localPath is a named argument error, and a rootless session fails closed', () => {
+      assert.throws(() => inside('   '), /ssh_scp: localPath is required/)
+      assert.throws(() => resolveLocalPath({ sessionCwd: root, requested: 'a.txt', sandboxMode: ww }),
+        /no workspace root is known/)
+      assert.equal(resolveLocalPath({ sessionCwd: root, requested: 'a.txt', sandboxMode: 'danger-full-access' }).outsideWorkspace, true)
+    })
+  } finally {
+    // nothing to clean up: every case above is lexical (no file is created)
   }
 }
 
