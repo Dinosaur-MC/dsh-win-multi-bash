@@ -7557,40 +7557,77 @@ console.log('\n[A] unit: the terminal session route (HTTP fence, method, body, d
   }
   const json = (record) => JSON.parse(record.body)
 
-  test('one prefix route per APPLY even across distinct web-server proxies; dispose frees it for a reload', () => {
-    // Cordis hands out a NEW service proxy on every access, so a guard keyed on the
-    // proxy identity (WeakSet) cannot see a repeat. The registrar's own flag can.
-    const registrations = []
-    const warns = []
-    let routeLive = false
-    const server = {
-      register(options) {
-        // The real server refuses a SECOND live route; disposing the first frees it.
-        if (routeLive) throw new Error('duplicate prefix route')
-        routeLive = true
-        registrations.push(options)
-        return () => { routeLive = false }
-      },
+  await testAsync('a replaced web server or connection re-registers on the NEW scope (old route disposed)', async () => {
+    // Cordis can inject a DIFFERENT webServer/connection while the row stays mounted.
+    // A handler built from the old hostCtx would keep answering through the old
+    // connection, and the new server would get no route at all; the registrar must
+    // dispose the live route and rebuild it from the CURRENT scope.
+    const makeServer = () => {
+      const record = { live: 0, registrations: [], disposers: 0 }
+      record.server = {
+        register(options) {
+          if (record.live > 0) throw new Error('duplicate prefix route')
+          record.live += 1
+          record.registrations.push(options)
+          return () => { record.live -= 1; record.disposers += 1 }
+        },
+      }
+      return record
     }
-    const proxyA = new Proxy(server, {})
-    const proxyB = new Proxy(server, {})
-    assert.notEqual(proxyA, proxyB, 'the two accesses are different objects, as Cordis returns them')
+    const first = makeServer()
+    const second = makeServer()
+    const warns = []
     const effectDisposers = []
     const ctx = { effect: (callback) => effectDisposers.push(callback()), root: { get: () => undefined } }
-    const register = createSessionChannelRegistrar({ ctx, dispatch: async () => ({ ok: true }), warn: (message) => warns.push(message) })
-    register({ webServer: proxyA })
-    register({ webServer: proxyB })
-    assert.equal(registrations.length, 1, 'exactly one route')
-    assert.equal(registrations[0].kind, 'prefix')
-    assert.equal(registrations[0].path, '/win-mb')
-    assert.equal(typeof registrations[0].handler, 'function')
+    const register = createSessionChannelRegistrar({ ctx, dispatch: async () => ({ ok: true, value: { sessions: [] } }), warn: (message) => warns.push(message) })
+    const denies = { admit: () => 401, requestRejection(req) { return this.admit(req) } }
+    const allows = { admit: () => undefined, requestRejection(req) { return this.admit(req) } }
+    register({ webServer: first.server, connection: denies })
+    assert.equal(first.live, 1)
+    register({ webServer: second.server, connection: allows })
+    assert.equal(first.live, 0, 'the old server route is disposed')
+    assert.equal(first.disposers, 1)
+    assert.equal(second.live, 1, 'the new server has exactly one route')
+    assert.equal(second.registrations.length, 1)
     assert.deepEqual(warns, [], 'no duplicate-prefix warning')
+    // The live handler now answers through the NEW connection (allows => 200).
+    const answered = await runRoute(second.registrations[0].handler, {})
+    assert.equal(answered.status, 200)
+    // Unloading the row takes the live route down.
     effectDisposers[0]()
-    register({ webServer: proxyB })
-    assert.equal(registrations.length, 2, 'the disposer clears the flag, so a reload registers again')
-    effectDisposers[1]()
+    assert.equal(second.live, 0)
   })
 
+  await testAsync('the legacy Connection-RPC path replaces its channel instead of double-registering', async () => {
+    const makeConnection = () => {
+      const record = { live: 0, handler: undefined }
+      record.connection = {
+        rpc: {
+          handle(_name, handler) {
+            record.live += 1
+            record.handler = handler
+            return () => { record.live -= 1 }
+          },
+        },
+      }
+      return record
+    }
+    const first = makeConnection()
+    const second = makeConnection()
+    const ctx = { effect: () => {}, root: { get: () => undefined } }
+    const register = createSessionChannelRegistrar({
+      ctx,
+      dispatch: async (endpoint) => ({ ok: true, endpoint }),
+      warn: () => {},
+    })
+    register({ get: (name) => (name === 'connection' ? first.connection : undefined) })
+    assert.equal(first.live, 1)
+    register({ get: (name) => (name === 'connection' ? second.connection : undefined) })
+    assert.equal(first.live, 0, 'the old channel is disposed, so only one is live')
+    assert.equal(second.live, 1)
+    const result = await second.handler('sessions.list', {})
+    assert.deepEqual(result, { ok: true, endpoint: 'sessions.list' })
+  })
   await testAsync('no trust fence is a 503; a rejection is echoed with its own status', async () => {
     const bare = await runRoute(handlerFor({}), {})
     assert.equal(bare.status, 503, 'a host without requestRejection fails closed')
@@ -7633,7 +7670,9 @@ console.log('\n[A] unit: the terminal session route (HTTP fence, method, body, d
     assert.deepEqual(get.headers, { Allow: 'POST' })
     const plain = await runRoute(handlerFor(hostCtx), { contentType: 'text/plain' })
     assert.equal(plain.status, 415, 'a body that is not JSON is refused before it is parsed')
-    assert.deepEqual(plain.headers, { Allow: 'POST' })
+    assert.equal(plain.headers, undefined, '415 is not a method refusal, so it carries no Allow')
+    const missing = await runRoute(handlerFor(hostCtx), { url: '/win-mb/' })
+    assert.equal(missing.status, 404, 'the bare prefix has no endpoint')
   })
 
   await testAsync('the route refuses a VALID JSON body over 64 KiB and malformed JSON with a 400', async () => {
