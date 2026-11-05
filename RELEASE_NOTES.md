@@ -1,3 +1,68 @@
+# dsh-win-multi-bash v0.8.0
+
+## New
+
+- **`ssh_shell` reaches a whole registry of hosts, one alias at a time.** `sshShell.hosts` is an array of objects — `alias`, `host`, `port` (22), `user`, `keyPath`, `passphraseEnv`, `startupCommand`, `shellTemplate` (a POSIX launcher that reads a base64 script from stdin), `connectTimeoutMs` (30000), `approval` (`session`), `acceptNewHostKeys` (off), `default` and `description`. Aliases are unique, at most one host may be `default` (zero is valid: a call then names its alias), and the registry is validated once per stored value. A failure names the field and, where it has one, the alias — the array-level failures (`hosts must be an array`, `each host must be an object`) and `more than one default host` cannot name a single alias; the default message may list the aliases. An invalid array leaves the row registered and every call says `sshShell.hosts is invalid (<the field, and the alias where the failure has one>)`; a valid empty one says no hosts are configured. A call never picks a host it was not told or given as the default.
+- **One pooled ssh2 connection per host, one exec channel per call.** The command form no longer starts a local `ssh.exe`: it drives ssh2 (~1.17.0) directly, reuses one TCP/SSH connection per alias, and gives every call its own channel, so concurrent commands interleave safely and a background call cannot swap output with a foreground one. Cancelling a call signals the remote process (TERM, then KILL 2 s later) instead of only closing the channel; a channel that closes without an exit status is reported as a lost connection and **fails** the call or job — never as a completed run.
+- **Host keys are strict, like OpenSSH.** `known_hosts` and `known_hosts2` are read together; hashed entries, wildcard and negated patterns and `@revoked` are honoured, and a non-default port matches its `[host]:port` identity. A changed key is refused by name and a missing `known_hosts` file is a configuration error. `acceptNewHostKeys` (off by default) accepts an unknown key for **one connection** and never writes the file; it never bypasses a changed key. `@cert-authority` entries are not honoured in 0.8.0.
+- **Per-host startup commands and a real remote working directory.** `startupCommand` is a POSIX snippet run before the command on that host; `workdir` is an absolute POSIX path **on that host**, and a local Windows path is refused with the form to use instead (e.g. `/home/me/project`).
+- **Background work, promotion and `job_kill`.** A call may run as a platform job, promote on timeout, and be killed: the job owns the remote process, a kill signals it on the host, and a lost connection settles the job **failed** with the reason. Background and job-owned calls retry a refused channel open at most four times; a foreground call retries until its own deadline instead.
+- **`ssh_scp` transfers files and trees over SFTP.** One row serves both tools: a transfer reuses the same `sshShell.hosts` entry, the same pooled connection and the same host-key check. It uploads or downloads a file or a directory tree (empty directories are preserved), bounds one operation with its own deadline (default `300000` ms, five minutes), and is **foreground only** — no `run_in_background`, no promotion, no job. Its local side is sandboxed: `workspace-write` resolves `localPath` against the session's working directory and refuses anything outside it with the family's sandbox sentence, and `danger-full-access` is the way out. Every result is a value — `{ ok, bytes, files?, error?, sandbox, outsideWorkspace? }` — with the `error.phase` naming `config`, `approval`, `sandbox`, `connect` or `sftp`, so a failed transfer is inspectable instead of thrown. Remote paths use the POSIX form the remote host sees (`/C:/...` on a Windows OpenSSH host).
+- **A session authorization gate in front of every dial.** Each host's `approval` is `trusted` (never ask) or `session` (the default): on `session`, the first use of that host in a conversation asks through the platform's approval service and the grant lives **in memory, for that session only** — one prompt per host. The fingerprint that decides whether a grant still applies is only `alias`, `host`, `port`, `user`, `keyPath` and `passphraseEnv` — editing any of those six asks again, while editing `startupCommand`, `shellTemplate`, `connectTimeoutMs`, `acceptNewHostKeys`, `approval`, `default` or `description` does not. Refusal, cancellation or no answerer fails closed with phase `approval` (`ssh_shell` throws the named error; `ssh_scp` returns it as its structured value), and `approval: trusted` is the documented way to pre-authorize headless use.
+- **Only channel capacity is retried.** When the server refuses a new channel for capacity — `MaxSessions`, `administratively prohibited`, `channel open failure`, `open failed`, `resource shortage` — the OPEN is retried at 100/200/400 ms, capped at 1 s, never the command. Authentication, host-key, handshake, socket and passphrase failures, and every SFTP operation error, are never retried. When retrying stops, the error is the server's **last refusal verbatim** plus a note saying why (the call deadline expired, or `gave up after N attempts`); it is never a synthetic timeout, and an abort stays the platform's abort.
+
+## Improvements
+
+- **The host registry has a real table editor.** The ssh row's page draws one card per host with every field above, an exclusive `default` radio, an `approval` select, Add/Remove, and inline validation that blocks the save while a row is invalid (blank required field, malformed or duplicate alias, port outside 1..65535, a non-object entry, more than one default) — the page never shows JSON text. Empty optional fields are cleared from the saved object, and an invalid table is never written.
+- **A dedicated authorization card for this bundle's prompts.** A `conversation.composer` chain entry at priority 0 claims only `ssh_shell`/`ssh_scp` pending approvals and renders the alias, the request sentence, and **Allow for this session** / **Reject**; every other approval keeps the platform's standard card. A failed answer re-enables the card with the failure instead of pretending the request settled.
+- **Errors place the failure.** Where a host is involved, a failure names its alias; where a stage applies, the message identifies the failed stage (`config`, `sandbox`, `connect`, `host-key`, `auth`, `channel`, `exec`). Configuration failures are about the registry, not a host — `no hosts are configured` and `sshShell.hosts is invalid (...)` have no alias, and `ssh_shell` reports every failure by a named error and its detail rather than through a structured `phase`. A timeout, an abort and a lost connection are outcomes reported as such (`timedOut`, the platform abort, `disconnected`) rather than phases. `ssh_scp` returns a structured value whose `error.phase` is exactly one of `config`, `approval`, `sandbox`, `connect` or `sftp`. A background acknowledgement carries no invented verdict, and a foreground result states the sandbox fact it actually observed (`sandbox: { mode, remote: true }`).
+
+## Bug fixes
+
+- A cancelled pending channel open no longer leaks a pooled connection lease: the lease is released before the client is retired, so a burst of cancellations cannot exhaust the pool.
+- SFTP subsystem refusals are classified as capacity refusals and bounded (four attempts) instead of surfacing raw ssh2 text; `Unable to start subsystem` now ends with `gave up after N attempts` rather than looping.
+- The hosts table refuses to save a table the Host would reject — blank required fields, malformed or duplicate aliases, a port outside the range, a non-object entry, or more than one default — instead of persisting an inventory every call then fails on.
+- An approval answer that fails no longer marks the request settled: the card re-enables its buttons, shows the failure, and leaves the request pending.
+- Stale single-host pins no longer fall back silently to one host: a profile that still carries them comes up with no hosts and the call error says what to add.
+
+## Breaking changes
+
+| Surface | 0.7.x | 0.8.0 |
+| --- | --- | --- |
+| Tool | `ssh_bash` | `ssh_shell` |
+| Config partition | `sshBash` | `sshShell` |
+| Patch row | `.../tool-ssh-bash` | `.../tool-ssh-shell` |
+| Export subpath | `./tool-ssh-bash` | `./tool-ssh-shell` |
+| Terminal shell value | `ssh_bash` | `ssh_shell` |
+| Terminal pin partition | `sshBash` | `sshShell` |
+| Executor | `SshBashExecutor` | `SshShellExecutor` |
+
+The old names are not honoured at runtime. On the command row the single-host pins (`sshPath`, `sshHost`, `sshUser`, `sshPort`, `acceptNewHostKeys`, `connectTimeoutMs`) are **replaced** by `sshShell.hosts`, and the row has no `sshPath` any more (its client is ssh2, not `ssh.exe`). A profile that still lists `sshBash:` keeps that key unread and silently preserved: the row comes up with no hosts and every call fails with `no hosts are configured; add them to the sshShell.hosts array on this row` — there is no fallback to a single host. The `terminal` row keeps its own single-host pin under `sshShell` and does not read the registry, so sessions are unchanged apart from the partition rename.
+
+## Known limitations
+
+- The local-path check for `ssh_scp` is **lexical**: it resolves the path against the session and the sandbox root but does not resolve symlinks, and a time-of-check/time-of-use window exists between the check and the transfer. It is a guardrail, not a containment boundary for a local attacker.
+- Channel retrying has a bounded attempt budget but no separate deadline for background calls: they stop after four attempts, while a foreground call is bounded by its own deadline.
+- `ssh_list` is deferred; 0.8.0 has no tool that lists the configured hosts.
+- `terminal` stays outside the registry and the gate: an SSH session still uses the session row's single-host pin and is not covered by `ssh_shell`'s authorization.
+- `@cert-authority` entries in `known_hosts` are not honoured.
+
+## Security
+
+- **Key-only authentication.** `keyPath` names a private key file; `passphraseEnv` names an environment variable that carries the passphrase — never the passphrase itself. There is no password prompt and no live ssh-agent.
+- **Host keys are verified against `known_hosts`** (both files, hashed entries, patterns, `@revoked`); an unknown key fails unless the host opts into `acceptNewHostKeys`, which accepts it for one connection only, and a changed key is always refused. The tool never writes `known_hosts`.
+- **Authorization grants are memory-only and per session**: a grant never leaves the process, is never persisted, and is lost when the session or plugin reloads.
+- **No secrets are logged or returned**: results and warnings name aliases, targets and phases only — never a key path's contents or a passphrase value.
+
+## Migration
+
+1. Rename the tool in the profile: `win-mb-tool-ssh` now points at `dsh-win-multi-bash/tool-ssh-shell` (the export subpath, patch row and executor name follow the table above).
+2. Replace the command row's pins with an `sshShell.hosts` array — at minimum `alias`, `host`, `user`, `keyPath` per host; add `port`, `startupCommand`, `shellTemplate`, `connectTimeoutMs`, `approval`, `acceptNewHostKeys` and `description` as needed, and mark at most one host `default: true`. The Plugins page's host table edits the same value.
+3. If the profile still carries `sshBash:`, it is ignored: move anything worth keeping into `sshShell.hosts` and delete the stale key at your leisure (it is preserved silently, not read).
+4. Update callers: `ssh_shell` with `alias` (or no alias when a default host exists) and its `command`; for a transfer use `ssh_scp` with `localPath`/`remotePath` and the same `alias`.
+5. Move terminal sessions from `shell: "ssh_bash"` to `shell: "ssh_shell"`, and their pins from `sshBash.*` to `sshShell.*`; the session form keeps its own single host and does not read the hosts table in 0.8.0.
+6. Add every host to `known_hosts` before the first call (or set `acceptNewHostKeys: true` for that host to accept an unknown key once). Authentication is key-only: put an encrypted key's passphrase in the environment variable named by `passphraseEnv`.
+7. Decide each host's `approval`: leave `session` (the default) to be asked once per conversation, or set `trusted` for headless deployments. Remember the terminal form is not gated in 0.8.0.
 # dsh-win-multi-bash v0.7.7
 
 ## New

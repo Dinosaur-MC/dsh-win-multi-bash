@@ -58,11 +58,11 @@ Only `git_bash` and `terminal` are enabled by default; three dialects ship switc
 | `default` | no | At most one host may carry it; a call may then omit `alias`. |
 | `description` | no | Free text for the human (the Configure page and the composition file); it never reaches a call's result. |
 
-The registry is validated once per stored `hosts` value — a live edit re-validates it, and a call reuses that verdict instead of re-reading the array. A missing required field, a malformed or duplicated alias, a port outside the range, or two `default` hosts fails with a message naming the field and the alias. A broken array leaves the row registered with no hosts, and every call then fails with the same sentence — `sshShell.hosts is invalid (<the field and alias>)` — instead of letting "no host with alias X" hide the real cause. A valid empty array is a different state: `no hosts are configured; add them to the sshShell.hosts array on this row`.
+The registry is validated once per stored `hosts` value — a live edit re-validates it, and a call reuses that verdict instead of re-reading the array. A missing required field, a malformed or duplicated alias, a port outside the range, or more than one `default` host fails with a message naming the field and the alias (for a duplicate default the message may list the aliases). A broken array leaves the row registered with no hosts, and every call then fails with the same sentence — `sshShell.hosts is invalid (<the field and alias>)` — instead of letting "no host with alias X" hide the real cause. A valid empty array is a different state: `no hosts are configured; add them to the sshShell.hosts array on this row`.
 
 `alias` may be omitted from a call only when **exactly one** host carries `default: true`. With no default the call fails and names the declared aliases; running on the first host instead would be a guess about where a command runs.
 
-On the Plugins page the registry is edited as **JSON text** in one control: a draft that does not parse is reported and never saved, and an emptied control clears the override instead of writing an empty value. The array itself is never returned with secrets — it carries paths and an environment-variable name, never key material or a passphrase. The model sees only the alias list in the `alias` parameter's description.
+On the Plugins page the registry is a **table**, one card per host: every field above (text/number inputs, a textarea for `description`, a checkbox for `acceptNewHostKeys`), a per-host **Session authorization** select (`session` / `trusted`) and one exclusive **Default host** radio across the table. **Add host** appends a blank row, **Remove host** drops one; required-field, alias-format/duplicate, host-format, port-range, timeout-range and duplicate-default problems are shown inline on the row, and a table-level alert says the table cannot be saved while any row is invalid — an invalid table is never written. `default` is **at most one**, and zero is allowed; the radio keeps the table's single default at most one (a stored or hand-edited array with two is reported and blocks the save). Editor row ids only keep React identity stable and are never saved. The value a save writes is the array of host objects — blanks cleared, numbers as numbers — and there is no JSON text control on the page. A legacy JSON-string draft from the pre-table form is still shown as rows, so an in-flight draft is not lost. The array is never returned with secrets: it carries paths and an environment-variable name, never key material or a passphrase. The model sees only the alias list in the `alias` parameter's description.
 
 ## Host keys and `known_hosts`
 
@@ -191,7 +191,7 @@ The page stages drafts and writes only on **Save**, fenced by the revision it re
 
 A profile that still lists `sshBash:` under the ssh row keeps that key **unread**: neither this tool nor the terminal row looks at it any more (the stale key is preserved silently — no throw and no loader warning; naming it in the loader is Plan 4 work). The row therefore comes up with no hosts, and the diagnostic is the call error — `no hosts are configured; add them to the sshShell.hosts array on this row` — rather than a silent fallback to one host.
 
-Replace the single-target pins (`sshPath`, `sshHost`, `sshUser`, `sshPort`, `acceptNewHostKeys`, `connectTimeoutMs`) with a hosts array, in the profile's YAML or on the row's Configure page:
+Replace the single-target pins (`sshPath`, `sshHost`, `sshUser`, `sshPort`, `acceptNewHostKeys`, `connectTimeoutMs`) with a hosts array, in the profile's YAML or with the row's host table:
 
 ```yaml
 - id: win-mb-tool-ssh
@@ -218,3 +218,11 @@ Then update the calls — `ssh_shell` with `alias: "ubuntu"` and its `command`, 
 Authentication is key-only: a password prompt or a live ssh-agent is not available to `ssh_shell`, and an encrypted key needs `passphraseEnv`. Host keys are strict — add each host to `known_hosts` first, or set `acceptNewHostKeys: true` on that host to accept an unknown key once with a warning. Neither a missing `known_hosts` entry nor a changed key is bypassed by that switch, and `@cert-authority` entries are not honoured in 0.8.0.
 
 The row also gains a second tool, `ssh_scp` (see [File transfer](#file-transfer-ssh_scp)). It is not a rename: there is no old name to migrate, it reads the same `sshShell.hosts` and reuses the same connection, its local side is sandboxed as described there, its remote paths use the POSIX form (`/C:/...` on a Windows OpenSSH host), and its `approval` semantics are `ssh_shell`'s (session-memory grants, see [Host authorization](#host-authorization)).
+
+## Known limitations (0.8.0)
+
+- **The local transfer path is checked, not confined.** `ssh_scp`'s `localPath` rule is lexical (no `realpath`/TOCTOU), so a symlink or junction inside the workspace that points outside it is followed by the file stream. Treat it as a path check, not an OS confinement.
+- **Channel-open retries are bounded.** Capacity refusals are retried at 100/200/400 ms (capped at 1 s): a foreground call until its deadline, a background or job-owned call for at most four attempts, and a refused SFTP subsystem for four attempts. There is no unbounded or queued retry beyond that budget, and no retry at all for authentication, host-key, handshake, socket, passphrase or SFTP-operation errors.
+- **`ssh_list` is deferred.** 0.8.0 ships no model-facing host-list tool; the configured aliases are visible in the `alias` parameter's description, and key paths and passphrases are never exposed.
+- **`terminal` stays outside the registry and the gate.** An SSH session keeps its own single-host pin under `sshShell` and does not read the hosts table; the session authorization gate covers `ssh_shell` and `ssh_scp` only.
+

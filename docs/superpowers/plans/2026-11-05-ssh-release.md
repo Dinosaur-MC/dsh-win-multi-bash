@@ -10,7 +10,7 @@ human rules on the release.
 ## Non-negotiables
 
 - The hosts table is a real editor of `sshShell.hosts`: add/remove rows, edit
-  every field, exactly one `default`, per-host `approval` select, save through
+  every field, at most one `default` (zero allowed), per-host `approval` select, save through
   the existing form; no JSON text remains on the Configure page.
 - The client form renderer stays a generated-registry consumer; no new slot, no
   page navigation; dictionary values are strings; README under 10k.
@@ -41,7 +41,7 @@ human rules on the release.
   table/list editor: one row per host, fields alias/host/port/user/keyPath/
   passphraseEnv/startupCommand/shellTemplate/connectTimeoutMs/approval/
   acceptNewHostKeys/default/description; add row, remove row, move? (no), mark
-  default as a radio (exactly one), approval as a select; invalid rows show the
+  default as a radio (at most one; zero allowed), approval as a select; invalid rows show the
   field error inline; the value saved is the array of host objects.
 - Keep the existing form plumbing (coerce/sameValue/invalidReason/dictionary);
   no JSON text fallback visible; a "raw JSON" escape hatch is allowed only if

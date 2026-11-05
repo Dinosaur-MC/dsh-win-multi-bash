@@ -9,7 +9,7 @@ The [README](../README.md) is the entry point and release summary. These documen
 | [Sandbox behavior](sandbox.md) | Per-backend capabilities, Windows caveats, bwrap setup, the self-heal switch, and SSH's remote scope |
 | [Terminal sessions](terminal.md) | PTY lifecycle, signals, output bounds, sessions vs jobs, SSH sessions, measured defaults |
 | [Conversation rows](conversation-rows.md) | How a call becomes the platform's own shell card |
-| [Configuration](configuration.md) | The Plugins page, every row's knobs, the SSH host registry and its migration, the `ssh_scp` transfer rules, live semantics, staged saves |
+| [Configuration](configuration.md) | The Plugins page, the SSH hosts table and its migration, the `ssh_scp` transfer rules, 0.8.0 limitations, live semantics, staged saves |
 | [Verification](verification.md) | Dev runtime, both test entries, the audit gate, the live SSH round trip |
 | [Troubleshooting](troubleshooting.md) | Symptom → fix |
 

@@ -53,7 +53,7 @@ dsh plugin --profile web remove dsh-win-multi-bash                 # 卸载
 
 - **`git_bash`** 装好即可用。每次调用启动一个全新的 MSYS bash；`workdir` 接受原生、MSYS（`/c/...`）与 WSL automount（`/mnt/c/...`）三种写法。
 - **`wsl_bash` / `msys2_bash`**：在插件页启用 `win-mb-tool-wsl` / `win-mb-tool-msys2`。只有自动探测不够时才需要 pin `wslBash.wslDistro` 或 `msys2Bash.bashPath`。
-- **`ssh_shell`**：启用 `win-mb-tool-ssh`，在 `sshShell.hosts` 下添加主机（`alias`、`host`、`user`、`keyPath`；需要时再加 `port` / `startupCommand` / `default`）。调用时指定别名（只有一台主机标 `default` 时才可以省略）；没有主机的行会拒绝每一次调用。仅密钥认证、严格主机密钥——迁移说明见[配置](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/configuration.md)。主机默认 `approval: session`：每会话一次、经专用卡片提问；`trusted` 永不提问。
+- **`ssh_shell`**：启用 `win-mb-tool-ssh`，在 `sshShell.hosts` 下添加主机（`alias`、`host`、`user`、`keyPath`；需要时再加 `port` / `startupCommand` / `default`）。调用时指定别名（只有一台主机标 `default` 时才可以省略）；没有主机的行会拒绝每一次调用。仅密钥认证、严格主机密钥——迁移说明见[配置](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/configuration.md)。主机默认 `approval: session`：每会话一次、经专用卡片提问；`trusted` 永不提问。主机在配置页的**主机表**中编辑——每台一张卡，最多一台默认。
 - **`ssh_scp`**：同一行也做传输——`action: "upload" | "download"`、`localPath`（除非 `danger-full-access`，否则必须在工作区内；校验是词法的，不会解引用工作区内的符号链接）、`remotePath`（绝对 POSIX；Windows OpenSSH 用 `/C:/...`）、`recursive` 传目录树、`timeoutMs`（默认 5 分钟）。仅前台；结果为 `{ ok, bytes, files?, error? }` 外加 `sandbox` 事实（允许外部路径时含 `outsideWorkspace`），失败是带 phase 与别名的结果值。
 - **`terminal`**：`open` 开会话，`send`（`submit: true`）发命令，`read` 读回复，`close` 结束。工作目录、导出的变量与别名会跨调用保留。会话是进程内的、有上限、空闲会被回收，且**不是**后台任务；Session 头部面板会列出并停止它们。
 - 每行在插件页都有**配置**入口：路径、超时、沙箱立场、会话上限，以及部署级的自愈开关。除非某个旋钮决定工具 schema，改动都是即时的。

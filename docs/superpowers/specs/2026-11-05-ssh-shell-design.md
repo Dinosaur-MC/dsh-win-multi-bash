@@ -114,8 +114,9 @@ sshShell.hosts is an array of objects in the ssh row's configuration:
     }
 
 Validation runs at config read and at call time. Missing key files, duplicate
-aliases, two defaults, or a malformed alias fail with a message naming the field
-and the alias.
+aliases, more than one default (the error may list the aliases), or a malformed
+alias fail with a message naming the field and the alias. At most one host may
+be the default, and zero is allowed.
 
 The row stays opt-in (defaultEnabled false): with no hosts configured the tool
 registers but every call fails with "no hosts configured". The tool joins the
@@ -133,14 +134,18 @@ schema are generated into smoke/gen-client-registry.mjs and pinned by the audit
 the client form renderer; text values are stored trimmed, numbers as numbers,
 and blank optional fields cleared.
 
-ssh_list is the model-facing view: alias, host, port, user, default, keyReady,
-approval, description, acceptNewHostKeys. It never returns key paths or
-passphrases (keyReady is a boolean).
+ssh_list is deferred to a later release (recorded amendment, 2026-11-05). The
+model-facing alias list is the `alias` parameter's description; key paths and
+passphrases are never exposed. 0.8.0 may ship only with this paragraph rewritten
+as above or with ssh_list implemented; a later release can add the tool without
+changing the host schema.
 
 ## 7. Transport and authentication
 
-- Dependency: ssh2 ^1.17.0 (runtime dependency, not a peer). THIRD_PARTY_NOTICES
-  is updated; license is MIT.
+- Dependency: ssh2 `~1.17.0` (runtime dependency, not a peer) — a deliberate
+deviation from `^1.17.0`: cancellation uses the protocol-level signal request
+after stdin is half-closed, so the build that exposes that path is pinned.
+  THIRD_PARTY_NOTICES is updated; license is MIT.
 - Connect config: host, port, username, privateKey read from keyPath, optional
   passphrase from passphraseEnv, readyTimeout: connectTimeoutMs,
   keepaliveInterval: 15000, keepaliveCountMax: 3, tryKeyboard: false.
@@ -164,6 +169,9 @@ known_hosts is parsed by us (no auto-accept):
 - acceptNewHostKeys: true accepts an unknown key with a one-time warning per
   connection. It never writes the file; the warning tells the user how to add
   the entry.
+- Known limitation (recorded): a bracket negation such as `*,![example.com]:22`
+  can over-refuse the bare host at the default port. The failure is on the
+  strict side — a refused call, never an unverified key.
 
 ## 8. Command execution
 
@@ -225,7 +233,10 @@ row's maxOutputBytes / maxSpillBytes knobs.
 
 ### 8.5 Timeout and cancellation
 
-- Timeout budget is per call, measured from channel open.
+- Timeout budget is per call, measured from channel open. Recorded observation:
+  the initial dial is outside that budget, so a slow dial delays the deadline;
+  `connectTimeoutMs` bounds the handshake and the command budget starts with the
+  channel.
 - On timeout or caller abort: send SIGTERM via the SSH signal request, wait up
   to 2 s, send SIGKILL, close the channel. Result: timedOut true or aborted
   true, exitCode null, with the phase in the error text.
@@ -402,6 +413,13 @@ pinned.
 - CI must be green before the tag and release; npm after the GitHub release.
 - Existing users of ssh_bash move to ssh_shell; the migration text includes a
   sample hosts array and the sshBash -> sshShell rename.
+- Mandatory release gate (recorded): isolated `DSH_HOME` + local plugin install +
+  a model provider + a local sshd host with `approval: session` + a browser over
+  CDP. The dedicated card must render and answer `allowed-once`/`rejected`, a
+  non-ssh approval must keep the platform card, and two E2E checks must pass:
+  sequential approvals reset their per-pending state, and a synchronous
+  `pending.answer` throw re-enables the buttons and shows the error. Failure
+  blocks 0.8.0.
 
 ## 17. Verified facts behind this design
 
@@ -421,7 +439,8 @@ pinned.
 
 ## 18. Acceptance criteria
 
-1. ssh_list returns the configured hosts and no secrets.
+1. ssh_list is deferred in 0.8.0 (recorded amendment); the alias parameter names
+   the configured aliases and no key path or passphrase is ever exposed.
 2. ssh_shell with an alias runs a command over one pooled connection and returns
    stdout, stderr and the exit code; a second call reuses the connection.
 3. A command with run_in_background true returns a job id; job_output streams;
@@ -442,4 +461,4 @@ pinned.
     not prompt again in that session, prompts again in another session, and a
     denied request leaves the host unusable there. A host with "trusted" never
     prompts. The prompt uses the dedicated card with "Allow for this session"
-    and "Deny" buttons; other tools keep the standard approval card.
+    and "Reject" buttons; other tools keep the standard approval card.

@@ -364,6 +364,10 @@ git commit -m "feat(ssh): validate the host registry"
 - [ ] **Step 4:** Run node smoke/prepare.mjs audit and npm test; expect PASS.
 - [ ] **Step 5:** Commit: git add lib/ssh-shell/index.js lib/tool-bash/types/factory.js smoke/audit.test.mjs && git commit -m "feat(ssh): integrate ssh_shell with ctx.jobs".
 
+**Recorded coverage note:** there is no ssh end-to-end case that drives a *fake jobs registry* through the whole tool. Task 8 pins the handle contract, `processOutcome` mapping and output streaming directly, and the registry mechanics themselves are covered by the local dialects' tests. Recorded so a future reviewer does not read the missing fake-registry E2E as an untested path.
+
+**Recorded observation:** the exec timeout starts at channel open, after the initial dial; a slow dial therefore delays the deadline. `connectTimeoutMs` bounds the handshake, and the command budget starts with the channel.
+
 ## Task 9: Documentation and migration notes
 
 **Files:**
