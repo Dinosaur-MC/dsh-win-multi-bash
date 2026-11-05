@@ -7836,7 +7836,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
    */
   const applyWithProbes = (ctx) => client.apply(Object.assign({ get: (name) => ctx[name] }, ctx))
 
-  const { ROWS, rowKey, planOps, RowConfigForm, RowConfigCard, en, zh, SHELL_TOOL_NAMES, TERMINAL_TOOL_NAME, ToolCard, toolCardBody, toolCardIo, terminalBody, terminalLabels, cardTitle, shellCard, shellExitLabel, shellStatus, displayCwd, normalizeSegments, cardSummary, cardState, cardOutput, cardInput } = internals
+  const { ROWS, rowKey, planOps, RowConfigForm, RowConfigCard, HostsEditor, hostRowsFrom, hostObjectFromRow, hostObjectsFrom, hostRowErrors, blankHostRow, HOST_FIELDS, en, zh, SHELL_TOOL_NAMES, TERMINAL_TOOL_NAME, ToolCard, toolCardBody, toolCardIo, terminalBody, terminalLabels, cardTitle, shellCard, shellExitLabel, shellStatus, displayCwd, normalizeSegments, cardSummary, cardState, cardOutput, cardInput } = internals
 
   test('the client entry exports exactly the platform plugin triple', () => {
     // Official package-surface rule: a /client entry must not export implementation
@@ -8057,79 +8057,77 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.equal(form.project().dirty, false, 'an accepted save clears its drafts')
   })
 
-  await testAsync('the hosts editor shows a draft as typed and saves the parsed array', async () => {
-    // The control is a controlled text field over a JSON array. A draft must be
-    // echoed back EXACTLY as typed (re-encoding it would show a quoted string and
-    // escape every keystroke), and only the save turns it into the array.
+  await testAsync('the hosts table stages the ARRAY of host objects and saves it', async () => {
+    // The value a save carries IS the array of host objects: blanks dropped, numbers
+    // numbers, flags only when set, approval explicit. The table never stages JSON text.
     const sshRow = ROWS.find((row) => row.rowId === 'win-mb-tool-ssh')
-    const knob = sshRow.fields.find((entry) => entry.key === 'sshShell.hosts')
-    assert.equal(knob?.kind, 'hosts', 'the ssh row edits hosts through the hosts kind')
+    assert.equal(sshRow.fields.find((entry) => entry.key === 'sshShell.hosts')?.kind, 'hosts')
     const scope = fakeScope()
     const form = new RowConfigForm(scope, sshRow)
-    const hosts = [{ alias: 'prod', host: '10.0.0.5', user: 'deploy', keyPath: '~/.ssh/id_ed25519' }]
-    const draft = JSON.stringify(hosts, null, 2)
-    form.edit('sshShell.hosts', draft)
+    const rows = [{
+      alias: 'prod', host: '10.0.0.5', port: '2222', user: 'deploy', keyPath: 'C:/keys/id_ed25519',
+      passphraseEnv: 'SSH_PASS', startupCommand: '', shellTemplate: '', connectTimeoutMs: '',
+      approval: 'trusted', acceptNewHostKeys: true, default: true, description: 'main box',
+    }]
+    form.edit('sshShell.hosts', hostObjectsFrom(rows))
     const field = () => form.project().fields.find((entry) => entry.key === 'sshShell.hosts')
-    assert.equal(field().text, draft, 'the draft is shown as typed, never JSON-encoded a second time')
-    assert.equal(field().invalid, false)
-    assert.equal(field().invalidReason, undefined)
+    assert.equal(field().rows.length, 1, 'the table shows one row per host')
+    assert.deepEqual(field().rowErrors, [{}], 'a complete row has no warning')
     assert.equal(form.project().dirty, true)
     await form.save()
     assert.deepEqual(scope.calls, [{
-      ops: [{ op: 'set', path: ['sshShell', 'hosts'], value: hosts }],
+      ops: [{ op: 'set', path: ['sshShell', 'hosts'], value: [{
+        alias: 'prod', host: '10.0.0.5', port: 2222, user: 'deploy', keyPath: 'C:/keys/id_ed25519',
+        passphraseEnv: 'SSH_PASS', approval: 'trusted', acceptNewHostKeys: true, default: true, description: 'main box',
+      }] }],
       revision: 1,
     }])
     assert.equal(form.project().dirty, false, 'an accepted save clears the draft')
     form.dispose()
   })
 
-  test('a STORED hosts array renders as JSON text', () => {
+  test('a STORED hosts array renders as editor ROWS, never as JSON text', () => {
     const sshRow = ROWS.find((row) => row.rowId === 'win-mb-tool-ssh')
-    const stored = [{ alias: 'prod', host: 'h', user: 'u', keyPath: 'k' }]
+    const stored = [{ alias: 'prod', host: 'h.example', user: 'u', keyPath: 'k', port: 2200, approval: 'trusted', default: true }]
     const form = new RowConfigForm(fakeScope({
       value: { sshShell: { hosts: stored } },
       user: { sshShell: { hosts: stored } },
     }), sshRow)
-    assert.equal(form.project().fields.find((entry) => entry.key === 'sshShell.hosts').text,
-      JSON.stringify(stored, null, 2))
+    const field = form.project().fields.find((entry) => entry.key === 'sshShell.hosts')
+    assert.equal(field.rows.length, 1)
+    assert.equal(field.rows[0].alias, 'prod')
+    assert.equal(field.rows[0].port, '2200', 'a stored number is edited as text')
+    assert.equal(field.rows[0].approval, 'trusted')
+    assert.equal(field.rows[0].default, true)
+    assert.deepEqual(field.rowErrors, [{}])
     form.dispose()
   })
 
-  await testAsync('an unparseable hosts draft warns, stays dirty, and plans no write', async () => {
+  await testAsync('an unparseable legacy draft warns, stays dirty, and plans no write', async () => {
+    // The table never produces this; a draft persisted by the pre-table form still
+    // gets an honest warning instead of being written as a string.
     const sshRow = ROWS.find((row) => row.rowId === 'win-mb-tool-ssh')
     const scope = fakeScope()
     const form = new RowConfigForm(scope, sshRow)
     form.edit('sshShell.hosts', '[{"alias": "prod",]')
     const field = form.project().fields.find((entry) => entry.key === 'sshShell.hosts')
-    assert.equal(field.invalid, true, 'the warning is visible')
+    assert.equal(field.invalid, true)
     assert.equal(field.invalidReason, 'hosts')
-    assert.equal(form.project().invalid, false, 'a warning never blocks the save (A3)')
-    assert.equal(form.project().dirty, true, 'an unparseable draft keeps Save doing something')
+    assert.equal(form.project().dirty, true)
     await form.save()
     assert.equal(scope.calls.length, 0, 'nothing to carry: a string must never be written into an array field')
     form.dispose()
-    // Valid JSON that is not an array is refused the same way.
-    const scope2 = fakeScope()
-    const form2 = new RowConfigForm(scope2, sshRow)
-    form2.edit('sshShell.hosts', '{"alias": "prod"}')
-    assert.equal(form2.project().fields.find((entry) => entry.key === 'sshShell.hosts').invalidReason, 'hosts')
-    await form2.save()
-    assert.equal(scope2.calls.length, 0)
-    form2.dispose()
   })
 
-  await testAsync('an emptied hosts control clears the override instead of writing an empty value', async () => {
+  await testAsync('an emptied legacy hosts control clears the override', async () => {
     const sshRow = ROWS.find((row) => row.rowId === 'win-mb-tool-ssh')
     const scope = fakeScope({ user: { sshShell: { hosts: [{ alias: 'a' }] } } })
     const form = new RowConfigForm(scope, sshRow)
     form.edit('sshShell.hosts', '   ')
-    assert.equal(form.project().fields.find((entry) => entry.key === 'sshShell.hosts').text, '',
-      'a clear renders as the empty box')
     await form.save()
     assert.deepEqual(scope.calls[0].ops, [{ op: 'unset', path: ['sshShell', 'hosts'] }])
     form.dispose()
   })
-
   await testAsync('an emptied text control clears the override, not writes an empty string', async () => {
     const scope = fakeScope({ user: { gitBash: { bashPath: 'C:\\pinned\\bash.exe' } } })
     const form = new RowConfigForm(scope, gitRow)
@@ -8408,6 +8406,9 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     const nodes = []
     const walk = (node) => {
       if (node === undefined || node === null) return
+      // A child may be an ARRAY of elements (a mapped list); React flattens it, so
+      // the stub walker must too.
+      if (Array.isArray(node)) { for (const child of node) walk(child); return }
       if (typeof node === 'string') { nodes.push({ text: node }); return }
       if (typeof node !== 'object') return
       nodes.push(node)
@@ -8416,6 +8417,94 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     walk(root)
     return nodes
   }
+  test('the hosts card renders the TABLE: one fieldset per host, no JSON text, no navigation', () => {
+    const sshRow = ROWS.find((row) => row.rowId === 'win-mb-tool-ssh')
+    const stored = [{ alias: 'prod', host: 'h.example', user: 'u', keyPath: 'k', default: true }]
+    const scope = fakeScope({ value: { sshShell: { hosts: stored } }, user: { sshShell: { hosts: stored } } })
+    const form = new RowConfigForm(scope, sshRow)
+    const state = form.project()
+    const tree = RowConfigCard({ view: 'page', t: (key) => en[key] ?? key, useRowForm: (select) => select(state), edit: () => {}, resetField: () => {}, save: () => {}, discard: () => {} })
+    const editor = flattenTree(tree).find((node) => node.type === HostsEditor)
+    assert.ok(editor !== undefined, 'the ssh page renders the table, not a text box')
+    assert.equal(editor.props.knob.kind, 'hosts')
+    const nodes = flattenTree(HostsEditor(editor.props))
+    assert.equal(nodes.filter((node) => node.type === 'fieldset').length, 1, 'one card per host')
+    assert.equal(nodes.filter((node) => node.type === 'input' && node.props.type === 'radio').length, 1, 'one default radio')
+    assert.equal(nodes.filter((node) => node.type === 'input' && node.props.type === 'checkbox').length, 1, 'acceptNewHostKeys is a checkbox')
+    assert.equal(nodes.filter((node) => node.type === 'select').length, 1, 'approval is a select')
+    const labels = new Set(nodes.filter((node) => node.type === 'label').map((node) => node.props.htmlFor))
+    for (const control of nodes.filter((node) => node.type === 'input' || node.type === 'select' || node.type === 'textarea'))
+      assert.ok(labels.has(control.props.id), 'every control is labelled: ' + control.props.id)
+    assert.equal(nodes.some((node) => node.type === 'a'), false, 'no navigation')
+    const text = nodes.filter((node) => typeof node.text === 'string').map((node) => node.text).join(' ')
+    assert.doesNotMatch(text, /"alias"\s*:/, 'no JSON is visible')
+    form.dispose()
+  })
+
+  test('the hosts table adds and removes rows, staging the array each time', () => {
+    const staged = []
+    const rows = [blankHostRow(), blankHostRow()]
+    const knob = { key: 'sshShell.hosts', rows, rowErrors: hostRowErrors(rows) }
+    const props = { knob, disabled: false, t: (key) => en[key] ?? key, edit: (_key, value) => staged.push(value), resetField: () => {} }
+    flattenTree(HostsEditor(props)).find((node) => node.props?.['data-action'] === 'add').props.onClick()
+    assert.equal(staged.at(-1).length, 3, 'add appends one host')
+    const remove = flattenTree(HostsEditor(props)).find((node) => node.props?.['data-action'] === 'remove' && node.props?.['data-row'] === 0)
+    remove.props.onClick()
+    assert.equal(staged.at(-1).length, 1, 'remove drops the row it belongs to (2 rows -> 1)')
+  })
+
+  test('the default radio is EXCLUSIVE: marking a row clears every other row', () => {
+    const staged = []
+    const rows = [blankHostRow(), blankHostRow()]
+    rows[0].alias = 'one'; rows[1].alias = 'two'; rows[0].default = true
+    const props = { knob: { key: 'sshShell.hosts', rows, rowErrors: hostRowErrors(rows) }, disabled: false, t: (key) => en[key] ?? key, edit: (_key, value) => staged.push(value), resetField: () => {} }
+    const radios = flattenTree(HostsEditor(props)).filter((node) => node.type === 'input' && node.props.type === 'radio')
+    assert.equal(radios.length, 2)
+    radios[1].props.onChange()
+    assert.deepEqual(staged.at(-1).map((host) => host.default === true), [false, true], 'exactly one default')
+    assert.equal(staged.at(-1)[1].alias, 'two')
+  })
+
+  test('the approval select stages trusted vs session', () => {
+    const staged = []
+    const rows = [blankHostRow()]
+    rows[0].alias = 'prod'
+    const props = { knob: { key: 'sshShell.hosts', rows, rowErrors: hostRowErrors(rows) }, disabled: false, t: (key) => en[key] ?? key, edit: (_key, value) => staged.push(value), resetField: () => {} }
+    const select = flattenTree(HostsEditor(props)).find((node) => node.type === 'select')
+    assert.equal(select.props.value, 'session', 'session is the default')
+    select.props.onChange({ target: { value: 'trusted' } })
+    assert.equal(staged.at(-1)[0].approval, 'trusted')
+  })
+
+  test('blank optional fields are CLEARED from the saved object, not stored as empty strings', () => {
+    const staged = []
+    const rows = [blankHostRow()]
+    rows[0].alias = 'prod'
+    rows[0].passphraseEnv = 'SSH_PASS'
+    rows[0].startupCommand = 'source ~/.profile'
+    assert.deepEqual(Object.keys(hostObjectFromRow(rows[0])).sort(), ['alias', 'approval', 'passphraseEnv', 'startupCommand'])
+    const props = { knob: { key: 'sshShell.hosts', rows, rowErrors: hostRowErrors(rows) }, disabled: false, t: (key) => en[key] ?? key, edit: (_key, value) => staged.push(value), resetField: () => {} }
+    const input = flattenTree(HostsEditor(props)).find((node) => node.props?.['data-field'] === 'passphraseEnv')
+    input.props.onChange({ target: { value: '' } })
+    assert.equal(Object.hasOwn(staged.at(-1)[0], 'passphraseEnv'), false, 'a blank optional field is cleared')
+  })
+
+  test('an invalid alias or port shows the field error inline', () => {
+    const rows = [blankHostRow()]
+    rows[0].alias = 'bad alias'
+    rows[0].host = 'h.example'
+    rows[0].port = '70000'
+    rows[0].user = 'u'
+    rows[0].keyPath = 'k'
+    const errors = hostRowErrors(rows)
+    assert.equal(errors[0].alias, 'aliasFormat')
+    assert.equal(errors[0].port, 'portRange')
+    const nodes = flattenTree(HostsEditor({ knob: { key: 'sshShell.hosts', rows, rowErrors: errors }, disabled: false, t: (key) => en[key] ?? key, edit: () => {}, resetField: () => {} }))
+    const warnings = nodes.filter((node) => node.type === 'span' && node.props.role === 'alert').map((node) => node.children[0])
+    assert.ok(warnings.some((text) => /An alias starts with a letter or digit/.test(text)), 'alias error is shown')
+    assert.ok(warnings.some((text) => /1 to 65535/.test(text)), 'port error is shown')
+    assert.equal(warnings.length, 2, 'only the invalid fields are flagged')
+  })
   /**
    * A React stub whose hooks actually work (and re-render manually), for the card's
    * state machine: disabled-while-submitting, re-enabled after a rejected answer, and
