@@ -387,7 +387,7 @@ Unit tests (no network):
 Integration tests (deterministic, in-process): an ssh2.Server fixture with a
 generated host key serves exec and SFTP; the pool connects to it, so channel,
 job, timeout and scp paths run without a real network. A live-host smoke test
-(ubuntu_tx) stays manual.
+(me) stays manual.
 
 Audit updates: field tables (client vs host config), patch rows, exports, tool
 names, terminal enum, and the generated client registry all change and must be

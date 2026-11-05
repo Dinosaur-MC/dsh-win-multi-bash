@@ -49,7 +49,7 @@ The suite also probes the default WSL distribution functionally. When one is mis
 A live round trip needs a reachable host and a credential, so it is never part of the gate:
 
 ```bash
-DSH_AUDIT_SSH_HOST=ubuntu_tx node smoke/prepare.mjs audit
+DSH_AUDIT_SSH_HOST=me node smoke/prepare.mjs audit
 ```
 
 That boots the real `ssh_shell` row with a one-host registry and runs `uname -sr; echo SSH-ROUNDTRIP-OK; exit 7` through the real tool over ssh2. It asserts that the remote exit status **7 propagates**, stdout carries `SSH-ROUNDTRIP-OK`, the structured fact is `sandbox.remote: true`, and this host's managed `$DSH_*` variables do **not** cross the connection. The host comes from `DSH_AUDIT_SSH_HOST` (a `~/.ssh/config` alias or a host name); `DSH_AUDIT_SSH_USER` (default `root`) and `DSH_AUDIT_SSH_KEY` (default `~/.ssh/id_ed25519`) pin the login, so the check adds no configuration of its own. Unset, every offline case still runs and the suite stays fully offline.

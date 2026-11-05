@@ -88,7 +88,7 @@ The detailed documents are maintained in English; this README is the bilingual e
 npm ci                  # once: the pinned 0.2.1-rc.2 dev runtime
 pnpm test               # boot a composition; run real commands; a verdict
 pnpm run test:audit     # the full audit suite
-DSH_AUDIT_SSH_HOST=ubuntu_tx node smoke/prepare.mjs audit   # optional live SSH
+DSH_AUDIT_SSH_HOST=me node smoke/prepare.mjs audit   # optional live SSH
 ```
 
 Both entries are development tools: the published tarball ships no `smoke/`. `pnpm test` fails on a missing tool, a wrong description, a lost `ctx.shell` seat or a failed command; the audit announces and counts its skips.

@@ -88,7 +88,7 @@ dsh plugin --profile web remove dsh-win-multi-bash                 # 卸载
 npm ci                  # 一次：安装钉定的 0.2.1-rc.2 开发运行时
 pnpm test               # 启动真实组合、跑真实命令、失败即判据
 pnpm run test:audit     # 完整审计套件
-DSH_AUDIT_SSH_HOST=ubuntu_tx node smoke/prepare.mjs audit   # 可选：live SSH 往返
+DSH_AUDIT_SSH_HOST=me node smoke/prepare.mjs audit   # 可选：live SSH 往返
 ```
 
 两个入口都是开发工具：发布 tarball 不包含 `smoke/`。`pnpm test` 在工具缺失、描述错误、`ctx.shell` 席位丢失或任一命令失败时退出非零；审计会声明并统计 skip。

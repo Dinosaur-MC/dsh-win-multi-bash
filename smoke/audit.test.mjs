@@ -1886,10 +1886,10 @@ console.log('\n[A] unit: factory workdir drive-form normalization')
   // `spawn` as the child's cwd, so an untranslated form fails with the
   // misleading `spawn <shell> ENOENT`.
   test('toNativeWorkdir: MSYS drive form becomes a native path', () => {
-    assert.equal(toNativeWorkdir('/c/Users/Dinos'), 'C:\\Users\\Dinos')
+    assert.equal(toNativeWorkdir('/c/Users/me'), 'C:\\Users\\me')
   })
   test('toNativeWorkdir: WSL automount form becomes a native path', () => {
-    assert.equal(toNativeWorkdir('/mnt/c/Users/Dinos'), 'C:\\Users\\Dinos')
+    assert.equal(toNativeWorkdir('/mnt/c/Users/me'), 'C:\\Users\\me')
   })
   test('toNativeWorkdir: a bare drive root keeps its trailing separator', () => {
     assert.equal(toNativeWorkdir('/mnt/c'), 'C:\\')
@@ -2490,7 +2490,7 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
 
   test('a target can never be read as an option, and a port is bounded', () => {
     assert.equal(assertSshTarget('host.example', 'sshShell.sshHost'), 'host.example')
-    assert.equal(assertSshTarget('ubuntu_tx', 'sshShell.sshHost'), 'ubuntu_tx')
+    assert.equal(assertSshTarget('me', 'sshShell.sshHost'), 'me')
     // The classic injection: an option smuggled in through the target.
     assert.throws(() => assertSshTarget('-oProxyCommand=calc', 'sshShell.sshHost'), /must not begin with \"-\"/)
     assert.throws(() => assertSshTarget('a b', 'sshShell.sshHost'), /whitespace or a control character/)
@@ -2964,7 +2964,7 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     }
     // OPT-IN: a real round trip needs a reachable host and a credential, so it is
     // never part of the gate. Run it with
-    //   DSH_AUDIT_SSH_HOST=ubuntu_tx node smoke/prepare.mjs audit
+    //   DSH_AUDIT_SSH_HOST=me node smoke/prepare.mjs audit
     const liveHost = process.env.DSH_AUDIT_SSH_HOST
     if (liveHost === undefined || liveHost.length === 0) {
       skip('  … skipping the live SSH round trip: set DSH_AUDIT_SSH_HOST to run it')
@@ -7734,7 +7734,7 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
     }
     // OPT-IN, like the SSH row's own live round trip: a real session needs a reachable host
     // and a credential, so it is NEVER part of the gate. Run it with
-    //   DSH_AUDIT_SSH_HOST=ubuntu_tx node smoke/prepare.mjs audit
+    //   DSH_AUDIT_SSH_HOST=me node smoke/prepare.mjs audit
     // This is the only coverage of the PERSISTENT remote form — the form that exists so a
     // fingerprint, a password or a passphrase can be answered at all (a remote tty).
     const liveSshHost = process.env.DSH_AUDIT_SSH_HOST
