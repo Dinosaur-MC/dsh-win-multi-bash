@@ -8276,7 +8276,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
   const client = registrations[0].factory((id) => {
     if (id === 'react') return { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }), useState: (initial) => [initial, () => {}], useRef: (initial) => ({ current: initial }) }
     if (id === '@deepseek-ai/dsh-client-ui-primitives')
-      return { SettingsForm: 'SettingsForm', SettingsValueField: 'SettingsValueField', Checkbox: 'Checkbox', SegmentedControl: 'SegmentedControl', Button: 'Button', DisclosureRow: 'DisclosureRow', TextShimmer: 'TextShimmer', IconApiOutlineRegular: 'IconApiOutlineRegular', IconInspectOutlineRegular: 'IconInspectOutlineRegular', TerminalBlock: 'TerminalBlock' }
+      return { SettingsForm: 'SettingsForm', SettingsValueField: 'SettingsValueField', Checkbox: 'Checkbox', SegmentedControl: 'SegmentedControl', Button: 'Button', StateDot: 'StateDot', DisclosureRow: 'DisclosureRow', TextShimmer: 'TextShimmer', IconApiOutlineRegular: 'IconApiOutlineRegular', IconInspectOutlineRegular: 'IconInspectOutlineRegular', TerminalBlock: 'TerminalBlock' }
     throw new Error(`unexpected client require: "${id}"`)
   })
   const internals = clientInternals
@@ -9218,7 +9218,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
       registrations[0].factory((id) => {
         if (id === 'react') return statefulReact
         if (id === '@deepseek-ai/dsh-client-ui-primitives')
-          return { SettingsForm: 'SettingsForm', SettingsValueField: 'SettingsValueField', Checkbox: 'Checkbox', SegmentedControl: 'SegmentedControl', Button: 'Button', DisclosureRow: 'DisclosureRow', TextShimmer: 'TextShimmer', IconApiOutlineRegular: 'IconApiOutlineRegular', IconInspectOutlineRegular: 'IconInspectOutlineRegular', TerminalBlock: 'TerminalBlock' }
+          return { SettingsForm: 'SettingsForm', SettingsValueField: 'SettingsValueField', Checkbox: 'Checkbox', SegmentedControl: 'SegmentedControl', Button: 'Button', StateDot: 'StateDot', DisclosureRow: 'DisclosureRow', TextShimmer: 'TextShimmer', IconApiOutlineRegular: 'IconApiOutlineRegular', IconInspectOutlineRegular: 'IconInspectOutlineRegular', TerminalBlock: 'TerminalBlock' }
         throw new Error(`unexpected client require: "${id}"`)
       })
     }
@@ -9474,8 +9474,8 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.equal(sshApprovalMatch(settled), null, 'a settled pending is not claimed')
     const nodes = flattenTree(SshApprovalCard({ matched: settled, t: (key) => en[key] ?? key }))
     const buttons = nodes.filter((node) => node.type === 'Button')
-    assert.equal(buttons.length, 2)
-    assert.ok(buttons.every((node) => node.props.disabled === true), 'both buttons are disabled once settled')
+    assert.equal(buttons.length, 3)
+    assert.ok(buttons.every((node) => node.props.disabled === true), 'every action is disabled once settled')
     const text = nodes.filter((node) => typeof node.text === 'string').map((node) => node.text).join(' ')
     assert.match(text, /no longer pending/)
     assert.doesNotMatch(text, /could not be delivered/, 'a settled request is not a failed one')
@@ -9490,19 +9490,42 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     }
     const nodes = flattenTree(SshApprovalCard({ matched: pending, t: (key) => en[key] ?? key }))
     const buttons = nodes.filter((node) => node.type === 'Button')
-    assert.equal(buttons.length, 2, 'allow + reject, no third choice')
-    assert.deepEqual(buttons.map((node) => node.children[0]), ['Allow for this session', 'Reject'])
-    assert.equal(buttons.every((node) => node.props.disabled === false), true, 'both are live while the request is pending')
+    assert.equal(buttons.length, 3, 'reject + allow once + the added session button')
+    assert.deepEqual(buttons.map((node) => node.children[0]), ['Reject', 'Allow once', 'Allow for this session'])
+    assert.deepEqual(buttons.map((node) => node.props.variant), ['outline', 'outline', 'primary'], 'the session grant is the primary action')
+    assert.equal(buttons.every((node) => node.props.disabled === false), true, 'every action is live while the request is pending')
     const text = nodes.filter((node) => typeof node.text === 'string').map((node) => node.text).join(' ')
     assert.match(text, /host "prod" \(deploy@10\.0\.0\.9:22\)/, 'the request sentence names the alias and the target')
     assert.match(text, /THIS session only/)
     buttons[0].props.onClick()
-    assert.deepEqual(answered, ['allowed-once'], 'the allow button answers allowed-once')
+    buttons[1].props.onClick()
+    buttons[2].props.onClick()
+    assert.deepEqual(answered, ['rejected', 'allowed-once', 'allowed-once'], 'the added button sends the same session-grant outcome')
+  })
+
+  test('the approval card keeps the platform structure, classes and keyboard contract', () => {
+    const { SshApprovalCard, en } = internals
+    const answered = []
+    const pending = { kind: 'approval', toolName: 'ssh_shell', answerable: true, answer: (outcome) => { answered.push(outcome); return Promise.resolve() }, displayReason: { en: 'ssh_shell: allow this session to use host "prod" (deploy@10.0.0.9:22)?' } }
+    const nodes = flattenTree(SshApprovalCard({ matched: pending, t: (key) => en[key] ?? key }))
+    const classes = new Set(nodes.map((node) => node.props?.className).filter((value) => typeof value === 'string'))
+    for (const name of ['dshwmb-ap-root', 'dshwmb-ap-card', 'dshwmb-ap-strip', 'dshwmb-ap-body', 'dshwmb-ap-heading', 'dshwmb-ap-headline', 'dshwmb-ap-description', 'dshwmb-ap-action-row', 'dshwmb-ap-reject'])
+      assert.ok(classes.has(name), 'the standard card structure carries ' + name)
+    const text = nodes.map((node) => (typeof node.text === 'string' ? node.text : '')).concat(nodes.map((node) => node.props?.['aria-label'] ?? '')).join(' ')
+    for (const label of ['Waiting for approval', 'Approval details', 'Reject', 'Allow once', 'Allow for this session'])
+      assert.match(text, new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'label ' + label)
+    const dot = nodes.find((node) => node.type === 'StateDot')
+    assert.equal(dot.props.state, 'warning', 'the strip carries the warning dot')
+    // Enter allows once, Escape rejects (the platform card keyboard contract).
+    const root = nodes.find((node) => node.props?.className === 'dshwmb-ap-root')
+    root.props.onKeyDown({ key: 'Enter', defaultPrevented: false, preventDefault: () => {}, stopPropagation: () => {} })
+    root.props.onKeyDown({ key: 'Escape', defaultPrevented: false, preventDefault: () => {}, stopPropagation: () => {} })
+    assert.deepEqual(answered, ['allowed-once', 'rejected'])
   })
 
   test('the card disables both buttons while the answer is submitting', () => {
     const react = makeStatefulReact()
-    const seam = makeClientInstance(react, { Button: 'Button' })
+    const seam = makeClientInstance(react, { Button: 'Button', StateDot: 'StateDot' })
     let settleAnswer
     const pending = { kind: 'approval', toolName: 'ssh_shell', answerable: true, answer: () => new Promise((resolve) => { settleAnswer = resolve }) }
     const props = { matched: pending, t: (key) => seam.en[key] ?? key }
@@ -9511,13 +9534,14 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     flattenTree(tree).find((node) => node.type === 'Button').props.onClick()
     tree = react.mount()
     const buttons = flattenTree(tree).filter((node) => node.type === 'Button')
-    assert.ok(buttons.every((node) => node.props.disabled === true), 'submitting disables both buttons')
+    assert.equal(buttons.length, 3)
+    assert.ok(buttons.every((node) => node.props.disabled === true), 'submitting disables every action')
     settleAnswer('allowed-once')
   })
 
   test('a REJECTED answer re-enables the card instead of reporting it settled', async () => {
     const react = makeStatefulReact()
-    const seam = makeClientInstance(react, { Button: 'Button' })
+    const seam = makeClientInstance(react, { Button: 'Button', StateDot: 'StateDot' })
     const answered = []
     const pending = { kind: 'approval', toolName: 'ssh_shell', answerable: true, answer: (outcome) => { answered.push(outcome); return Promise.reject(new Error('transport died')) } }
     const props = { matched: pending, t: (key) => seam.en[key] ?? key }
@@ -9531,12 +9555,12 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     const text = flattenTree(tree).filter((node) => typeof node.text === 'string').map((node) => node.text).join(' ')
     assert.match(text, /could not be delivered/, 'the failure is visible')
     assert.doesNotMatch(text, /no longer pending/, 'a failed submit is NOT settled')
-    assert.deepEqual(answered, ['allowed-once'])
+    assert.deepEqual(answered, ['rejected'])
   })
 
   test('a SYNCHRONOUS throw from answer re-enables the card and shows the failure', async () => {
     const react = makeStatefulReact()
-    const seam = makeClientInstance(react, { Button: 'Button' })
+    const seam = makeClientInstance(react, { Button: 'Button', StateDot: 'StateDot' })
     const answered = []
     const pending = { kind: 'approval', toolName: 'ssh_shell', answerable: true, answer: (outcome) => { answered.push(outcome); throw new Error('sync boom') } }
     const props = { matched: pending, t: (key) => seam.en[key] ?? key }
@@ -9550,18 +9574,18 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.ok(buttons.every((node) => node.props.disabled === false), 'the call is still pending, so the buttons come back')
     const text = flattenTree(tree).filter((node) => typeof node.text === 'string').map((node) => node.text).join(' ')
     assert.match(text, /could not be delivered/, 'the synchronous failure is visible')
-    assert.deepEqual(answered, ['allowed-once'])
+    assert.deepEqual(answered, ['rejected'], 'the first action is Reject now, and its throw is still handled')
   })
   test('a RESOLVED answer settles the card and ignores later clicks', async () => {
     const react = makeStatefulReact()
-    const seam = makeClientInstance(react, { Button: 'Button' })
+    const seam = makeClientInstance(react, { Button: 'Button', StateDot: 'StateDot' })
     const answered = []
     const pending = { kind: 'approval', toolName: 'ssh_scp', answerable: true, answer: (outcome) => { answered.push(outcome); return Promise.resolve() } }
     const props = { matched: pending, t: (key) => seam.en[key] ?? key }
     react.begin(() => seam.SshApprovalCard(props))
     let tree = react.mount()
     const buttons = flattenTree(tree).filter((node) => node.type === 'Button')
-    buttons[0].props.onClick()
+    buttons[2].props.onClick()
     await new Promise((resolve) => setTimeout(resolve, 0))
     tree = react.mount()
     const after = flattenTree(tree).filter((node) => node.type === 'Button')
@@ -9603,14 +9627,14 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.equal(composer.options.select({ pendingInteraction: { kind: 'approval', toolName: 'ui-other' } }), null, 'other approvals fall through')
     const injected = composer.options.inject()
     const nodes = flattenTree(composer.component({ matched: pending, t: (key) => internals.en[key] ?? key, resolver: injected.resolver }))
-    assert.equal(nodes.filter((node) => node.type === 'Button').length, 2, 'the card renders through the registered entry')
+    assert.equal(nodes.filter((node) => node.type === 'Button').length, 3, 'the card renders through the registered entry (reject + once + session)')
   })
   test('a deployment without the card primitives gets no row at all, not a broken one', () => {
     const slotRegistrations = []
     const bare = registrations[0].factory((id) => {
       if (id === 'react') return { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }), useState: (initial) => [initial, () => {}], useRef: (initial) => ({ current: initial }) }
       if (id === '@deepseek-ai/dsh-client-ui-primitives')
-        return { SettingsForm: 'SettingsForm', SettingsValueField: 'SettingsValueField', Checkbox: 'Checkbox', SegmentedControl: 'SegmentedControl', Button: 'Button' }
+        return { SettingsForm: 'SettingsForm', SettingsValueField: 'SettingsValueField', Checkbox: 'Checkbox', SegmentedControl: 'SegmentedControl', Button: 'Button', StateDot: 'StateDot' }
       throw new Error('unexpected client require: "' + id + '"')
     })
     assert.doesNotThrow(() => bare.apply({
