@@ -8457,6 +8457,39 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     return seam
   }
 
+  test('the SSH approval matcher claims ONLY ssh_shell / ssh_scp pending approvals', async () => {
+    const { sshApprovalMatch, APPROVAL_GATED_TOOL_NAMES } = internals
+    // The generated list IS the host registry's gate list: a rename reddens here.
+    const registry = await import(libUrl('tool-bash', 'types', 'registry.js'))
+    assert.deepEqual(APPROVAL_GATED_TOOL_NAMES, registry.APPROVAL_GATED_TOOL_NAMES)
+    assert.deepEqual(APPROVAL_GATED_TOOL_NAMES, ['ssh_shell', 'ssh_scp'])
+    const pending = (over = {}) => ({ kind: 'approval', toolName: 'ssh_shell', answerable: true, answer: async () => {}, ...over })
+    const shell = pending({ toolName: 'ssh_shell' })
+    const scp = pending({ toolName: 'ssh_scp' })
+    assert.equal(sshApprovalMatch(shell), shell, 'ssh_shell is claimed')
+    assert.equal(sshApprovalMatch(scp), scp, 'ssh_scp is claimed')
+    assert.equal(sshApprovalMatch(pending({ toolName: 'git_bash' })), null, 'another tool falls through to the platform card')
+    assert.equal(sshApprovalMatch(pending({ toolName: 'terminal' })), null)
+    assert.equal(sshApprovalMatch(pending({ kind: 'question' })), null, 'a non-approval interaction falls through')
+    assert.equal(sshApprovalMatch(pending({ answerable: false })), null, 'a settled request falls through')
+    assert.equal(sshApprovalMatch({ kind: 'approval', toolName: 'ssh_shell' }), null, 'no answer() means it is not answerable here')
+    assert.equal(sshApprovalMatch(undefined), null)
+    assert.equal(sshApprovalMatch(null), null)
+    assert.equal(sshApprovalMatch('ssh_shell'), null, 'a primitive is not a pending approval')
+  })
+
+  test('a settled request renders no live buttons and keeps the platform card', () => {
+    const { sshApprovalMatch, SshApprovalCard, en } = internals
+    const settled = { kind: 'approval', toolName: 'ssh_scp', answerable: false, answer: async () => {}, displayReason: { en: 'allow?' } }
+    assert.equal(sshApprovalMatch(settled), null, 'a settled pending is not claimed')
+    const nodes = flattenTree(SshApprovalCard({ matched: settled, t: (key) => en[key] ?? key }))
+    const buttons = nodes.filter((node) => node.type === 'Button')
+    assert.equal(buttons.length, 2)
+    assert.ok(buttons.every((node) => node.props.disabled === true), 'both buttons are disabled once settled')
+    const text = nodes.filter((node) => typeof node.text === 'string').map((node) => node.text).join(' ')
+    assert.match(text, /no longer pending/)
+    assert.doesNotMatch(text, /could not be delivered/, 'a settled request is not a failed one')
+  })
   test('the SSH approval card labels both choices and sends the pending request its own answer', () => {
     const { SshApprovalCard, en } = internals
     const answered = []
