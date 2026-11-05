@@ -4916,6 +4916,49 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
         assert.equal(fixture.state.disconnects, 3, 'every retired connection was actually closed')
       } finally { pool.dispose(); await fixture.close() }
     })
+    await testAsync('repeated OPEN stalls release every lease and close every retired connection', async () => {
+      const fixture = await startServer({ holdOpen: true })
+      const { pool, runner } = runnerFor(fixture)
+      try {
+        const local = join(localRoot, 'hold.txt')
+        writeFileSync(local, 'x')
+        for (let attempt = 1; attempt <= 2; attempt += 1) {
+          const result = await runner.upload({ host: hostEntry(fixture.port), localPath: local, remotePath: '/hold.txt', timeoutMs: 100 })
+          assert.equal(result.ok, false)
+          assert.equal(result.error.phase, 'sftp', 'the session existed, so the phase is sftp')
+          assert.equal(pool.leases.size, 0, 'attempt ' + attempt + ': the lease was handed back')
+          assert.equal(pool.size(), 0, 'attempt ' + attempt + ': the stalled client was retired, not accumulated')
+          assert.equal(fixture.state.connections, attempt, 'each attempt dialled its own connection')
+        }
+        await waitFor(() => fixture.state.disconnects === 2, 2000)
+        assert.equal(fixture.state.disconnects, 2, 'both retired connections were closed')
+        assert.equal(fixture.state.sftpOpened, 2, 'each attempt opened an SFTP session')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('an OPEN stall does not kill a command sharing the client', async () => {
+      const fixture = await startServer({ holdOpen: true, execDelayMs: 400 })
+      const { SshShellExecutor } = await import(libUrl('ssh-shell', 'index.js'))
+      const pool = new SshPool({ knownHostsPath: knownHostsFor(fixture.port) })
+      const config = SshShellExecutor.Config({ hosts: [hostEntry(fixture.port)], timeoutMs: 5000, maxTimeoutMs: 60000 })
+      const executor = Object.assign(Object.create(SshShellExecutor.prototype), {
+        config, poolInstance: pool, internals: {}, processFacts: new Map(), warnedAbout: new Set(),
+        ctx: { sandboxPolicy: { defaultMode: 'workspace-write', resolve: () => ({ mode: 'workspace-write', workspaceRoot: localRoot }) }, logger: { warn: () => {}, debug: () => {} } },
+      })
+      try {
+        const command = (async () => (await executor.execute(executor.resolve({ command: 'true', timeoutMs: 5000 }))).result())()
+        const local = join(localRoot, 'hold-shared.txt')
+        writeFileSync(local, 'x')
+        const transfer = await executor.transferRunner().upload({ host: hostEntry(fixture.port), localPath: local, remotePath: '/hold-shared.txt', timeoutMs: 100 })
+        assert.equal(transfer.ok, false)
+        assert.equal(transfer.error.phase, 'sftp')
+        const result = await command
+        assert.equal(result.exitCode, 0, 'the command sharing the retired client finished normally')
+        assert.equal(fixture.state.connections, 1, 'one connection served both')
+        await waitFor(() => pool.leases.size === 0, 2000)
+        assert.equal(pool.leases.size, 0, 'every lease was handed back')
+      } finally { pool.dispose(); await fixture.close() }
+    })
     await testAsync('two operations reuse ONE pooled connection and one SFTP session each', async () => {
       const fixture = await startServer()
       const { pool, runner } = runnerFor(fixture)
