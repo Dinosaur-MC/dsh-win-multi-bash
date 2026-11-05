@@ -57,3 +57,15 @@ That boots the real `ssh_shell` row with a one-host registry and runs `uname -sr
 ## What `smoke/prepare.mjs` does
 
 Both entries run the same Node bootstrap: it links the runtime scope in force (the checkout's pinned `node_modules`, or the live profile when the checkout has none) into `smoke/node_modules`, refusing to touch anything that is not already the expected link, writes its fixtures under `.temp/smoke/`, and removes only the links it created. The `bashPath` it pins comes from the plugin's own resolver in `lib/`, never a hardcoded path.
+## Manual 0.8.0 boot gate (isolated DSH)
+
+Run on 2026-11-06 against `0.2.2-rc.1` in an isolated `DSH_HOME` with the local workspace installed into the profile, a local Ollama provider (`qwen3.6-uncensored:35b_q5kp`), and the real `me` host in the registry (`approval: session`, key auth). No local sshd was installed, so the gate used the known remote host; every other requirement of the Plan 4 gate held. The isolated instance ran on its own port/token, not the user's running profile.
+
+- **Dedicated SSH card (allowed).** A real agent turn called `ssh_shell` for `me`; the plugin's card rendered as a copy of the platform approval card (same root/card/strip/body/action-row structure and tokens, `StateDot`, heading/description) with `拒绝` / `允许一次` / `本次会话允许`. Clicking the added session button printed `GATE-ALLOW2` from the host.
+- **Rejected.** A fresh `me2` request rendered a new card; `拒绝` made the tool fail with `ssh: host "me2" (...) is not authorized for this session: the request was rejected`.
+- **Sequential approvals.** The second request after the first allowed answer rendered a fresh card with enabled buttons, not a settled or stale one; state is per pending id, not per composer instance.
+- **Non-SSH approval.** A `plugin_manager` call requiring `danger-full-access` rendered the platform's standard approval card (`拒绝` / `允许一次`), not the SSH card. The SSH matcher claims only `ssh_shell`/`ssh_scp`.
+- **Synchronous `pending.answer` throw.** In the real page the pending object was located through the React fiber and its `answer` replaced with a synchronous throw. Clicking `本次会话允许` restored all three buttons (`disabled=false`) and showed the failure alert (`答复未能送达。该请求仍在等待——请重试，或改用标准审批卡答复。`); the card did not deadlock.
+
+The throw injection is test-only browser-page instrumentation; no platform package or shipped file was modified. The pre-fix run of the same check left all buttons disabled with no alert, which is why the synchronous-answer guard is part of 0.8.0.
+
