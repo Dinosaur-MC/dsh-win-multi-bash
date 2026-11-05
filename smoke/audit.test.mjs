@@ -5981,6 +5981,60 @@ console.log('\n[A] unit: the ssh session authorization gate (S12)')
     assert.deepEqual(await owner, { granted: true }, 'the owner still settles normally')
   })
 
+  await testAsync('an owner CANCELLED answer is not <mine>: the waiter asks for itself', async () => {
+    const resolvers = []
+    const calls = []
+    const gate = createApprovalGate({
+      request: (request) => { calls.push(request); return new Promise((resolve) => resolvers.push(resolve)) },
+      logger: { info: () => {}, warn: () => {} },
+      setTimeout: () => { throw new Error('no timer expected') },
+      clearTimeout: () => {},
+    })
+    const session = fakeSession()
+    const agent = fakeAgent(session)
+    const host = hostEntry({ approvalTimeoutMs: 0 })
+    const owner = gate.authorize({ session, agent, host, toolName: 'ssh_shell', callId: 'owner-cancelled' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const waiter = gate.authorize({ session, agent, host, toolName: 'ssh_scp', callId: 'waiter-asks' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(calls.length, 1, 'one in-flight ask first')
+    resolvers[0]('cancelled')
+    await assert.rejects(owner, (error) => error.outcome === 'cancelled' && error.phase === 'approval')
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(calls.length, 2, 'the owner\'s cancellation does NOT cancel the waiter: it asks its OWN approval')
+    resolvers[1]('allowed-once')
+    assert.deepEqual(await waiter, { granted: true }, 'the waiter settles by its own answer')
+  })
+
+  await testAsync('a waiter behind an allowed-once-on-abort owner still times out with ONE prompt', async () => {
+    let fire
+    const calls = []
+    const gate = createApprovalGate({
+      request: (request) => {
+        calls.push(request)
+        return new Promise((resolve) => { request.signal?.addEventListener?.('abort', () => resolve('allowed-once'), { once: true }) })
+      },
+      logger: { info: () => {}, warn: () => {} },
+      setTimeout: (callback) => { fire = callback; return 'timer-grant-w' },
+      clearTimeout: () => {},
+    })
+    const session = fakeSession()
+    const agent = fakeAgent(session)
+    const host = hostEntry({ approvalTimeoutMs: 1800 })
+    const first = gate.authorize({ session, agent, host, toolName: 'ssh_shell', callId: 'grant-abort-a' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const second = gate.authorize({ session, agent, host, toolName: 'ssh_scp', callId: 'grant-abort-b' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(calls.length, 1)
+    fire()
+    const settled = await Promise.allSettled([first, second])
+    for (const result of settled) {
+      assert.equal(result.status, 'rejected')
+      assert.equal(result.reason.outcome, 'timeout')
+      assert.match(result.reason.message, /approval timed out after 1800 ms/)
+    }
+    assert.equal(calls.length, 1, 'the waiter never gets a second prompt after a timeout')
+  })
   await testAsync('the timeout timer is cleared on success and on a non-timeout rejection', async () => {
     const clears = []
     let nextId = 0
