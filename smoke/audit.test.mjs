@@ -4156,7 +4156,7 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
   const ssh2 = (await import('ssh2')).default ?? (await import('ssh2'))
   // ssh2's package root does not export the SFTP protocol constants (they live in
   // its internal SFTP module); these are the stable wire numbers the fixture needs.
-  const SFTP_STATUS = { OK: 0, EOF: 1, NO_SUCH_FILE: 2, FAILURE: 4 }
+  const SFTP_STATUS = { OK: 0, EOF: 1, NO_SUCH_FILE: 2, PERMISSION_DENIED: 3, FAILURE: 4 }
   const SFTP_OPEN = { READ: 0x1, WRITE: 0x2, APPEND: 0x4, CREAT: 0x8, TRUNC: 0x10 }
   const { ScpRunner } = await import(libUrl('ssh-shell', 'scp.js'))
   const { SshPool } = await import(libUrl('ssh-shell', 'pool.js'))
@@ -4192,9 +4192,11 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
   /**
    * Start the SFTP fixture.
    * @param options.holdOpen - never answer OPEN, so a client waits until it gives up.
+   * @param options.ignoreSubsystem - never accept/reject the sftp subsystem request.
+   * @param options.deny - remote paths answered with PERMISSION_DENIED.
    */
-  const startServer = async ({ holdOpen = false } = {}) => {
-    const state = { connections: 0, sftpSessions: 0 }
+  const startServer = async ({ holdOpen = false, ignoreSubsystem = false, deny = [] } = {}) => {
+    const state = { connections: 0, sftpOpened: 0, sftpClosed: 0 }
     const server = new ssh2.Server({ hostKeys: [hostKey.private] }, (client) => {
       state.connections += 1
       client.on('error', () => {})
@@ -4203,8 +4205,12 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
         client.on('session', (accept) => {
           const session = accept()
           session.on('sftp', (acceptSftp) => {
-            state.sftpSessions += 1
+            // The subsystem request is simply dropped: the client must still end at its
+            // own deadline, before any SFTP session exists.
+            if (ignoreSubsystem) return
+            state.sftpOpened += 1
             const sftp = acceptSftp()
+            session.on('close', () => { state.sftpClosed += 1 })
             const handles = new Map()
             let next = 0
             const open = (value) => {
@@ -4216,6 +4222,7 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
             const lookup = (handle) => handle.length === 4 ? handles.get(handle.readUInt32BE(0)) : undefined
             sftp.on('OPEN', (reqid, filename, flags) => {
               if (holdOpen) return
+              if (deny.includes(filename)) return sftp.status(reqid, SFTP_STATUS.PERMISSION_DENIED)
               const { OPEN_MODE, STATUS_CODE } = { OPEN_MODE: SFTP_OPEN, STATUS_CODE: SFTP_STATUS }
               const wantsWrite = (flags & (OPEN_MODE.WRITE | OPEN_MODE.APPEND | OPEN_MODE.CREAT | OPEN_MODE.TRUNC)) !== 0
               try {
@@ -4277,6 +4284,7 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
               sftp.status(reqid, SFTP_STATUS.OK)
             })
             const statHandler = (reqid, path) => {
+              if (deny.includes(path)) return sftp.status(reqid, SFTP_STATUS.PERMISSION_DENIED)
               try {
                 sftp.attrs(reqid, attrsOf(fs.statSync(localOf(path))))
               }
@@ -4342,6 +4350,15 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
     const port = server.address().port
     return { port, state, close: () => new Promise((resolve) => server.close(resolve)) }
+  }
+  /** Poll a cheap predicate (the fixture's counters) for a bounded time. */
+  const waitFor = async (predicate, timeoutMs = 2000) => {
+    const until = Date.now() + timeoutMs
+    while (Date.now() < until) {
+      if (predicate()) return true
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    return false
   }
   const runnerFor = (fixture, logger) => {
     const pool = new SshPool({ knownHostsPath: knownHostsFor(fixture.port) })
@@ -4467,6 +4484,122 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
       } finally { pool.dispose(); await fixture.close() }
     })
 
+    await testAsync('a subsystem request that is never answered times out at the deadline', async () => {
+      const fixture = await startServer({ ignoreSubsystem: true })
+      const { pool, runner } = runnerFor(fixture)
+      try {
+        const local = join(localRoot, 'sub.txt')
+        writeFileSync(local, 'x')
+        const started = Date.now()
+        const result = await runner.upload({ host: hostEntry(fixture.port), localPath: local, remotePath: '/sub.txt', timeoutMs: 200 })
+        const elapsed = Date.now() - started
+        assert.equal(result.ok, false)
+        assert.equal(result.error.phase, 'connect', 'no SFTP session ever existed')
+        assert.match(result.error.message, /timed out after 200 ms/)
+        assert.ok(elapsed < 3000, 'the deadline ended the call, not the socket: ' + elapsed + ' ms')
+        assert.equal(fixture.state.sftpOpened, 0, 'nothing was opened, so nothing can leak')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('a caller abort in the same window is aborted and opens no session', async () => {
+      const fixture = await startServer({ ignoreSubsystem: true })
+      const { pool, runner } = runnerFor(fixture)
+      try {
+        const local = join(localRoot, 'abort-window.txt')
+        writeFileSync(local, 'x')
+        const controller = new AbortController()
+        setTimeout(() => controller.abort(), 50)
+        const result = await runner.upload({ host: hostEntry(fixture.port), localPath: local, remotePath: '/abort-window.txt', timeoutMs: 30000, signal: controller.signal })
+        assert.equal(result.ok, false)
+        assert.equal(result.error.aborted, true)
+        assert.equal(result.error.phase, 'connect')
+        assert.equal(fixture.state.sftpOpened, 0)
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('sessions are closed after a success, an OPEN stall and an abort alike', async () => {
+      const success = await startServer()
+      const successPool = new SshPool({ knownHostsPath: knownHostsFor(success.port) })
+      const successRunner = new ScpRunner({ pool: successPool })
+      try {
+        const local = join(localRoot, 'close-me.txt')
+        writeFileSync(local, 'abc')
+        await successRunner.upload({ host: hostEntry(success.port), localPath: local, remotePath: '/close-me.txt', timeoutMs: 5000 })
+        await waitFor(() => success.state.sftpClosed === 1, 2000)
+        assert.equal(success.state.sftpOpened, 1)
+        assert.equal(success.state.sftpClosed, 1, 'the successful session was closed')
+      } finally { successPool.dispose(); await success.close() }
+
+      const stalled = await startServer({ holdOpen: true })
+      const stalledPool = new SshPool({ knownHostsPath: knownHostsFor(stalled.port) })
+      const stalledRunner = new ScpRunner({ pool: stalledPool })
+      try {
+        const local = join(localRoot, 'stall-close.txt')
+        writeFileSync(local, 'x')
+        await stalledRunner.upload({ host: hostEntry(stalled.port), localPath: local, remotePath: '/stall-close.txt', timeoutMs: 200 })
+        await waitFor(() => stalled.state.sftpClosed === 1, 2000)
+        assert.equal(stalled.state.sftpOpened, 1)
+        assert.equal(stalled.state.sftpClosed, 1, 'the timed-out session was closed')
+      } finally { stalledPool.dispose(); await stalled.close() }
+
+      const aborted = await startServer({ holdOpen: true })
+      const abortedPool = new SshPool({ knownHostsPath: knownHostsFor(aborted.port) })
+      const abortedRunner = new ScpRunner({ pool: abortedPool })
+      try {
+        const local = join(localRoot, 'abort-close.txt')
+        writeFileSync(local, 'x')
+        const controller = new AbortController()
+        setTimeout(() => controller.abort(), 50)
+        await abortedRunner.upload({ host: hostEntry(aborted.port), localPath: local, remotePath: '/abort-close.txt', timeoutMs: 30000, signal: controller.signal })
+        await waitFor(() => aborted.state.sftpClosed === 1, 2000)
+        assert.equal(aborted.state.sftpOpened, 1)
+        assert.equal(aborted.state.sftpClosed, 1, 'the aborted session was closed')
+      } finally { abortedPool.dispose(); await aborted.close() }
+    })
+
+    await testAsync('a remote permission failure is a structured error naming the ssh2 reason', async () => {
+      const fixture = await startServer({ deny: ['/denied.bin'] })
+      const { pool, runner } = runnerFor(fixture)
+      try {
+        const download = await runner.download({ host: hostEntry(fixture.port), localPath: join(localRoot, 'denied.bin'), remotePath: '/denied.bin', timeoutMs: 5000 })
+        assert.equal(download.ok, false)
+        assert.equal(download.error.phase, 'sftp')
+        assert.equal(download.error.alias, 'scp-fixture')
+        assert.match(download.error.message, /Permission denied/i, 'the ssh2 status text is kept: ' + download.error.message)
+        const local = join(localRoot, 'denied-up.bin')
+        writeFileSync(local, 'x')
+        const upload = await runner.upload({ host: hostEntry(fixture.port), localPath: local, remotePath: '/denied.bin', timeoutMs: 5000 })
+        assert.equal(upload.ok, false)
+        assert.match(upload.error.message, /Permission denied/i, 'an OPEN denial is reported too: ' + upload.error.message)
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('recursive transfers preserve EMPTY directories on both sides', async () => {
+      const fixture = await startServer()
+      const { pool, runner } = runnerFor(fixture)
+      try {
+        const tree = join(localRoot, 'with-empty')
+        fs.mkdirSync(join(tree, 'empty'), { recursive: true })
+        fs.mkdirSync(join(tree, 'sub', 'empty-deep'), { recursive: true })
+        writeFileSync(join(tree, 'a.txt'), 'a')
+        const up = await runner.upload({ host: hostEntry(fixture.port), localPath: tree, remotePath: '/with-empty', recursive: true, timeoutMs: 5000 })
+        assert.deepEqual(up, { ok: true, bytes: 1, files: 1 })
+        assert.equal(fs.statSync(join(remoteRoot, 'with-empty', 'empty')).isDirectory(), true, 'the empty directory arrived')
+        assert.equal(fs.statSync(join(remoteRoot, 'with-empty', 'sub', 'empty-deep')).isDirectory(), true, 'and so did the nested empty one')
+
+        const remoteTree = join(remoteRoot, 'down-empty')
+        fs.mkdirSync(join(remoteTree, 'empty'), { recursive: true })
+        fs.mkdirSync(join(remoteTree, 'sub', 'empty-deep'), { recursive: true })
+        writeFileSync(join(remoteTree, 'b.txt'), 'bb')
+        const target = join(localRoot, 'pulled-empty')
+        const down = await runner.download({ host: hostEntry(fixture.port), localPath: target, remotePath: '/down-empty', recursive: true, timeoutMs: 5000 })
+        assert.deepEqual(down, { ok: true, bytes: 2, files: 1 })
+        assert.equal(fs.statSync(join(target, 'empty')).isDirectory(), true, 'the empty directory landed locally')
+        assert.equal(fs.statSync(join(target, 'sub', 'empty-deep')).isDirectory(), true, 'and the nested one too')
+        assert.equal(readFileSync(join(target, 'b.txt'), 'utf8'), 'bb')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
     await testAsync('the runner never logs a file content, a key or a passphrase', async () => {
       const fixture = await startServer()
       const messages = []
@@ -4496,7 +4629,9 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
         await runner.upload({ host: hostEntry(fixture.port), localPath: one, remotePath: '/one.txt', timeoutMs: 5000 })
         await runner.upload({ host: hostEntry(fixture.port), localPath: two, remotePath: '/two.txt', timeoutMs: 5000 })
         assert.equal(fixture.state.connections, 1, 'one TCP connection served both transfers')
-        assert.equal(fixture.state.sftpSessions, 2, 'and each operation opened its own SFTP session')
+        assert.equal(fixture.state.sftpOpened, 2, 'and each operation opened its own SFTP session')
+        await waitFor(() => fixture.state.sftpClosed === 2, 2000)
+        assert.equal(fixture.state.sftpClosed, 2, 'every session it opened was closed')
         assert.equal(pool.size(), 1)
       } finally { pool.dispose(); await fixture.close() }
     })
