@@ -2818,6 +2818,13 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
       name: 'ssh_shell',
       arguments: { description: 'audit ssh', ...args },
     })
+    /** The row's SECOND tool: same boot, same executor, same host registry. */
+    const scpCall = (ctx, args) => ctx.tools.execute({
+      signal: new AbortController().signal,
+      callId: ToolCallId('audit-scp-' + Math.random().toString(36).slice(2)),
+      name: 'ssh_scp',
+      arguments: args,
+    })
     let ctx
     try {
       ctx = await bootFixture(BLACKHOLE_ROWS(), 'ssh-blackhole.yml')
@@ -2843,6 +2850,38 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
           const text = result.content.filter((block) => block.type === 'text').map((block) => block.text).join('')
           assert.equal(result.isError, true, 'an unknown alias fails the call')
           assert.match(text, /no host with alias "nope"; this row declares blackhole/, text)
+        }],
+        ['the ssh row registers ssh_scp from the SAME executor, with a transfer surface', async () => {
+          const definition = ctx.tools.get('ssh_scp')
+          assert.ok(definition !== undefined, 'ssh_scp is registered on the ssh row, not on a row of its own')
+          const properties = definition.parameters?.properties ?? {}
+          assert.deepEqual(properties.action.enum, ['upload', 'download'])
+          for (const key of ['alias', 'localPath', 'remotePath', 'recursive', 'timeoutMs'])
+            assert.ok(properties[key] !== undefined, 'ssh_scp serves the parameter ' + key)
+          assert.equal(properties.run_in_background, undefined, 'a transfer is never backgrounded')
+          // The three facts a caller can get wrong are in the description, not implied.
+          assert.match(definition.description, /SFTP/)
+          assert.match(definition.description, /danger-full-access/)
+          assert.match(definition.description, /\/C:\//, 'the Windows OpenSSH remote-path form is stated')
+          assert.match(definition.description, /foreground only/)
+          assert.match(definition.description, /blackhole/, 'the alias hint comes from the row registry')
+          const output = definition.output?.schema?.properties ?? {}
+          assert.deepEqual(Object.keys(output).sort(), ['bytes', 'error', 'files', 'ok'])
+          // The row still serves exactly the shell tool and this one.
+          assert.ok(ctx.tools.get('ssh_shell') !== undefined)
+        }],
+        ['ssh_scp applies the same alias rule as ssh_shell, before any transfer', async () => {
+          const unknown = await scpCall(ctx, { action: 'upload', localPath: 'a.txt', remotePath: '/tmp/a.txt', alias: 'nope' })
+          const text = unknown.content.filter((block) => block.type === 'text').map((block) => block.text).join('')
+          assert.equal(unknown.isError, true)
+          assert.match(text, /no host with alias "nope"; this row declares blackhole/)
+          const resolved = await scpCall(ctx, { action: 'upload', localPath: 'a.txt', remotePath: '/tmp/a.txt' })
+          const resolvedText = resolved.content.filter((block) => block.type === 'text').map((block) => block.text).join('')
+          assert.equal(resolved.isError, false, 'the transfer stub answers with a structured result: ' + resolvedText)
+          assert.equal(resolved.value?.ok, false, 'the transfer engine is not wired yet, so the result is a structured failure: ' + JSON.stringify(resolved.value))
+          assert.equal(resolved.value?.bytes, 0)
+          assert.equal(resolved.value?.error?.phase, 'sftp')
+          assert.equal(resolved.value?.error?.alias, 'blackhole', 'the default host was resolved by the same rule')
         }],
         ['the tool advertises no sandbox_permissions it cannot honour', async () => {
           const definition = ctx.tools.get('ssh_shell')
