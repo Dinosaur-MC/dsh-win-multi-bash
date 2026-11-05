@@ -8086,6 +8086,53 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     form.dispose()
   })
 
+  await testAsync('INVALID hosts BLOCK the save: blank row, bad alias and bad port each write nothing', async () => {
+    // A host the Host would refuse to use must not reach the settings layer: the table
+    // warning is a gate here (unlike a text box), because saving it persists a broken
+    // registry. Save stays enabled (dirty) so the user can see it become valid.
+    const sshRow = ROWS.find((row) => row.rowId === 'win-mb-tool-ssh')
+    const scope = fakeScope()
+    const form = new RowConfigForm(scope, sshRow)
+    const valid = { alias: 'prod', host: 'h.example', port: '', user: 'u', keyPath: 'k', passphraseEnv: '', startupCommand: '', shellTemplate: '', connectTimeoutMs: '', approval: 'session', acceptNewHostKeys: false, default: false, description: '' }
+    const cases = [
+      ['a blank added row', [blankHostRow()]],
+      ['a bad alias', [{ ...valid, alias: 'bad alias' }]],
+      ['a bad port', [{ ...valid, port: '70000' }]],
+    ]
+    for (const [label, rows] of cases) {
+      form.edit('sshShell.hosts', hostObjectsFrom(rows))
+      const field = form.project().fields.find((entry) => entry.key === 'sshShell.hosts')
+      assert.equal(field.invalid, true, label + ' is flagged invalid')
+      assert.equal(field.invalidReason, 'hosts')
+      assert.equal(form.project().dirty, true, label + ' keeps Save enabled for the fix')
+      await form.save()
+      assert.equal(scope.calls.length, 0, label + ' writes nothing')
+    }
+    form.dispose()
+  })
+
+  await testAsync('zero defaults is VALID: at most one, so both hosts save without one', async () => {
+    // Spec §6 says AT MOST one default; zero is a complete configuration (a call must
+    // then name its alias). The table must not force a radio and must not block.
+    const sshRow = ROWS.find((row) => row.rowId === 'win-mb-tool-ssh')
+    const scope = fakeScope()
+    const form = new RowConfigForm(scope, sshRow)
+    const rows = [
+      { alias: 'one', host: 'one.example', port: '22', user: 'u', keyPath: 'k', passphraseEnv: '', startupCommand: '', shellTemplate: '', connectTimeoutMs: '', approval: 'session', acceptNewHostKeys: false, default: false, description: '' },
+      { alias: 'two', host: 'two.example', port: '', user: 'u', keyPath: 'k', passphraseEnv: '', startupCommand: '', shellTemplate: '', connectTimeoutMs: '', approval: 'trusted', acceptNewHostKeys: false, default: false, description: '' },
+    ]
+    form.edit('sshShell.hosts', hostObjectsFrom(rows))
+    const field = form.project().fields.find((entry) => entry.key === 'sshShell.hosts')
+    assert.deepEqual(field.rowErrors, [{}, {}], 'no row is invalid')
+    assert.equal(field.invalid, false, 'zero defaults does not block the save')
+    await form.save()
+    assert.equal(scope.calls.length, 1)
+    const saved = scope.calls[0].ops[0].value
+    assert.equal(saved.length, 2)
+    assert.equal(saved.some((host) => host.default === true), false, 'no default is invented')
+    form.dispose()
+  })
+
   test('a STORED hosts array renders as editor ROWS, never as JSON text', () => {
     const sshRow = ROWS.find((row) => row.rowId === 'win-mb-tool-ssh')
     const stored = [{ alias: 'prod', host: 'h.example', user: 'u', keyPath: 'k', port: 2200, approval: 'trusted', default: true }]
@@ -8119,6 +8166,18 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     form.dispose()
   })
 
+  await testAsync('a legacy JSON OBJECT draft warns and writes nothing', async () => {
+    const sshRow = ROWS.find((row) => row.rowId === 'win-mb-tool-ssh')
+    const scope = fakeScope()
+    const form = new RowConfigForm(scope, sshRow)
+    form.edit('sshShell.hosts', JSON.stringify({ alias: 'prod' }))
+    const field = form.project().fields.find((entry) => entry.key === 'sshShell.hosts')
+    assert.equal(field.invalid, true, 'an object is not an array')
+    assert.equal(field.invalidReason, 'hosts')
+    await form.save()
+    assert.equal(scope.calls.length, 0, 'nothing to carry')
+    form.dispose()
+  })
   await testAsync('an emptied legacy hosts control clears the override', async () => {
     const sshRow = ROWS.find((row) => row.rowId === 'win-mb-tool-ssh')
     const scope = fakeScope({ user: { sshShell: { hosts: [{ alias: 'a' }] } } })
@@ -8499,11 +8558,13 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     const errors = hostRowErrors(rows)
     assert.equal(errors[0].alias, 'aliasFormat')
     assert.equal(errors[0].port, 'portRange')
-    const nodes = flattenTree(HostsEditor({ knob: { key: 'sshShell.hosts', rows, rowErrors: errors }, disabled: false, t: (key) => en[key] ?? key, edit: () => {}, resetField: () => {} }))
+    const nodes = flattenTree(HostsEditor({ knob: { key: 'sshShell.hosts', rows, rowErrors: errors, invalid: true }, disabled: false, t: (key) => en[key] ?? key, edit: () => {}, resetField: () => {} }))
     const warnings = nodes.filter((node) => node.type === 'span' && node.props.role === 'alert').map((node) => node.children[0])
     assert.ok(warnings.some((text) => /An alias starts with a letter or digit/.test(text)), 'alias error is shown')
     assert.ok(warnings.some((text) => /1 to 65535/.test(text)), 'port error is shown')
     assert.equal(warnings.length, 2, 'only the invalid fields are flagged')
+    const summary = nodes.filter((node) => node.type === 'p' && node.props.role === 'alert').map((node) => node.children[0])
+    assert.ok(summary.some((text) => /cannot be saved yet/.test(text)), 'the table states that the save is blocked')
   })
   /**
    * A React stub whose hooks actually work (and re-render manually), for the card's
@@ -8567,6 +8628,27 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.equal(sshApprovalMatch('ssh_shell'), null, 'a primitive is not a pending approval')
   })
 
+  test('editor row ids are stable across add, remove and edit', () => {
+    // A React key derived from the index would move focus/IME to a different row as
+    // soon as a row above it is removed; the id must travel with the row.
+    const staged = []
+    const rows = [blankHostRow(), blankHostRow()]
+    rows[0].alias = 'one'; rows[1].alias = 'two'
+    const props = { knob: { key: 'sshShell.hosts', rows, rowErrors: hostRowErrors(rows) }, disabled: false, t: (key) => en[key] ?? key, edit: (_key, value) => staged.push(value), resetField: () => {} }
+    const ids = flattenTree(HostsEditor(props)).filter((node) => node.type === 'fieldset').map((node) => node.props['data-row-id'])
+    assert.equal(new Set(ids).size, 2, 'each row has its own id')
+    assert.deepEqual(ids, rows.map((row) => row.__rowId))
+    flattenTree(HostsEditor(props)).find((node) => node.props?.['data-action'] === 'add').props.onClick()
+    assert.equal(staged.at(-1).length, 3)
+    assert.equal(new Set(staged.at(-1).map((host) => host.__rowId)).size, 3, 'the added row gets a fresh id')
+    flattenTree(HostsEditor(props)).find((node) => node.props?.['data-action'] === 'remove' && node.props['data-row'] === 0).props.onClick()
+    assert.deepEqual(staged.at(-1).map((host) => host.__rowId), [rows[1].__rowId], 'the survivor keeps its id')
+    assert.equal(staged.at(-1)[0].alias, 'two', 'and its value')
+    const input = flattenTree(HostsEditor(props)).find((node) => node.props?.['data-row'] === 1 && node.props?.['data-field'] === 'alias')
+    input.props.onChange({ target: { value: 'renamed' } })
+    assert.equal(staged.at(-1)[1].__rowId, rows[1].__rowId, 'editing a row keeps its id')
+    assert.equal(staged.at(-1)[1].alias, 'renamed')
+  })
   test('a settled request renders no live buttons and keeps the platform card', () => {
     const { sshApprovalMatch, SshApprovalCard, en } = internals
     const settled = { kind: 'approval', toolName: 'ssh_scp', answerable: false, answer: async () => {}, displayReason: { en: 'allow?' } }
