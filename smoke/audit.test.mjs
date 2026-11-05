@@ -7760,6 +7760,13 @@ console.log('\n[A] unit: the terminal session route\'s hosts.test endpoint and t
   const { createSessionDispatch, createSessionRouteHandler } = await import(libUrl('tool-bash', 'types', 'terminal.js'))
   const { probeHost } = await import(libUrl('ssh-shell', 'probe.js'))
   const path = await import('node:path')
+  const { mkdirSync, writeFileSync } = await import('node:fs')
+  // A SMALL regular file is what the key checks accept; process.execPath is tens of MB
+  // and would (correctly) hit the read cap before any handshake.
+  const probeDir = path.join('.temp', 'probe-audit')
+  mkdirSync(probeDir, { recursive: true })
+  const PROBE_KEY = path.join(probeDir, 'probe.key')
+  writeFileSync(PROBE_KEY, '-----BEGIN OPENSSH PRIVATE KEY-----\nnot a real key\n-----END OPENSSH PRIVATE KEY-----\n')
   const fakeSessions = { listAll: () => [], list: () => [], tail: () => undefined, clearFinished: () => 0, stop: async () => true }
 
   await testAsync('hosts.test dispatches the injectable probe and maps every failure phase', async () => {
@@ -7768,13 +7775,12 @@ console.log('\n[A] unit: the terminal session route\'s hosts.test endpoint and t
       probeHost: async (host) => {
         calls.push(host)
         if (host.force === 'bad') return { ok: false, phase: 'host-key', message: 'ssh-shell: host key verification failed for "prod (u@h.example:22)": changed' }
-        return { ok: true, fingerprint: 'SHA256:abc' }
+        return { ok: true, fingerprint: 'SHA256:abc', warning: 'host key was learned, not matched' }
       },
     })
     const ok = await dispatch('hosts.test', { host: { alias: 'prod', host: 'h.example', user: 'u', keyPath: 'k' } })
-    assert.deepEqual(ok, { ok: true, value: { fingerprint: 'SHA256:abc' } }, 'success carries the fingerprint')
-    assert.equal(calls.length, 1, 'the route handed the raw row to the probe')
-    assert.equal(calls.length, 1, 'a success reached the probe once')
+    assert.deepEqual(ok, { ok: true, value: { fingerprint: 'SHA256:abc', warning: 'host key was learned, not matched' } }, 'success carries the fingerprint and the warning')
+    assert.equal(calls.length, 1)
     const failed = await dispatch('hosts.test', { host: { alias: 'prod', host: 'h.example', user: 'u', keyPath: 'k', force: 'bad' } })
     assert.equal(failed.ok, false)
     assert.equal(failed.error.code, 'hosts/test-failed')
@@ -7786,6 +7792,13 @@ console.log('\n[A] unit: the terminal session route\'s hosts.test endpoint and t
     assert.equal(calls.length, 2, 'a missing host never reaches the probe')
     const primitive = await dispatch('hosts.test', { host: 'prod' })
     assert.equal(primitive.error.phase, 'config')
+    // A probe that THROWS is still a failed test, never the unknown-endpoint error.
+    const throwing = createSessionDispatch(fakeSessions, { probeHost: async () => { throw new Error('probe exploded') } })
+    const thrown = await throwing('hosts.test', { host: { alias: 'prod', host: 'h.example', user: 'u', keyPath: 'k' } })
+    assert.equal(thrown.ok, false)
+    assert.equal(thrown.error.code, 'hosts/test-failed')
+    assert.equal(thrown.error.phase, 'connect')
+    assert.match(thrown.error.message, /probe exploded/)
     // The same envelope over the real HTTP handler.
     const hostCtx = { connection: { requestRejection: () => undefined } }
     const route = createSessionRouteHandler({ hostCtx, dispatch })
@@ -7803,7 +7816,7 @@ console.log('\n[A] unit: the terminal session route\'s hosts.test endpoint and t
     }
     await route(req, fakeRes)
     assert.equal(written.status, 200)
-    assert.deepEqual(JSON.parse(written.body), { ok: true, value: { fingerprint: 'SHA256:abc' } })
+    assert.deepEqual(JSON.parse(written.body), { ok: true, value: { fingerprint: 'SHA256:abc', warning: 'host key was learned, not matched' } })
   })
 
   test('the probe refuses an invalid row and an unreadable key as CONFIG, naming the host', async () => {
@@ -7819,26 +7832,75 @@ console.log('\n[A] unit: the terminal session route\'s hosts.test endpoint and t
     assert.doesNotMatch(noKey.message, /passphrase/i)
   })
 
-  test('the probe hangs up on success and never executes a command', async () => {
+  test('the probe refuses a non-regular key file and an oversized key BEFORE reading it', async () => {
+    const { mkdirSync, rmSync, writeFileSync } = await import('node:fs')
+    const dir = path.join('.temp', 'probe-audit-keys')
+    rmSync(dir, { recursive: true, force: true })
+    mkdirSync(dir, { recursive: true })
+    const asDirectory = await probeHost({ alias: 'prod', host: 'h.example', user: 'u', keyPath: dir }, { env: {} })
+    assert.equal(asDirectory.ok, false)
+    assert.equal(asDirectory.phase, 'config')
+    assert.match(asDirectory.message, /not a regular file/)
+    const big = path.join(dir, 'big.key')
+    writeFileSync(big, Buffer.alloc(1_048_577, 1))
+    const oversized = await probeHost({ alias: 'prod', host: 'h.example', user: 'u', keyPath: big }, { env: {} })
+    assert.equal(oversized.ok, false)
+    assert.equal(oversized.phase, 'config')
+    assert.match(oversized.message, /read cap is 1048576/)
+  })
+
+  test('the probe refuses an over-cap connectTimeoutMs without dialing, and clamps its deadline', async () => {
+    let dialed = false
+    class CountingClient { constructor() { dialed = true } }
+    const capped = await probeHost({ alias: 'prod', host: 'h.example', user: 'u', keyPath: PROBE_KEY, connectTimeoutMs: 400000 }, { Client: CountingClient, env: {} })
+    assert.equal(capped.ok, false)
+    assert.equal(capped.phase, 'config')
+    assert.match(capped.message, /300000 ms/)
+    assert.equal(dialed, false, 'an over-cap row never reaches the socket')
+    const delays = []
+    class SilentClient {
+      constructor() { this.events = {}; SilentClient.last = this }
+      once(event, handler) { this.events[event] = handler; return this }
+      connect(config) { this.config = config }
+      end() {}
+    }
+    const pending = probeHost({ alias: 'prod', host: 'h.example', user: 'u', keyPath: PROBE_KEY, connectTimeoutMs: 5000 }, { Client: SilentClient, env: {}, deadlineMs: 10_000_000, setTimeout: (_fn, delay) => { delays.push(delay); return { id: 1 } } })
+    assert.deepEqual(delays, [300000], 'the total deadline is clamped to the 300 s cap')
+    assert.equal(SilentClient.last.config.readyTimeout, 5000)
+    SilentClient.last.events.close()
+    const closed = await pending
+    assert.equal(closed.phase, 'connect')
+    assert.match(closed.message, /closed before it was ready/)
+  })
+
+  test('the probe hangs up on success, carrying the verifier fingerprint and warning', async () => {
     class ReadyClient {
       constructor() { this.ended = false; this.events = {}; ReadyClient.last = this }
       once(event, handler) { this.events[event] = handler; return this }
-      connect(config) { this.config = config; queueMicrotask(() => this.events.ready()) }
+      connect(config) { this.config = config; queueMicrotask(() => { config.hostVerifier(Buffer.from('key blob')); this.events.ready() }) }
       end() { this.ended = true }
     }
-    const result = await probeHost({ alias: 'prod', host: 'h.example', user: 'u', keyPath: process.execPath, connectTimeoutMs: 4321 }, { Client: ReadyClient, env: {}, deadlineMs: 1000 })
-    assert.deepEqual(result, { ok: true })
+    const seen = []
+    const result = await probeHost({ alias: 'prod', host: 'h.example', user: 'u', keyPath: PROBE_KEY, connectTimeoutMs: 4321 }, {
+      Client: ReadyClient,
+      env: {},
+      knownHostsPath: path.join('.temp', 'known_hosts'),
+      deadlineMs: 1000,
+      verifyHostKey: (options) => { seen.push(options); return { ok: true, fingerprint: 'SHA256:test', warning: 'host key was learned, not matched' } },
+    })
+    assert.deepEqual(result, { ok: true, fingerprint: 'SHA256:test', warning: 'host key was learned, not matched' })
+    assert.equal(seen.length, 1, 'the verifier ran once')
+    assert.equal(seen[0].host, 'h.example')
+    assert.equal(seen[0].port, 22)
+    assert.equal(seen[0].acceptNewHostKeys, false)
     const client = ReadyClient.last
-    assert.equal(client.config.host, 'h.example')
-    assert.equal(client.config.port, 22)
-    assert.equal(client.config.username, 'u')
     assert.equal(client.config.readyTimeout, 4321, 'readyTimeout is the host ceiling')
     assert.equal(typeof client.config.hostVerifier, 'function', 'the host key is always verified')
     assert.equal(client.config.keepaliveInterval, undefined, 'a probe does not keepalive')
     assert.equal(client.ended, true, 'the client is closed on success')
   })
 
-  test('the probe classifies auth, host-key and deadline failures, and always closes', async () => {
+  test('the probe fails closed and classifies auth, host-key, credential, close and deadline failures', async () => {
     class FailingClient {
       constructor(mode) { this.mode = mode; this.ended = false; this.events = {}; FailingClient.last = this }
       once(event, handler) { this.events[event] = handler; return this }
@@ -7850,24 +7912,38 @@ console.log('\n[A] unit: the terminal session route\'s hosts.test endpoint and t
             this.events.error(new Error('Host key verification failed'))
           }
           else if (this.mode === 'auth') this.events.error(new Error('All configured authentication methods failed'))
+          else if (this.mode === 'passphrase') this.events.error(new Error('Encrypted private OpenSSH key detected, but no passphrase given'))
+          else if (this.mode === 'close') this.events.close()
+          else if (this.mode === 'ready-no-verifier') this.events.ready()
           // 'timeout' never settles: the deadline must.
         })
       }
       end() { this.ended = true }
     }
-    const auth = await probeHost({ alias: 'prod', host: 'h.example', user: 'u', keyPath: process.execPath }, { Client: class extends FailingClient { constructor() { super('auth') } }, env: {}, deadlineMs: 1000 })
+    const make = (mode, over = {}) => probeHost({ alias: 'prod', host: 'h.example', user: 'u', keyPath: PROBE_KEY }, { Client: class extends FailingClient { constructor() { super(mode) } }, env: {}, deadlineMs: 1000, ...over })
+    const auth = await make('auth')
     assert.equal(auth.phase, 'auth')
     assert.match(auth.message, /authentication failed for "prod \(u@h\.example:22\)"/)
     assert.equal(FailingClient.last.ended, true)
-    const hostKey = await probeHost({ alias: 'prod', host: 'h.example', user: 'u', keyPath: process.execPath }, { Client: class extends FailingClient { constructor() { super('host-key') } }, env: {}, deadlineMs: 1000 })
+    const hostKey = await make('host-key')
     assert.equal(hostKey.phase, 'host-key')
     assert.match(hostKey.message, /host key verification failed for "prod \(u@h\.example:22\)"/)
-    const timeout = await probeHost({ alias: 'prod', host: 'h.example', user: 'u', keyPath: process.execPath }, { Client: class extends FailingClient { constructor() { super('timeout') } }, env: {}, deadlineMs: 25 })
+    const credential = await make('passphrase')
+    assert.equal(credential.phase, 'config', 'an unusable credential is a configuration failure, not connect')
+    assert.match(credential.message, /cannot use the private key/)
+    assert.doesNotMatch(credential.message, /SEKRET|hunter2/)
+    const closed = await make('close')
+    assert.equal(closed.phase, 'connect')
+    assert.match(closed.message, /closed before it was ready/)
+    const unverified = await make('ready-no-verifier')
+    assert.equal(unverified.phase, 'host-key', 'a ready without a verifier fails closed')
+    assert.match(unverified.message, /not verified/)
+    const timeout = await make('timeout', { deadlineMs: 25 })
     assert.equal(timeout.phase, 'connect')
     assert.match(timeout.message, /timed out after 25 ms/)
-    assert.equal(FailingClient.last.ended, true, 'the deadline still closes the client')
   })
 }
+
 console.log('\n[B] boot integration: the terminal row over a REAL PTY (state must survive between calls)')
 {
   // The acceptance test the row exists for: one live interactive shell whose
@@ -9027,14 +9103,14 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
       requests.push({ url, options })
       return { status, ok, json: async () => body }
     }
-    const success = await testHostConnection(row, fakeFetch({ ok: true, value: { fingerprint: 'SHA256:abc' } }))
-    assert.deepEqual(success, { ok: true, fingerprint: 'SHA256:abc' })
+    const success = await testHostConnection(row, fakeFetch({ ok: true, value: { fingerprint: 'SHA256:abc', warning: 'host key was learned, not matched' } }))
+    assert.deepEqual(success, { ok: true, fingerprint: 'SHA256:abc', warning: 'host key was learned, not matched' })
     assert.equal(requests[0].url, '/win-mb/hosts.test')
     assert.equal(requests[0].options.method, 'POST')
     assert.deepEqual(JSON.parse(requests[0].options.body), { host: hostObjectFromRow(row) }, 'the staged host object is the payload')
     assert.equal(Object.hasOwn(JSON.parse(requests[0].options.body).host, '__rowId'), false, 'the editor id never leaves the page')
     const withoutFingerprint = await testHostConnection(row, fakeFetch({ ok: true, value: {} }))
-    assert.deepEqual(withoutFingerprint, { ok: true, fingerprint: undefined })
+    assert.deepEqual(withoutFingerprint, { ok: true, fingerprint: undefined, warning: undefined })
     const failed = await testHostConnection(row, fakeFetch({ ok: false, error: { code: 'hosts/test-failed', phase: 'auth', message: 'ssh-shell: authentication failed for "prod (u@h.example:22)"' } }))
     assert.equal(failed.ok, false)
     assert.match(failed.message, /authentication failed for "prod \(u@h\.example:22\)"/)
@@ -9042,6 +9118,8 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.deepEqual(rejected, { ok: false, message: 'unauthorized' }, 'an HTTP refusal surfaces its message')
     const opaque = await testHostConnection(row, fakeFetch({}, 500, false))
     assert.deepEqual(opaque, { ok: false, message: 'HTTP 500' }, 'a non-JSON refusal still names its status')
+    const missingRoute = await testHostConnection(row, fakeFetch({}, 404, false))
+    assert.match(missingRoute.message, /not registered on this host/, 'a 404 names the missing route (the terminal row is disabled)')
   })
   test('required warnings and row labels use the same placeholder the helper fills', () => {
     const rows = [blankHostRow()]
@@ -9086,9 +9164,8 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.equal(addOf([complete, blankHostRow()]).props.disabled, true, 'one invalid row among valid ones still blocks adding')
   })
 
-  test('a named row starts collapsed and its toggle flips aria-expanded; a blank row starts open', () => {
-    // A second client instance with a React stub whose useState really stores, so the
-    // collapse transition can be observed; the shared stub above is intentionally inert.
+  /** A client instance whose React stub stores state, so transitions are observable. */
+  const makeStatefulHostClient = () => {
     const hooks = []
     let cursor = 0
     let renderFn
@@ -9101,11 +9178,9 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
         return [hooks[at], (value) => { hooks[at] = typeof value === 'function' ? value(hooks[at]) : value }]
       },
     }
-    const begin = (render) => { renderFn = render; hooks.length = 0; cursor = 0 }
-    const mount = () => { cursor = 0; return renderFn() }
-    let statefulInternals
+    let captured
     const previousHook = globalThis.__dshWinMbClientTest__
-    globalThis.__dshWinMbClientTest__ = (value) => { statefulInternals = value }
+    globalThis.__dshWinMbClientTest__ = (value) => { captured = value }
     try {
       registrations[0].factory((id) => {
         if (id === 'react') return statefulReact
@@ -9117,29 +9192,79 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     finally {
       globalThis.__dshWinMbClientTest__ = previousHook
     }
+    return { begin: (render) => { renderFn = render; hooks.length = 0; cursor = 0 }, mount: () => { cursor = 0; return renderFn() }, internals: captured }
+  }
+
+  test('a learned host key warning is shown with the success line', async () => {
+    const stateful = makeStatefulHostClient()
+    const row = blankHostRow()
+    row.alias = 'prod'; row.host = 'h.example'; row.user = 'u'; row.keyPath = 'k'
+    const props = () => ({ knob: { key: 'sshShell.hosts', rows: [row], rowErrors: hostRowErrors([row]) }, disabled: false, t: (key) => en[key] ?? key, edit: () => {}, resetField: () => {}, save: () => {}, testHost: async () => ({ ok: true, fingerprint: 'SHA256:w', warning: 'the host key was learned, not matched' }) })
+    stateful.begin(() => stateful.internals.HostsEditor(props()))
+    let nodes = flattenTree(stateful.mount())
+    nodes.find((node) => node.props?.['data-action'] === 'toggle').props.onClick()
+    flattenTree(stateful.mount()).find((node) => node.props?.['data-action'] === 'test').props.onClick()
+    await Promise.resolve()
+    await Promise.resolve()
+    const text = flattenTree(stateful.mount()).filter((node) => typeof node.text === 'string').map((node) => node.text).join(' ')
+    assert.match(text, /Connection OK \(fingerprint SHA256:w\)/)
+    assert.match(text, /Host key note: the host key was learned, not matched/)
+  })
+
+  test('a test answer that arrives after an edit is discarded (generation guard)', async () => {
+    const stateful = makeStatefulHostClient()
+    let resolveProbe
+    const pending = new Promise((resolve) => { resolveProbe = resolve })
+    const row = blankHostRow()
+    row.alias = 'prod'; row.host = 'h.example'; row.user = 'u'; row.keyPath = 'k'
+    const props = () => ({ knob: { key: 'sshShell.hosts', rows: [row], rowErrors: hostRowErrors([row]) }, disabled: false, t: (key) => en[key] ?? key, edit: () => {}, resetField: () => {}, save: () => {}, testHost: () => pending })
+    stateful.begin(() => stateful.internals.HostsEditor(props()))
+    let nodes = flattenTree(stateful.mount())
+    nodes.find((node) => node.props?.['data-action'] === 'toggle').props.onClick()
+    flattenTree(stateful.mount()).find((node) => node.props?.['data-action'] === 'test').props.onClick()
+    // The user edits the row while the probe is still in flight.
+    flattenTree(stateful.mount()).find((node) => node.props?.['data-row'] === 0 && node.props?.['data-field'] === 'alias').props.onChange({ target: { value: 'prod2' } })
+    resolveProbe({ ok: true, fingerprint: 'SHA256:late' })
+    await Promise.resolve()
+    await Promise.resolve()
+    nodes = flattenTree(stateful.mount())
+    const text = nodes.filter((node) => typeof node.text === 'string').map((node) => node.text).join(' ')
+    assert.doesNotMatch(text, /SHA256:late|Connection OK/, 'a late answer never repopulates an edited row')
+    assert.equal(nodes.some((node) => node.props?.role === 'status'), false)
+  })
+
+  test('an unknown validation code falls back to a generic sentence, never a placeholder', () => {
+    const rows = [blankHostRow()]
+    const nodes = flattenTree(HostsEditor({ knob: { key: 'sshShell.hosts', rows, rowErrors: [{ alias: 'someFutureCode' }] }, disabled: false, t: (key) => en[key] ?? key, edit: () => {}, resetField: () => {} }))
+    const warnings = nodes.filter((node) => node.type === 'span' && node.props.role === 'alert').map((node) => node.children[0])
+    assert.ok(warnings.includes('This field is invalid.'))
+    assert.equal(warnings.some((text) => text.includes('{value}')), false)
+  })
+  test('a named row starts collapsed and its toggle flips aria-expanded; a blank row starts open', () => {
+    const statefulHost = makeStatefulHostClient()
     const propsFor = (rows) => ({ knob: { key: 'sshShell.hosts', rows, rowErrors: hostRowErrors(rows) }, disabled: false, t: (key) => en[key] ?? key, edit: () => {}, resetField: () => {}, save: () => {} })
     const toggleOf = (nodes) => nodes.find((node) => node.props?.['data-action'] === 'toggle')
     const named = blankHostRow()
     named.alias = 'prod'; named.host = 'h.example'; named.user = 'u'; named.keyPath = 'k'
-    begin(() => statefulInternals.HostsEditor(propsFor([named])))
-    let nodes = flattenTree(mount())
+    statefulHost.begin(() => statefulHost.internals.HostsEditor(propsFor([named])))
+    let nodes = flattenTree(statefulHost.mount())
     assert.equal(toggleOf(nodes).props['aria-expanded'], false, 'a named row starts collapsed')
     assert.equal(nodes.filter((node) => node.type === 'input').length, 0, 'a collapsed row renders no fields')
     assert.match(nodes.filter((node) => typeof node.text === 'string').map((node) => node.text).join(' '), /prod@h\.example/, 'the collapsed header summarises alias@host')
     toggleOf(nodes).props.onClick()
-    nodes = flattenTree(mount())
+    nodes = flattenTree(statefulHost.mount())
     assert.equal(toggleOf(nodes).props['aria-expanded'], true, 'the toggle flips aria-expanded')
     assert.ok(nodes.some((node) => node.type === 'input'), 'expanding unmounts nothing but shows the fields')
     // An invalid named row stays collapsed but still reports its problem count.
     const broken = blankHostRow()
     broken.alias = 'prod'; broken.host = 'h.example'; broken.user = 'u'
-    begin(() => statefulInternals.HostsEditor(propsFor([broken])))
-    nodes = flattenTree(mount())
+    statefulHost.begin(() => statefulHost.internals.HostsEditor(propsFor([broken])))
+    nodes = flattenTree(statefulHost.mount())
     assert.equal(toggleOf(nodes).props['aria-expanded'], false)
     assert.match(nodes.filter((node) => typeof node.text === 'string').map((node) => node.text).join(' '), /1 problems/, 'the collapsed header keeps the validation count')
     // A blank/new row is open from the start.
-    begin(() => statefulInternals.HostsEditor(propsFor([blankHostRow()])))
-    nodes = flattenTree(mount())
+    statefulHost.begin(() => statefulHost.internals.HostsEditor(propsFor([blankHostRow()])))
+    nodes = flattenTree(statefulHost.mount())
     assert.equal(toggleOf(nodes).props['aria-expanded'], true, 'a blank row starts open')
     assert.ok(nodes.some((node) => node.type === 'input'))
   })
