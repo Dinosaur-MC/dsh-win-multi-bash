@@ -20,7 +20,7 @@ The shipped `cordis.patch.yml` inserts:
 | `win-mb-tool-git` | `.../tool-git-bash` | on | `GitBashExecutor`, its config partition `gitBash` |
 | `win-mb-tool-wsl` | `.../tool-wsl-bash` | **off** | `WslBashExecutor`, `wslBash` |
 | `win-mb-tool-msys2` | `.../tool-msys2-bash` | **off** | `Msys2BashExecutor`, `msys2Bash` |
-| `win-mb-tool-ssh` | `.../tool-ssh-shell` | **off** | `SshShellExecutor`, `sshShell` |
+| `win-mb-tool-ssh` | `.../tool-ssh-shell` | **off** | `SshShellExecutor`, `sshShell` — serves `ssh_shell` and `ssh_scp` from one executor |
 | `win-mb-tool-terminal` | `.../tool-terminal` | on | `terminal`, `terminal` config partition |
 
 All rows are win32-only. A row inserts only its own tool; nothing of the base bundle's shell wiring is disabled. That is deliberate: the plugin never provides `ctx.shell`, so dsh's own `pwsh-sandbox` row keeps the seat and every plugin that injects `shell` is unaffected.
@@ -68,6 +68,8 @@ The four executors own their argv:
 - result rendering: exit/signal markers, sandbox markers, spill previews, promoted reads, the `(no output)` body;
 - the fallback description when the core row is absent (the shared guidance moves into each tool description).
 
+A dialect may also contribute **extra tools** from its one executor (`extraTools`): the ssh row registers `ssh_scp` this way, so the transfer shares the row's Config, host registry and connection pool instead of building a second engine.
+
 ## The prompt section
 
 One `tool:win-mb-bash` section is registered by the core row at the midpoint of dsh's `TOOL_BASH` and `TOOL_PWSH` orders. Its text is resolved **per assembly** from the tools actually mounted:
@@ -98,6 +100,7 @@ The browser half cannot import the package (the client module loader resolves su
 model tool call
   → tool instance (factory) resolves the policy and the workdir (the alias, for `ssh_shell`)
   → executor builds argv and asks the sandbox seam (confine / none), or opens a pooled channel (remote)
+  → a transfer opens one SFTP session on the same pooled client and streams the files
   → subprocess spawns the shell, or the ssh channel runs the script remotely; stdout/stderr are bounded and spilled
   → renderer writes markers ([exit code: N], sandbox facts, promotion, spill)
   → tool result (content + structured sandbox fact; `{ remote: true }` for `ssh_shell`)
@@ -111,11 +114,22 @@ The SSH dialect keeps the family's tool contract but replaces the local spawn wi
 - **One engine per tool row, one client per host.** `lib/ssh-shell/pool.js` owns an `ssh2.Client` per alias, dialled lazily and reused across calls (two concurrent first calls share one dial); the host key is verified on every dial, a client that errors or closes is dropped so the next call redials instead of inheriting a dead socket, and row teardown closes every client. There is no idle timer.
 - **One exec channel per call.** `execute` / `resolve` open a channel, send the base64 POSIX script built by `script.js` on its stdin, collect stdout and stderr separately, and settle on the exit status ssh2 delivers (the `exit` event or the `close` arguments). Settlement waits at most 100 ms for trailing bytes, then destroys the channel; bytes that arrive afterwards are counted and discarded, so a background child cannot leak output into the next call.
 - **The host registry decides the target.** `hosts.js` validates `sshShell.hosts` and resolves the call's alias (or the single `default` host); `known-hosts.js` supplies the `hostVerifier` that refuses an unknown, changed or `@revoked` key before authentication completes. `pool.js` reads the private key from `keyPath` and a passphrase only from the environment variable the host names.
-- **No plugin-level concurrency cap.** Concurrency is bounded by the job registry's limits (background), the agent loop's parallel calls and the number of sessions (foreground), and the server's `MaxSessions` per connection. A channel the server refuses is reported verbatim today; retrying it with backoff once a slot frees is planned for the scp work and is not part of this release.
+- **No plugin-level concurrency cap.** Concurrency is bounded by the job registry's limits (background), the agent loop's parallel calls and the number of sessions (foreground), and the server's `MaxSessions` per connection. A channel the server refuses is reported verbatim; retrying it with backoff once a slot frees is a plain follow-up item, not part of this release.
 - **Jobs are the factory's, not a second implementation.** The channel handle exposes the same `result()` / `kill()` / output-source contract as the local executors, so `run_in_background` (register immediately, stream into the job ring, settle on exit), timeout promotion (register before starting, return a job id, leave it running), `job_kill` (TERM, 2 s, KILL, close) and the admission-refusal fallback all reuse the existing factory path. A channel that closes with no exit status is an infrastructure failure: the handle is `failed`, the job settles **failed** with a sentence naming the host, never completed with exit 0.
 - **Cancellation is a remote signal.** On timeout or caller abort the runner sends `SIGTERM`, waits up to 2 s, sends `SIGKILL` and closes the channel; a lost connection tears the remote session down with it. Commands that detach themselves (`nohup`, `setsid`) survive by design, and are documented that way. The transport is `ssh2 ~1.17.0`: the version is pinned because the cancellation path uses the protocol-level signal request after stdin is half-closed (the public `signal()` becomes a no-op there). If a future build lacks that path, the result's stderr carries a loud marker that the remote command may still be running.
 - **Remote effects are stated, not sandboxed.** The result carries `sandbox: { mode, remote: true }` and no local verdict; the local file sandbox is not applied to a command that runs on another host. `cwd` is the remote `workdir` when one was given and the empty string otherwise.
 - **The PTY path is unchanged.** `terminal` still runs a real PTY over the OpenSSH client (`ssh.exe -t`), configured by its own `sshShell` single-host pin; it does not read the `hosts` table in 0.8.0, so interactive host-key questions and terminal semantics stay exactly as they were. Sharing the registry with `terminal` is future work.
+
+### Transfers (`ssh_scp`)
+
+The same row, executor, host registry, known_hosts check and connection pool serve a second tool, `ssh_scp` (`lib/ssh-shell/scp-tool.js` over `scp.js`). `defineShellTool` accepts an `extraTools` list for exactly this: a dialect registers additional tools against the ONE executor, so the transfer adds no row, no config partition and no second pool.
+
+- **One SFTP session per operation** on a leased pooled client, closed in `finally` — on success, timeout and abort alike (a session that arrives after the caller already got its answer is still closed).
+- **Foreground only.** No `run_in_background`, no promotion, no job: its own deadline (default 300 s) races the **whole** operation — the pool dial, the SFTP subsystem request and the transfer — because each of those awaits can park forever on a server that never answers.
+- **A leased client, retired surgically.** `pool.get()` / `release()` count leases. A cancelled transfer hands its lease back and retires exactly the client it held (`retire(alias, client)`), so a command or another transfer already running on that connection finishes normally while the next call dials a fresh one. A stalled subsystem or OPEN request can never be un-parked, so closing the old client with its last lease is what stops it accumulating.
+- **The local side is a real local effect.** `local-path.js` resolves `localPath` against the session cwd and requires it to stay inside the workspace root; `danger-full-access` is the only mode that allows an outside path, and the result then says `outsideWorkspace: true`. The decision is lexical (no pre-flight filesystem access), and a refusal reuses the family's sandbox sentence. `remotePath` is an absolute POSIX path — `/C:/...` on a Windows OpenSSH host — and is refused before any dial when it is a local Windows or relative path.
+- **Result and failure contract.** `{ ok, bytes, files?, error?, sandbox, outsideWorkspace? }`, with `sandbox: { mode, remote: true }` on **every** result. A failure is a value: `{ phase, alias, message }` with the phase one of `config`, `sandbox`, `connect`, `sftp`, the alias named and the ssh2 message kept. Only the platform's abort throws, exactly as `ssh_shell` does.
+- **No custom conversation card.** The transfer has no `tool.call.toolview` row of its own; it renders through the platform's generic card. A dedicated transfer card is future work.
 
 ## Path conversion and workdir
 
@@ -130,8 +144,9 @@ lib/
 ├── bash-git/       GitBashExecutor (MSYS)
 ├── bash-wsl/       WslBashExecutor (WSL, base64 payloads)
 ├── bash-msys2/     Msys2BashExecutor (MSYS2 UCRT64)
-├── ssh-shell/      SshShellExecutor (pooled ssh2 channels), hosts, known_hosts,
-│                   script builder, connection pool
+├── ssh-shell/      SshShellExecutor (pooled ssh2 channels) + ssh_scp (SFTP),
+│                   hosts, known_hosts, script builder, connection pool,
+│                   local-path policy and transfer runner
 ├── tool-bash/      factory + one instance per dialect; registry, shell-family,
 │                   render, terminal, backend ownership
 ├── terminal-session.js   PTY registry: bounded output, readiness, reclamation

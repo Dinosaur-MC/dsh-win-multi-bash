@@ -60,6 +60,8 @@ Consequences:
 - the sandbox stance list is inert for this dialect — both `auto` and `none` mean "nothing local to wrap" — and `probeTimeoutMs` / `sandboxNotice` never fire because there is no probe and no degraded run;
 - the family prompt section drops its local file-sandbox sentence when no locally-sandboxable family tool is mounted.
 
+`ssh_scp` is the one part of the SSH row with a **local** file effect, and it is sandboxed as one: `localPath` is resolved against the session's working directory and must stay inside the workspace root. A path outside is refused — with the family's standard sandbox sentence — unless the effective mode is `danger-full-access`, which allows it and says so on the result (`outsideWorkspace: true`); the path is never silently clamped. The transfer's remote side remains a remote effect, so every transfer result carries `sandbox: { mode, remote: true }` beside that local disclosure. `ssh_scp` does not consult `requireSandbox` (that knob speaks about confining a remote command); its local rule is the effective mode itself.
+
 A **stopped SSH call now stops the remote command**, which is why the transport is a channel rather than a client process: on timeout or caller abort the runner sends `SIGTERM` through the SSH signal request, waits up to 2 s, sends `SIGKILL`, then closes the channel. A lost connection tears the remote session down with it. A command that detached itself (`nohup`, `setsid`) survives by design — make long remote work self-limiting on the remote side (`timeout`, `systemd-run`). The one-shot OpenSSH form could only stop `ssh.exe`; it is gone in 0.8.0, while a `terminal` session (`shell: ssh_shell`) keeps the OpenSSH PTY and its teardown reaps the remote process group.
 
 ## `requireSandbox`

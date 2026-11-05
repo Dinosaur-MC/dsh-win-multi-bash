@@ -8,6 +8,8 @@ The platform dispatches every atomic call through its keyed `tool.call.toolview`
 
 One row is registered per tool this bundle mounts: the dialects the terminal row's `defaultShell` list carries (today `git_bash`, `wsl_bash`, `msys2_bash`, `ssh_shell`) plus `terminal`. The audit pins that list against the host registry's tool instances, so a dialect added there cannot keep the generic row unnoticed.
 
+The ssh row's second tool, `ssh_scp`, deliberately has **no row of its own**: a transfer renders through the platform's generic `Tool call · ssh_scp` card until a dedicated transfer card exists (future work). Its result is still the platform's INPUT/OUTPUT shape, with the rendered sentence naming the byte count, the file count, the abort state and the phase.
+
 ## All or nothing
 
 The row is built from four client primitives (`DisclosureRow`, `TextShimmer`, `IconApiOutlineRegular`, `IconInspectOutlineRegular`). A deployment missing any of them registers **no row at all** and keeps the platform's generic card: plainer, never broken. `TerminalBlock` is optional rather than required: without it the rows still register and every body falls back to the platform's INPUT/OUTPUT card.
