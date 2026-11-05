@@ -3808,17 +3808,22 @@ console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (
    * An in-process ssh2 server whose exec behaviour each case supplies.
    * @param handler - called with the accepted channel and the exec request info.
    */
-  const startServer = async (handler, { refuseSessions = 0, closeOnSession = 0 } = {}) => {
+  const startServer = async (handler, { refuseSessions = 0, closeOnSession = 0, holdSession = false, holdExec = false } = {}) => {
     const signals = []
     const commands = []
     let sessionRequests = 0
     let refusals = 0
+    let closes = 0
     const server = new ssh2.Server({ hostKeys: [hostKey.private] }, (client) => {
       client.on('error', () => {})
       client.on('authentication', (context) => context.accept())
       client.on('ready', () => {
+        client.on('close', () => { closes += 1 })
         client.on('session', (accept, reject) => {
           sessionRequests += 1
+          // A server that authenticates and then never answers the OPEN (or never
+          // answers the exec request) is the parking case the race must end.
+          if (holdSession) return
           // A server at its MaxSessions limit answers the OPEN with administratively
           // prohibited (ssh2: reject()); one case also drops the connection instead,
           // which must NOT be retried.
@@ -3831,6 +3836,7 @@ console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (
             acceptSignal?.()
           })
           session.on('exec', (acceptExec, _rejectExec, info) => {
+            if (holdExec) return
             const stream = acceptExec()
             commands.push(info.command)
             handler(stream)
@@ -3846,6 +3852,7 @@ console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (
       commands,
       sessionRequests: () => sessionRequests,
       refusals: () => refusals,
+      closes: () => closes,
       close: () => new Promise((resolve) => server.close(resolve)),
     }
   }
@@ -4223,6 +4230,86 @@ console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (
       assert.equal(isSubsystemRefusal(new Error('Unable to start subsystem: sftp')), true)
       assert.equal(isSubsystemRefusal(new Error('All configured authentication methods failed')), false)
       assert.equal(isChannelRefusal(new Error('Unable to start subsystem: sftp')), false)
+    })
+    await testAsync('a session OPEN that is never answered ends at the deadline, with the lease back', async () => {
+      const fixture = await startServer(() => {}, { holdSession: true })
+      const { executor, pool } = await executorFor(fixture)
+      try {
+        const started = Date.now()
+        let failure
+        try { await executor.execute({ command: 'echo never', timeoutMs: 200 }) }
+        catch (error) { failure = error }
+        const elapsed = Date.now() - started
+        assert.ok(failure !== undefined, 'the call must settle, not hang on the unanswered OPEN')
+        assert.equal(failure.name, 'ChannelRefusalExhausted')
+        assert.match(failure.message, /no channel could be opened/)
+        assert.match(failure.message, /the call deadline of 200 ms expired during channel retries/)
+        assert.doesNotMatch(failure.message, /timed out after/, 'no synthesized timeout text')
+        assert.ok(elapsed < 1000, 'settled well inside a second: ' + elapsed + ' ms')
+        assert.equal(pool.leases.size, 0, 'the lease was released exactly once')
+        assert.equal(pool.size(), 0, 'and the parked client was retired')
+        for (let i = 0; i < 50 && fixture.closes() < 1; i += 1) await new Promise((resolve) => setTimeout(resolve, 20))
+        assert.ok(fixture.closes() >= 1, 'the server saw the connection close')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('a session OPEN that is never answered yields to an abort, as an AbortError', async () => {
+      const fixture = await startServer(() => {}, { holdSession: true })
+      const { executor, pool } = await executorFor(fixture)
+      const controller = new AbortController()
+      try {
+        const started = Date.now()
+        const pending = executor.execute({ command: 'echo never', timeoutMs: 30000, signal: controller.signal })
+        setTimeout(() => controller.abort(), 50)
+        let failure
+        try { await pending }
+        catch (error) { failure = error }
+        const elapsed = Date.now() - started
+        assert.ok(failure !== undefined, 'the call must settle on the abort')
+        assert.equal(failure.name, 'AbortError')
+        assert.match(failure.message, /aborted before the command started/)
+        assert.ok(elapsed < 1000, 'settled well inside a second: ' + elapsed + ' ms')
+        assert.equal(pool.leases.size, 0)
+        assert.equal(pool.size(), 0, 'the parked client was retired')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('an exec request that is never answered ends at the deadline, with the lease back', async () => {
+      const fixture = await startServer(() => {}, { holdExec: true })
+      const { executor, pool } = await executorFor(fixture)
+      try {
+        const started = Date.now()
+        let failure
+        try { await executor.execute({ command: 'echo never', timeoutMs: 200 }) }
+        catch (error) { failure = error }
+        const elapsed = Date.now() - started
+        assert.ok(failure !== undefined, 'the call must settle, not hang on the unanswered exec')
+        assert.equal(failure.name, 'ChannelRefusalExhausted')
+        assert.match(failure.message, /the call deadline of 200 ms expired during channel retries/)
+        assert.ok(elapsed < 1000, 'settled well inside a second: ' + elapsed + ' ms')
+        assert.equal(pool.leases.size, 0)
+        assert.equal(pool.size(), 0, 'the parked client was retired')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('an exec request that is never answered yields to an abort, as an AbortError', async () => {
+      const fixture = await startServer(() => {}, { holdExec: true })
+      const { executor, pool } = await executorFor(fixture)
+      const controller = new AbortController()
+      try {
+        const started = Date.now()
+        const pending = executor.execute({ command: 'echo never', timeoutMs: 30000, signal: controller.signal })
+        setTimeout(() => controller.abort(), 50)
+        let failure
+        try { await pending }
+        catch (error) { failure = error }
+        const elapsed = Date.now() - started
+        assert.ok(failure !== undefined)
+        assert.equal(failure.name, 'AbortError')
+        assert.ok(elapsed < 1000, 'settled well inside a second: ' + elapsed + ' ms')
+        assert.equal(pool.leases.size, 0)
+        assert.equal(pool.size(), 0)
+      } finally { pool.dispose(); await fixture.close() }
     })
     await testAsync('a missing host alias names the aliases this row declares', async () => {
       const fixture = await startServer(() => {})
@@ -5075,6 +5162,44 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
         assert.equal(readFileSync(join(remoteRoot, 'retry-sftp.txt'), 'utf8'), 'retry')
         assert.equal(pool.leases.size, 0)
       } finally { pool.dispose(); await fixture.close() }
+    })
+    await testAsync('a refused subsystem that never succeeds ends in the CONNECT phase, alias named once', async () => {
+      const fixture = await startServer({ rejectSftpSessions: 99 })
+      const { pool, runner } = runnerFor(fixture)
+      try {
+        const local = join(localRoot, 'never-sftp.txt')
+        writeFileSync(local, 'x')
+        const result = await runner.upload({ host: hostEntry(fixture.port), localPath: local, remotePath: '/never-sftp.txt', timeoutMs: 5000 })
+        assert.equal(result.ok, false)
+        assert.equal(result.error.phase, 'connect', 'no SFTP session ever existed')
+        assert.equal(result.error.alias, 'scp-fixture', 'the alias is carried in its own field')
+        assert.match(result.error.message, /Unable to start subsystem: sftp/, result.error.message)
+        assert.match(result.error.message, /gave up after 4 attempts/, 'the bounded budget ended it: ' + result.error.message)
+        assert.doesNotMatch(result.error.message, /scp-fixture:\d+/, 'the host:port form is not in the message')
+        assert.equal(pool.leases.size, 0)
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('a channel refusal on the SFTP open ends in the CONNECT phase with the deadline note', async () => {
+      let calls = 0
+      const refusal = new Error('channel open failure: administratively prohibited: open failed')
+      const client = {
+        sftp(callback) {
+          calls += 1
+          callback(refusal)
+        },
+      }
+      const pool = { get: async () => client, release: () => {}, retire: () => {} }
+      const runner = new ScpRunner({ pool })
+      const local = join(localRoot, 'cap-refused.txt')
+      writeFileSync(local, 'x')
+      const result = await runner.upload({ host: { alias: 'cap-fixture', host: 'cap.invalid' }, localPath: local, remotePath: '/cap-refused.txt', timeoutMs: 150 })
+      assert.equal(result.ok, false)
+      assert.equal(result.error.phase, 'connect')
+      assert.equal(result.error.alias, 'cap-fixture')
+      assert.match(result.error.message, /administratively prohibited/, result.error.message)
+      assert.match(result.error.message, /the transfer deadline of 150 ms expired during channel retries/, result.error.message)
+      assert.ok(calls >= 2, 'it retried before the deadline: ' + calls)
     })
     await testAsync('two operations reuse ONE pooled connection and one SFTP session each', async () => {
       const fixture = await startServer()
