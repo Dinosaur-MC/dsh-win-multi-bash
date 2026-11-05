@@ -5583,7 +5583,7 @@ console.log('\n[A] unit: the ssh session authorization gate (S12)')
   // The gate is pure: fake sessions/agents and a fake request cover every path with no
   // boot and no network. Grants are per Session object and per host fingerprint, in
   // memory only, and a request is only ever made under a REAL agent.
-  const { ApprovalError, createApprovalGate, fingerprintOf } = await import(libUrl('ssh-shell', 'approval.js'))
+  const { ApprovalError, createApprovalGate, fingerprintOf, markOneShot, consumeOneShot } = await import(libUrl('ssh-shell', 'approval.js'))
 
   const hostEntry = (over = {}) => ({
     alias: 'prod', host: '10.0.0.9', port: 22, user: 'deploy',
@@ -5623,6 +5623,20 @@ console.log('\n[A] unit: the ssh session authorization gate (S12)')
     assert.equal(calls.length, 0, 'a trusted host never prompts')
   })
 
+  await testAsync('a marked call is a TRUE one-shot: granted once, not cached, next call asks again', async () => {
+    const { gate, calls, lines } = makeGate(['allowed-once', 'allowed-once', 'allowed-once'])
+    const session = fakeSession()
+    const agent = fakeAgent(session)
+    assert.equal(markOneShot('call-one-shot'), true)
+    assert.equal(consumeOneShot('not-marked'), false, 'an unmarked call consumes nothing')
+    await gate.authorize({ session, agent, host: hostEntry(), toolName: 'ssh_shell', callId: 'call-one-shot' })
+    assert.equal(calls.length, 1)
+    await gate.authorize({ session, agent, host: hostEntry(), toolName: 'ssh_shell', callId: 'call-later' })
+    assert.equal(calls.length, 2, 'the one-shot grant was NOT remembered for the session')
+    await gate.authorize({ session, agent, host: hostEntry(), toolName: 'ssh_shell', callId: 'call-third' })
+    assert.equal(calls.length, 2, 'the second (unmarked) grant IS remembered')
+    assert.ok(lines.some((line) => /allowed ONCE \(not cached\)/.test(line)), 'the log distinguishes one-shot from session')
+  })
   await testAsync('a first miss asks ONCE under the caller agent, then remembers for the session', async () => {
     const { gate, calls } = makeGate([])
     const session = fakeSession()
@@ -7819,6 +7833,35 @@ console.log('\n[A] unit: the terminal session route\'s hosts.test endpoint and t
     assert.deepEqual(JSON.parse(written.body), { ok: true, value: { fingerprint: 'SHA256:abc', warning: 'host key was learned, not matched' } })
   })
 
+  await testAsync('hosts.oneShot marks the call id through the injected marker', async () => {
+    const marked = []
+    const dispatch = createSessionDispatch(fakeSessions, { markOneShot: (callId) => { marked.push(callId); return true } })
+    const ok = await dispatch('hosts.oneShot', { callId: 'call-1' })
+    assert.deepEqual(ok, { ok: true })
+    assert.deepEqual(marked, ['call-1'])
+    const missing = await dispatch('hosts.oneShot', {})
+    assert.equal(missing.ok, false)
+    assert.equal(missing.error.code, 'hosts/bad-request')
+    assert.deepEqual(marked, ['call-1'], 'a missing callId never marks')
+    const refused = createSessionDispatch(fakeSessions, { markOneShot: () => false })
+    const rejected = await refused('hosts.oneShot', { callId: 'call-2' })
+    assert.equal(rejected.ok, false)
+    assert.equal(rejected.error.code, 'hosts/bad-request')
+    // The same endpoint over the real HTTP handler keeps the route rules.
+    const hostCtx = { connection: { requestRejection: () => undefined } }
+    const route = createSessionRouteHandler({ hostCtx, dispatch })
+    const written = { status: undefined, body: undefined, headersSent: false }
+    const res = {
+      get headersSent() { return written.headersSent },
+      writeHead(status) { written.status = status; written.headersSent = true },
+      end(body) { if (body !== undefined) written.body = String(body) },
+    }
+    const req = { method: 'POST', url: '/win-mb/hosts.oneShot', headers: { 'content-type': 'application/json' }, async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ callId: 'call-3' })) } }
+    await route(req, res)
+    assert.equal(written.status, 200)
+    assert.deepEqual(JSON.parse(written.body), { ok: true })
+    assert.deepEqual(marked, ['call-1', 'call-3'])
+  })
   test('the probe refuses an invalid row and an unreadable key as CONFIG, naming the host', async () => {
     const invalid = await probeHost({ alias: 'bad alias', host: 'h', user: 'u', keyPath: 'k' }, { env: {} })
     assert.equal(invalid.ok, false)
@@ -9480,15 +9523,16 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.match(text, /no longer pending/)
     assert.doesNotMatch(text, /could not be delivered/, 'a settled request is not a failed one')
   })
-  test('the SSH approval card labels both choices and sends the pending request its own answer', () => {
+  await testAsync('the SSH approval card labels three choices and sends the pending request its own answer', async () => {
     const { SshApprovalCard, en } = internals
     const answered = []
+    const marked = []
     const pending = {
-      kind: 'approval', toolName: 'ssh_shell', answerable: true,
+      kind: 'approval', toolName: 'ssh_shell', answerable: true, callId: 'call-1',
       answer: (outcome) => { answered.push(outcome); return Promise.resolve() },
       displayReason: { en: 'ssh_shell: allow this session to use host "prod" (deploy@10.0.0.9:22)? The grant lasts until this session ends.' },
     }
-    const nodes = flattenTree(SshApprovalCard({ matched: pending, t: (key) => en[key] ?? key }))
+    const nodes = flattenTree(SshApprovalCard({ matched: pending, markOneShot: async (callId) => { marked.push(callId) }, t: (key) => en[key] ?? key }))
     const buttons = nodes.filter((node) => node.type === 'Button')
     assert.equal(buttons.length, 3, 'reject + allow once + the added session button')
     assert.deepEqual(buttons.map((node) => node.children[0]), ['Reject', 'Allow once', 'Allow for this session'])
@@ -9497,17 +9541,20 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     const text = nodes.filter((node) => typeof node.text === 'string').map((node) => node.text).join(' ')
     assert.match(text, /host "prod" \(deploy@10\.0\.0\.9:22\)/, 'the request sentence names the alias and the target')
     assert.match(text, /THIS session only/)
-    buttons[0].props.onClick()
-    buttons[1].props.onClick()
-    buttons[2].props.onClick()
-    assert.deepEqual(answered, ['rejected', 'allowed-once', 'allowed-once'], 'the added button sends the same session-grant outcome')
+    const click = (index) => flattenTree(SshApprovalCard({ matched: pending, markOneShot: async (callId) => { marked.push(callId) }, t: (key) => en[key] ?? key })).filter((node) => node.type === 'Button')[index].props.onClick()
+    click(0)
+    click(1)
+    await Promise.resolve()
+    click(2)
+    assert.deepEqual(answered, ['rejected', 'allowed-once', 'allowed-once'], 'reject, the marked one-shot, and the session grant all answer')
+    assert.deepEqual(marked, ['call-1'], 'only the one-shot action marks the call id')
   })
 
-  test('the approval card keeps the platform structure, classes and keyboard contract', () => {
+  await testAsync('the approval card keeps the platform structure, classes and keyboard contract', async () => {
     const { SshApprovalCard, en } = internals
     const answered = []
-    const pending = { kind: 'approval', toolName: 'ssh_shell', answerable: true, answer: (outcome) => { answered.push(outcome); return Promise.resolve() }, displayReason: { en: 'ssh_shell: allow this session to use host "prod" (deploy@10.0.0.9:22)?' } }
-    const nodes = flattenTree(SshApprovalCard({ matched: pending, t: (key) => en[key] ?? key }))
+    const pending = { kind: 'approval', toolName: 'ssh_shell', answerable: true, callId: 'call-9', key: 'approval-key-9', answer: (outcome) => { answered.push(outcome); return Promise.resolve() }, displayReason: { en: 'ssh_shell: allow this session to use host "prod" (deploy@10.0.0.9:22)?' } }
+    const nodes = flattenTree(SshApprovalCard({ matched: pending, markOneShot: async () => {}, t: (key) => en[key] ?? key }))
     const classes = new Set(nodes.map((node) => node.props?.className).filter((value) => typeof value === 'string'))
     for (const name of ['dshwmb-ap-root', 'dshwmb-ap-card', 'dshwmb-ap-strip', 'dshwmb-ap-body', 'dshwmb-ap-heading', 'dshwmb-ap-headline', 'dshwmb-ap-description', 'dshwmb-ap-action-row', 'dshwmb-ap-reject'])
       assert.ok(classes.has(name), 'the standard card structure carries ' + name)
@@ -9516,13 +9563,73 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
       assert.match(text, new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'label ' + label)
     const dot = nodes.find((node) => node.type === 'StateDot')
     assert.equal(dot.props.state, 'warning', 'the strip carries the warning dot')
-    // Enter allows once, Escape rejects (the platform card keyboard contract).
     const root = nodes.find((node) => node.props?.className === 'dshwmb-ap-root')
-    root.props.onKeyDown({ key: 'Enter', defaultPrevented: false, preventDefault: () => {}, stopPropagation: () => {} })
-    root.props.onKeyDown({ key: 'Escape', defaultPrevented: false, preventDefault: () => {}, stopPropagation: () => {} })
+    assert.equal(root.props['data-approval-key'], 'approval-key-9', 'the platform key prop is used')
+    const body = nodes.find((node) => node.props?.className === 'dshwmb-ap-body')
+    assert.equal(body.props['data-approval-scroll'], '', 'the body carries the platform scroll marker')
+    // Enter allows once (through the mark), Escape rejects (the platform keyboard contract).
+    const freshRoot = () => nodes.length === 0 ? undefined : flattenTree(SshApprovalCard({ matched: pending, markOneShot: async () => {}, t: (key) => en[key] ?? key })).find((node) => node.props?.className === 'dshwmb-ap-root')
+    freshRoot().props.onKeyDown({ key: 'Enter', defaultPrevented: false, preventDefault: () => {}, stopPropagation: () => {} })
+    await Promise.resolve()
+    freshRoot().props.onKeyDown({ key: 'Escape', defaultPrevented: false, preventDefault: () => {}, stopPropagation: () => {} })
     assert.deepEqual(answered, ['allowed-once', 'rejected'])
   })
 
+  await testAsync('Allow once marks the call BEFORE answering, and the session button answers directly', async () => {
+    const { SshApprovalCard, en } = internals
+    const t = (key) => en[key] ?? key
+    const order = []
+    const marked = []
+    const pending = { kind: 'approval', toolName: 'ssh_shell', answerable: true, callId: 'call-7', answer: (outcome) => { order.push('answer:' + outcome); return Promise.resolve() } }
+    const props = { matched: pending, t, markOneShot: async (callId) => { order.push('mark:' + callId); marked.push(callId) } }
+    flattenTree(SshApprovalCard(props)).filter((node) => node.type === 'Button')[1].props.onClick()
+    await Promise.resolve()
+    assert.deepEqual(order, ['mark:call-7', 'answer:allowed-once'], 'the mark happens first, the answer only after it')
+    order.length = 0
+    marked.length = 0
+    flattenTree(SshApprovalCard(props)).filter((node) => node.type === 'Button')[2].props.onClick()
+    assert.deepEqual(order, ['answer:allowed-once'], 'the session action answers without a mark')
+    assert.deepEqual(marked, [], 'the session action never marks a one-shot')
+  })
+
+  test('a pending without a callId disables Allow once and explains why; the session action stays live', () => {
+    const { SshApprovalCard, en } = internals
+    const pending = { kind: 'approval', toolName: 'ssh_shell', answerable: true, answer: async () => {}, displayReason: { en: 'allow?' } }
+    const buttons = flattenTree(SshApprovalCard({ matched: pending, markOneShot: async () => {}, t: (key) => en[key] ?? key })).filter((node) => node.type === 'Button')
+    assert.equal(buttons[1].props.disabled, true, 'a true one-shot cannot be keyed without a call id')
+    assert.match(buttons[1].props.title, /no call id/)
+    assert.equal(buttons[2].props.disabled, false, 'the session action does not need the call id')
+  })
+
+  await testAsync('a failed one-shot mark leaves the approval unanswered and shows the failure', async () => {
+    const react = makeStatefulReact()
+    const seam = makeClientInstance(react, { Button: 'Button', StateDot: 'StateDot' })
+    const answered = []
+    let markCalls = 0
+    const pending = { kind: 'approval', toolName: 'ssh_shell', answerable: true, callId: 'call-x', answer: (outcome) => { answered.push(outcome); return Promise.resolve() } }
+    const props = { matched: pending, t: (key) => seam.en[key] ?? key, markOneShot: async () => { markCalls += 1; throw new Error('route down') } }
+    react.begin(() => seam.SshApprovalCard(props))
+    let tree = react.mount()
+    flattenTree(tree).filter((node) => node.type === 'Button')[1].props.onClick()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    tree = react.mount()
+    const buttons = flattenTree(tree).filter((node) => node.type === 'Button')
+    assert.equal(markCalls, 1)
+    assert.deepEqual(answered, [], 'the approval is NOT answered when the mark fails')
+    assert.ok(buttons.every((node) => node.props.disabled === false), 'every action comes back')
+    const text = flattenTree(tree).filter((node) => typeof node.text === 'string').map((node) => node.text).join(' ')
+    assert.match(text, /could not be delivered/, 'the failure is visible')
+  })
+
+  test('the waiting latch makes a rapid double click answer once', () => {
+    const { SshApprovalCard, en } = internals
+    const answered = []
+    const pending = { kind: 'approval', toolName: 'ssh_shell', answerable: true, callId: 'call-d', answer: (outcome) => { answered.push(outcome); return new Promise(() => {}) } }
+    const buttons = flattenTree(SshApprovalCard({ matched: pending, markOneShot: async () => {}, t: (key) => en[key] ?? key })).filter((node) => node.type === 'Button')
+    buttons[2].props.onClick()
+    buttons[2].props.onClick()
+    assert.deepEqual(answered, ['allowed-once'], 'the platform waiting ref swallows the second click')
+  })
   test('the card disables both buttons while the answer is submitting', () => {
     const react = makeStatefulReact()
     const seam = makeClientInstance(react, { Button: 'Button', StateDot: 'StateDot' })
@@ -9543,7 +9650,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     const react = makeStatefulReact()
     const seam = makeClientInstance(react, { Button: 'Button', StateDot: 'StateDot' })
     const answered = []
-    const pending = { kind: 'approval', toolName: 'ssh_shell', answerable: true, answer: (outcome) => { answered.push(outcome); return Promise.reject(new Error('transport died')) } }
+    const pending = { kind: 'approval', toolName: 'ssh_shell', answerable: true, callId: 'call-r', answer: (outcome) => { answered.push(outcome); return Promise.reject(new Error('transport died')) } }
     const props = { matched: pending, t: (key) => seam.en[key] ?? key }
     react.begin(() => seam.SshApprovalCard(props))
     let tree = react.mount()
@@ -9558,11 +9665,11 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.deepEqual(answered, ['rejected'])
   })
 
-  test('a SYNCHRONOUS throw from answer re-enables the card and shows the failure', async () => {
+  await testAsync('a SYNCHRONOUS throw from answer re-enables the card and shows the failure', async () => {
     const react = makeStatefulReact()
     const seam = makeClientInstance(react, { Button: 'Button', StateDot: 'StateDot' })
     const answered = []
-    const pending = { kind: 'approval', toolName: 'ssh_shell', answerable: true, answer: (outcome) => { answered.push(outcome); throw new Error('sync boom') } }
+    const pending = { kind: 'approval', toolName: 'ssh_shell', answerable: true, callId: 'call-s', answer: (outcome) => { answered.push(outcome); throw new Error('sync boom') } }
     const props = { matched: pending, t: (key) => seam.en[key] ?? key }
     react.begin(() => seam.SshApprovalCard(props))
     let tree = react.mount()
