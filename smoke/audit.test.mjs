@@ -7517,7 +7517,7 @@ console.log('\n[A] unit: the terminal session route (HTTP fence, method, body, d
   // The Session header's data channel is exercised as the MODULE it is: the route
   // factory, the endpoint dispatcher and the per-server registration guard are all
   // imported directly, so the contract is tested without a web server or a PTY.
-  const { createSessionDispatch, createSessionRouteHandler, registerSessionRoute } = await import(libUrl('tool-bash', 'types', 'terminal.js'))
+  const { createSessionDispatch, createSessionRouteHandler, createSessionChannelRegistrar } = await import(libUrl('tool-bash', 'types', 'terminal.js'))
   const fakeSessions = (over = {}) => ({
     listAll: () => [],
     list: () => [],
@@ -7557,25 +7557,38 @@ console.log('\n[A] unit: the terminal session route (HTTP fence, method, body, d
   }
   const json = (record) => JSON.parse(record.body)
 
-  test('the route factory registers ONE prefix route per web server and frees it on dispose', () => {
+  test('one prefix route per APPLY even across distinct web-server proxies; dispose frees it for a reload', () => {
+    // Cordis hands out a NEW service proxy on every access, so a guard keyed on the
+    // proxy identity (WeakSet) cannot see a repeat. The registrar's own flag can.
     const registrations = []
-    let disposed = 0
-    const webServer = { register: (options) => { registrations.push(options); return () => { disposed += 1 } } }
-    const handler = () => {}
-    const dispose = registerSessionRoute(webServer, handler, () => {})
-    assert.deepEqual(registrations.map((options) => ({ kind: options.kind, path: options.path })), [{ kind: 'prefix', path: '/win-mb' }])
-    assert.equal(registrations[0].handler, handler)
-    assert.equal(typeof dispose, 'function')
-    // A repeated ctx.inject must not throw 'duplicate prefix route' or lose the handler.
-    assert.equal(registerSessionRoute(webServer, handler, () => {}), undefined, 'a second registration is a no-op')
-    assert.equal(registrations.length, 1)
-    dispose()
-    assert.equal(disposed, 1, 'the effect disposer takes the route down')
-    // ...and the server is forgotten, so a reload can register again.
-    const again = registerSessionRoute(webServer, handler, () => {})
-    assert.equal(registrations.length, 2)
-    assert.equal(typeof again, 'function')
-    again()
+    const warns = []
+    let routeLive = false
+    const server = {
+      register(options) {
+        // The real server refuses a SECOND live route; disposing the first frees it.
+        if (routeLive) throw new Error('duplicate prefix route')
+        routeLive = true
+        registrations.push(options)
+        return () => { routeLive = false }
+      },
+    }
+    const proxyA = new Proxy(server, {})
+    const proxyB = new Proxy(server, {})
+    assert.notEqual(proxyA, proxyB, 'the two accesses are different objects, as Cordis returns them')
+    const effectDisposers = []
+    const ctx = { effect: (callback) => effectDisposers.push(callback()), root: { get: () => undefined } }
+    const register = createSessionChannelRegistrar({ ctx, dispatch: async () => ({ ok: true }), warn: (message) => warns.push(message) })
+    register({ webServer: proxyA })
+    register({ webServer: proxyB })
+    assert.equal(registrations.length, 1, 'exactly one route')
+    assert.equal(registrations[0].kind, 'prefix')
+    assert.equal(registrations[0].path, '/win-mb')
+    assert.equal(typeof registrations[0].handler, 'function')
+    assert.deepEqual(warns, [], 'no duplicate-prefix warning')
+    effectDisposers[0]()
+    register({ webServer: proxyB })
+    assert.equal(registrations.length, 2, 'the disposer clears the flag, so a reload registers again')
+    effectDisposers[1]()
   })
 
   await testAsync('no trust fence is a 503; a rejection is echoed with its own status', async () => {
@@ -7588,6 +7601,31 @@ console.log('\n[A] unit: the terminal session route (HTTP fence, method, body, d
     }
   })
 
+  await testAsync('requestRejection is called as a METHOD: its `this` is the connection', async () => {
+    // The real host method reads `this` (its admission helper). Extracting it before
+    // the call makes every real POST throw and answer 400 instead of the fence's code.
+    const connection = {
+      admit: () => 401,
+      requestRejection(req) { return this.admit(req) },
+    }
+    const record = await runRoute(handlerFor({ connection }), { body: '{}' })
+    assert.equal(record.status, 401, 'the fence answered, so `this` reached admit')
+    assert.equal(record.body, 'unauthorized')
+    const allowed = { admit: () => undefined, requestRejection(req) { return this.admit(req) } }
+    const ok = await runRoute(handlerFor({ connection: allowed }), {})
+    assert.equal(ok.status, 200)
+  })
+
+  await testAsync('the fence runs BEFORE method and body handling', async () => {
+    const hostCtx = { connection: { requestRejection: () => 401 } }
+    const oversized = await runRoute(handlerFor(hostCtx), { body: JSON.stringify({ ownerKey: 'x'.repeat(70000) }) })
+    assert.equal(oversized.status, 401, 'an unauthenticated oversized body is refused as unauthorized, not 400')
+    const get = await runRoute(handlerFor(hostCtx), { method: 'GET' })
+    assert.equal(get.status, 401, 'an unauthenticated GET is refused as unauthorized, not 405')
+    const bareGet = await runRoute(handlerFor({}), { method: 'GET' })
+    assert.equal(bareGet.status, 503, 'no fence is still 503 before the method check')
+  })
+
   await testAsync('the route is POST and JSON only: 405 carries Allow, a missing content type is 415', async () => {
     const hostCtx = { connection: { requestRejection: () => undefined } }
     const get = await runRoute(handlerFor(hostCtx), { method: 'GET' })
@@ -7598,11 +7636,19 @@ console.log('\n[A] unit: the terminal session route (HTTP fence, method, body, d
     assert.deepEqual(plain.headers, { Allow: 'POST' })
   })
 
-  await testAsync('the route refuses a body over 64 KiB and malformed JSON with a 400', async () => {
+  await testAsync('the route refuses a VALID JSON body over 64 KiB and malformed JSON with a 400', async () => {
     const hostCtx = { connection: { requestRejection: () => undefined } }
-    const huge = await runRoute(handlerFor(hostCtx), { body: 'x'.repeat(65537) })
+    // A valid body: with the cap removed this would parse and dispatch (200), so the
+    // assertion fails on a handler that only rejects unparseable input.
+    const big = JSON.stringify({ ownerKey: 'x'.repeat(70000) })
+    const huge = await runRoute(handlerFor(hostCtx), { body: big })
     assert.equal(huge.status, 400)
     assert.equal(json(huge).error.code, 'terminal/bad-request')
+    // The very same body under a raised cap answers 200, proving it is valid JSON.
+    const raised = createSessionRouteHandler({ hostCtx, dispatch: createSessionDispatch(fakeSessions()), maxBytes: 80000 })
+    const accepted = await runRoute(raised, { body: big })
+    assert.equal(accepted.status, 200)
+    assert.deepEqual(json(accepted), { ok: true, value: { sessions: [] } })
     const malformed = await runRoute(handlerFor(hostCtx), { body: '{oops' })
     assert.equal(malformed.status, 400)
     assert.equal(json(malformed).error.code, 'terminal/bad-request')
@@ -7994,7 +8040,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
    */
   const applyWithProbes = (ctx) => client.apply(Object.assign({ get: (name) => ctx[name] }, ctx))
 
-  const { ROWS, rowKey, planOps, RowConfigForm, RowConfigCard, HostsEditor, hostRowsFrom, hostObjectFromRow, hostObjectsFrom, hostDraftFrom, hostRowErrors, hostsValueProblem, blankHostRow, HOST_FIELDS, en, zh, SHELL_TOOL_NAMES, TERMINAL_TOOL_NAME, ToolCard, toolCardBody, toolCardIo, terminalBody, terminalLabels, cardTitle, shellCard, shellExitLabel, shellStatus, displayCwd, normalizeSegments, cardSummary, cardState, cardOutput, cardInput } = internals
+  const { ROWS, rowKey, planOps, RowConfigForm, RowConfigCard, HostsEditor, hostRowsFrom, hostObjectFromRow, hostObjectsFrom, hostDraftFrom, hostRowErrors, hostsValueProblem, blankHostRow, HOST_FIELDS, en, zh, SHELL_TOOL_NAMES, TERMINAL_TOOL_NAME, ToolCard, toolCardBody, toolCardIo, terminalBody, terminalLabels, cardTitle, shellCard, shellExitLabel, shellStatus, displayCwd, normalizeSegments, cardSummary, cardState, cardOutput, cardInput, callSessionEndpoint } = internals
 
   test('the client entry exports exactly the platform plugin triple', () => {
     // Official package-surface rule: a /client entry must not export implementation
@@ -8050,6 +8096,55 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.equal(unavailable, null, 'a missing connection also renders nothing')
   })
 
+  await testAsync('the session fetch falls back to RPC only when the route is absent or unreachable', async () => {
+    // Direct test of the decision (the component render stub runs no effects): a 404/405
+    // or a network failure uses the legacy channel, while any other HTTP failure is
+    // surfaced and never masked by a retry.
+    const calls = []
+    const connection = { rpc: { call: async (...args) => { calls.push(args); return { ok: true, value: { sessions: [], fromRpc: true } } } } }
+    const response = (over = {}) => ({
+      status: 200,
+      ok: true,
+      headers: { get: (name) => (name === 'content-type' ? 'application/json' : undefined) },
+      json: async () => ({ ok: true, value: { sessions: [] } }),
+      ...over,
+    })
+    const fetchReturning = (value) => async () => value
+    const absent = await callSessionEndpoint(fetchReturning(response({ status: 404 })), connection, 'sessions.list', {})
+    assert.equal(calls.length, 1, '404 falls back to RPC')
+    assert.equal(absent.value.fromRpc, true)
+    assert.deepEqual(calls[0], ['/win-mb', 'sessions.list', {}], 'the fallback carries the endpoint and payload')
+    calls.length = 0
+    const gone = await callSessionEndpoint(fetchReturning(response({ status: 405 })), connection, 'sessions.clear', { ownerKey: 's' })
+    assert.equal(calls.length, 1, '405 (route absent) falls back too')
+    assert.equal(gone.value.fromRpc, true)
+    calls.length = 0
+    await assert.rejects(
+      callSessionEndpoint(fetchReturning(response({ status: 500, ok: false, json: async () => ({ ok: false, error: { message: 'boom' } }) })), connection, 'sessions.stop', {}),
+      /boom/,
+    )
+    assert.equal(calls.length, 0, 'a 500 is surfaced, NOT retried over RPC')
+    calls.length = 0
+    await assert.rejects(
+      callSessionEndpoint(fetchReturning(response({ status: 400, ok: false, json: async () => ({ ok: false }) })), connection, 'sessions.list', {}),
+      /HTTP 400/,
+    )
+    assert.equal(calls.length, 0, 'a 400 keeps its status')
+    calls.length = 0
+    await assert.rejects(
+      callSessionEndpoint(fetchReturning(response({ headers: { get: () => 'text/plain' } })), connection, 'sessions.list', {}),
+      /without a JSON answer/,
+    )
+    assert.equal(calls.length, 0, 'a 2xx without JSON is an error')
+    calls.length = 0
+    const unreachable = await callSessionEndpoint(async () => { throw new Error('offline') }, connection, 'sessions.tail', { sessionId: 'x' })
+    assert.equal(calls.length, 1, 'a request that never reached the Host uses RPC')
+    assert.equal(unreachable.value.fromRpc, true)
+    calls.length = 0
+    const ok = await callSessionEndpoint(fetchReturning(response()), connection, 'sessions.list', {})
+    assert.deepEqual(ok.value.sessions, [])
+    assert.equal(calls.length, 0, 'a healthy route never touches the legacy channel')
+  })
   test('it declares the client services the page needs', () => {
     assert.equal(internals.NS, 'settings.win-mb-bash')
     assert.ok(Array.isArray(client.inject))
