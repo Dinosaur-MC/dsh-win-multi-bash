@@ -19,7 +19,7 @@ The card shows the title "Authorize this SSH host for the session", the request'
 - **Allow for this session** answers `allowed-once`; the gate records the session grant and the call proceeds.
 - **Reject** answers `rejected`; the call fails closed without dialing.
 
-It answers through the pending interaction's own `answer()` — no new RPC, and the approval audit events are unchanged. No page navigation; the fixed labels are plain strings in this plugin's dictionary. A request that settles elsewhere shows "This request is no longer pending."; an answer that could not be delivered says so and points at the standard approval card, which remains a working fallback.
+It answers through the pending interaction's own `answer()` — no new RPC, and the approval audit events are unchanged. No page navigation; the fixed labels are plain strings in this plugin's dictionary. A request that settles elsewhere is no longer claimed by this matcher (`answerable` turns false, so it returns null) and falls through to the platform's standard or empty card; the local "This request is no longer pending." notice only follows an answer made in **this** card. An answer that could not be delivered says so and points at the standard approval card, which remains a working fallback.
 
 ## All or nothing
 
