@@ -7755,6 +7755,119 @@ console.log('\n[A] unit: the terminal session route (HTTP fence, method, body, d
     assert.deepEqual(result, { writes: 0, ended: true }, 'the catch only ends an already-started response')
   })
 }
+console.log('\n[A] unit: the terminal session route\'s hosts.test endpoint and the host probe')
+{
+  const { createSessionDispatch, createSessionRouteHandler } = await import(libUrl('tool-bash', 'types', 'terminal.js'))
+  const { probeHost } = await import(libUrl('ssh-shell', 'probe.js'))
+  const path = await import('node:path')
+  const fakeSessions = { listAll: () => [], list: () => [], tail: () => undefined, clearFinished: () => 0, stop: async () => true }
+
+  await testAsync('hosts.test dispatches the injectable probe and maps every failure phase', async () => {
+    const calls = []
+    const dispatch = createSessionDispatch(fakeSessions, {
+      probeHost: async (host) => {
+        calls.push(host)
+        if (host.force === 'bad') return { ok: false, phase: 'host-key', message: 'ssh-shell: host key verification failed for "prod (u@h.example:22)": changed' }
+        return { ok: true, fingerprint: 'SHA256:abc' }
+      },
+    })
+    const ok = await dispatch('hosts.test', { host: { alias: 'prod', host: 'h.example', user: 'u', keyPath: 'k' } })
+    assert.deepEqual(ok, { ok: true, value: { fingerprint: 'SHA256:abc' } }, 'success carries the fingerprint')
+    assert.equal(calls.length, 1, 'the route handed the raw row to the probe')
+    assert.equal(calls.length, 1, 'a success reached the probe once')
+    const failed = await dispatch('hosts.test', { host: { alias: 'prod', host: 'h.example', user: 'u', keyPath: 'k', force: 'bad' } })
+    assert.equal(failed.ok, false)
+    assert.equal(failed.error.code, 'hosts/test-failed')
+    assert.equal(failed.error.phase, 'host-key')
+    assert.match(failed.error.message, /prod \(u@h\.example:22\)/)
+    const missing = await dispatch('hosts.test', {})
+    assert.equal(missing.ok, false)
+    assert.equal(missing.error.phase, 'config')
+    assert.equal(calls.length, 2, 'a missing host never reaches the probe')
+    const primitive = await dispatch('hosts.test', { host: 'prod' })
+    assert.equal(primitive.error.phase, 'config')
+    // The same envelope over the real HTTP handler.
+    const hostCtx = { connection: { requestRejection: () => undefined } }
+    const route = createSessionRouteHandler({ hostCtx, dispatch })
+    const written = { status: undefined, body: undefined, headersSent: false }
+    const fakeRes = {
+      get headersSent() { return written.headersSent },
+      writeHead(status) { written.status = status; written.headersSent = true },
+      end(body) { if (body !== undefined) written.body = String(body) },
+    }
+    const req = {
+      method: 'POST',
+      url: '/win-mb/hosts.test',
+      headers: { 'content-type': 'application/json' },
+      async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ host: { alias: 'prod', host: 'h.example', user: 'u', keyPath: 'k' } })) },
+    }
+    await route(req, fakeRes)
+    assert.equal(written.status, 200)
+    assert.deepEqual(JSON.parse(written.body), { ok: true, value: { fingerprint: 'SHA256:abc' } })
+  })
+
+  test('the probe refuses an invalid row and an unreadable key as CONFIG, naming the host', async () => {
+    const invalid = await probeHost({ alias: 'bad alias', host: 'h', user: 'u', keyPath: 'k' }, { env: {} })
+    assert.equal(invalid.ok, false)
+    assert.equal(invalid.phase, 'config')
+    assert.match(invalid.message, /bad alias/)
+    const noKey = await probeHost({ alias: 'prod', host: 'h.example', user: 'u', keyPath: path.join('.temp', 'no-such-key') }, { env: {} })
+    assert.equal(noKey.ok, false)
+    assert.equal(noKey.phase, 'config')
+    assert.match(noKey.message, /prod \(u@h\.example:22\)/)
+    assert.match(noKey.message, /cannot read the private key/)
+    assert.doesNotMatch(noKey.message, /passphrase/i)
+  })
+
+  test('the probe hangs up on success and never executes a command', async () => {
+    class ReadyClient {
+      constructor() { this.ended = false; this.events = {}; ReadyClient.last = this }
+      once(event, handler) { this.events[event] = handler; return this }
+      connect(config) { this.config = config; queueMicrotask(() => this.events.ready()) }
+      end() { this.ended = true }
+    }
+    const result = await probeHost({ alias: 'prod', host: 'h.example', user: 'u', keyPath: process.execPath, connectTimeoutMs: 4321 }, { Client: ReadyClient, env: {}, deadlineMs: 1000 })
+    assert.deepEqual(result, { ok: true })
+    const client = ReadyClient.last
+    assert.equal(client.config.host, 'h.example')
+    assert.equal(client.config.port, 22)
+    assert.equal(client.config.username, 'u')
+    assert.equal(client.config.readyTimeout, 4321, 'readyTimeout is the host ceiling')
+    assert.equal(typeof client.config.hostVerifier, 'function', 'the host key is always verified')
+    assert.equal(client.config.keepaliveInterval, undefined, 'a probe does not keepalive')
+    assert.equal(client.ended, true, 'the client is closed on success')
+  })
+
+  test('the probe classifies auth, host-key and deadline failures, and always closes', async () => {
+    class FailingClient {
+      constructor(mode) { this.mode = mode; this.ended = false; this.events = {}; FailingClient.last = this }
+      once(event, handler) { this.events[event] = handler; return this }
+      connect(config) {
+        this.config = config
+        queueMicrotask(() => {
+          if (this.mode === 'host-key') {
+            config.hostVerifier(Buffer.from('not a key'))
+            this.events.error(new Error('Host key verification failed'))
+          }
+          else if (this.mode === 'auth') this.events.error(new Error('All configured authentication methods failed'))
+          // 'timeout' never settles: the deadline must.
+        })
+      }
+      end() { this.ended = true }
+    }
+    const auth = await probeHost({ alias: 'prod', host: 'h.example', user: 'u', keyPath: process.execPath }, { Client: class extends FailingClient { constructor() { super('auth') } }, env: {}, deadlineMs: 1000 })
+    assert.equal(auth.phase, 'auth')
+    assert.match(auth.message, /authentication failed for "prod \(u@h\.example:22\)"/)
+    assert.equal(FailingClient.last.ended, true)
+    const hostKey = await probeHost({ alias: 'prod', host: 'h.example', user: 'u', keyPath: process.execPath }, { Client: class extends FailingClient { constructor() { super('host-key') } }, env: {}, deadlineMs: 1000 })
+    assert.equal(hostKey.phase, 'host-key')
+    assert.match(hostKey.message, /host key verification failed for "prod \(u@h\.example:22\)"/)
+    const timeout = await probeHost({ alias: 'prod', host: 'h.example', user: 'u', keyPath: process.execPath }, { Client: class extends FailingClient { constructor() { super('timeout') } }, env: {}, deadlineMs: 25 })
+    assert.equal(timeout.phase, 'connect')
+    assert.match(timeout.message, /timed out after 25 ms/)
+    assert.equal(FailingClient.last.ended, true, 'the deadline still closes the client')
+  })
+}
 console.log('\n[B] boot integration: the terminal row over a REAL PTY (state must survive between calls)')
 {
   // The acceptance test the row exists for: one live interactive shell whose
@@ -8079,7 +8192,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
    */
   const applyWithProbes = (ctx) => client.apply(Object.assign({ get: (name) => ctx[name] }, ctx))
 
-  const { ROWS, rowKey, planOps, RowConfigForm, RowConfigCard, HostsEditor, hostRowsFrom, hostObjectFromRow, hostObjectsFrom, hostDraftFrom, hostRowErrors, hostsValueProblem, blankHostRow, HOST_FIELDS, en, zh, SHELL_TOOL_NAMES, TERMINAL_TOOL_NAME, ToolCard, toolCardBody, toolCardIo, terminalBody, terminalLabels, cardTitle, shellCard, shellExitLabel, shellStatus, displayCwd, normalizeSegments, cardSummary, cardState, cardOutput, cardInput, callSessionEndpoint } = internals
+  const { ROWS, rowKey, planOps, RowConfigForm, RowConfigCard, HostsEditor, testHostConnection, hostRowsFrom, hostObjectFromRow, hostObjectsFrom, hostDraftFrom, hostRowErrors, hostsValueProblem, blankHostRow, HOST_FIELDS, en, zh, SHELL_TOOL_NAMES, TERMINAL_TOOL_NAME, ToolCard, toolCardBody, toolCardIo, terminalBody, terminalLabels, cardTitle, shellCard, shellExitLabel, shellStatus, displayCwd, normalizeSegments, cardSummary, cardState, cardOutput, cardInput, callSessionEndpoint } = internals
 
   test('the client entry exports exactly the platform plugin triple', () => {
     // Official package-surface rule: a /client entry must not export implementation
@@ -8864,6 +8977,8 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.equal(nodes.some((node) => node.type === 'a'), false, 'no navigation')
     const text = nodes.filter((node) => typeof node.text === 'string').map((node) => node.text).join(' ')
     assert.doesNotMatch(text, /"alias"\s*:/, 'no JSON is visible')
+    assert.match(text, /Host 1/, 'the row label substitutes its number into {value}')
+    assert.doesNotMatch(text, /\{value\}/, 'no dictionary placeholder is rendered literally')
     form.dispose()
   })
 
@@ -8879,6 +8994,66 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.equal(staged.at(-1).length, 1, 'remove drops the row it belongs to (2 rows -> 1)')
   })
 
+  test('each host row carries a Test connection button, disabled until the row is valid', () => {
+    const complete = blankHostRow()
+    complete.alias = 'prod'; complete.host = 'h.example'; complete.user = 'u'; complete.keyPath = 'k'
+    const makeProps = (rows, disabled = false) => ({
+      knob: { key: 'sshShell.hosts', rows, rowErrors: hostRowErrors(rows) },
+      disabled,
+      t: (key) => en[key] ?? key,
+      edit: () => {},
+      resetField: () => {},
+    })
+    const enabled = flattenTree(HostsEditor(makeProps([complete]))).find((node) => node.props?.['data-action'] === 'test')
+    assert.ok(enabled !== undefined, 'a complete row can be tested')
+    assert.equal(enabled.props['data-row'], 0)
+    assert.equal(enabled.props.disabled, false)
+    const invalid = flattenTree(HostsEditor(makeProps([blankHostRow()]))).find((node) => node.props?.['data-action'] === 'test')
+    assert.equal(invalid.props.disabled, true, 'a row with highlighted fields cannot be tested')
+    assert.match(invalid.props.title, /highlighted fields/)
+    const disabled = flattenTree(HostsEditor(makeProps([complete], true))).find((node) => node.props?.['data-action'] === 'test')
+    assert.equal(disabled.props.disabled, true, 'a read-only row cannot be tested')
+    const labels = flattenTree(HostsEditor(makeProps([complete]))).filter((node) => node.text === 'Test connection')
+    assert.equal(labels.length, 1, 'the button is labelled from the dictionary')
+  })
+
+  await testAsync('the hosts test request sends the staged row and reads both envelopes', async () => {
+    const requests = []
+    const row = blankHostRow()
+    row.alias = 'prod'; row.host = 'h.example'; row.user = 'u'; row.keyPath = 'k'
+    const fakeFetch = (body, status = 200, ok = true) => async (url, options) => {
+      requests.push({ url, options })
+      return { status, ok, json: async () => body }
+    }
+    const success = await testHostConnection(row, fakeFetch({ ok: true, value: { fingerprint: 'SHA256:abc' } }))
+    assert.deepEqual(success, { ok: true, fingerprint: 'SHA256:abc' })
+    assert.equal(requests[0].url, '/win-mb/hosts.test')
+    assert.equal(requests[0].options.method, 'POST')
+    assert.deepEqual(JSON.parse(requests[0].options.body), { host: hostObjectFromRow(row) }, 'the staged host object is the payload')
+    assert.equal(Object.hasOwn(JSON.parse(requests[0].options.body).host, '__rowId'), false, 'the editor id never leaves the page')
+    const withoutFingerprint = await testHostConnection(row, fakeFetch({ ok: true, value: {} }))
+    assert.deepEqual(withoutFingerprint, { ok: true, fingerprint: undefined })
+    const failed = await testHostConnection(row, fakeFetch({ ok: false, error: { code: 'hosts/test-failed', phase: 'auth', message: 'ssh-shell: authentication failed for "prod (u@h.example:22)"' } }))
+    assert.equal(failed.ok, false)
+    assert.match(failed.message, /authentication failed for "prod \(u@h\.example:22\)"/)
+    const rejected = await testHostConnection(row, fakeFetch({ ok: false, error: { message: 'unauthorized' } }, 401, false))
+    assert.deepEqual(rejected, { ok: false, message: 'unauthorized' }, 'an HTTP refusal surfaces its message')
+    const opaque = await testHostConnection(row, fakeFetch({}, 500, false))
+    assert.deepEqual(opaque, { ok: false, message: 'HTTP 500' }, 'a non-JSON refusal still names its status')
+  })
+  test('required warnings and row labels use the same placeholder the helper fills', () => {
+    const rows = [blankHostRow()]
+    const nodes = flattenTree(HostsEditor({ knob: { key: 'sshShell.hosts', rows, rowErrors: hostRowErrors(rows) }, disabled: false, t: (key) => en[key] ?? key, edit: () => {}, resetField: () => {} }))
+    const warnings = nodes.filter((node) => node.type === 'span' && node.props.role === 'alert').map((node) => node.children[0])
+    assert.ok(warnings.includes('Alias is required.'), 'the required sentence names the field')
+    assert.equal(warnings.some((text) => text.includes('{value}')), false, 'no placeholder leaks')
+    for (const dictionary of [en, zh]) {
+      assert.match(dictionary['hosts.row'], /\{value\}/)
+      assert.match(dictionary['hosts.required'], /\{value\}/)
+      assert.doesNotMatch(dictionary['hosts.row'], /\{index\}/)
+      assert.doesNotMatch(dictionary['hosts.required'], /\{field\}/)
+    }
+  })
   test('the default radio is EXCLUSIVE: marking a row clears every other row', () => {
     const staged = []
     const rows = [blankHostRow(), blankHostRow()]
