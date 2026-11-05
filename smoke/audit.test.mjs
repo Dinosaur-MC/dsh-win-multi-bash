@@ -46,6 +46,21 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
 const lib = join(__dirname, '..', 'lib')
 const libUrl = (...parts) => pathToFileURL(join(lib, ...parts)).href
+/**
+ * A generated ed25519 pair that its OWN parseKey accepts.
+ *
+ * Measured on ssh2 1.17: generateKeyPairSync('ed25519') intermittently emits a
+ * public key parseKey rejects as "Malformed OpenSSH public key" (~2 in 300), which
+ * would fail any fixture at random. Retrying keeps a red run meaningful.
+ */
+const ssh2Module = (await import('ssh2')).default ?? (await import('ssh2'))
+function stableKeyPair(type = 'ed25519') {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const pair = ssh2Module.utils.generateKeyPairSync(type)
+    if (typeof ssh2Module.utils.parseKey(pair.public)?.getPublicSSH === 'function') return pair
+  }
+  throw new Error('ssh2 could not generate a parsable ' + type + ' key pair')
+}
 
 const { isRunnerSpawnFailure, classifyDenial, classifyRunnerFailure, denialFacts, learnedDenialSignature, matchesSignature } =
   await import(libUrl('vendor', 'helpers.js'))
@@ -2810,7 +2825,7 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     const ssh2 = (await import('ssh2')).default ?? (await import('ssh2'))
     const keyDir = mkdtempSync(join(tmpdir(), 'dsh-wmb-pool-key-'))
     const keyPath = join(keyDir, 'id_ed25519')
-    writeFileSync(keyPath, ssh2.utils.generateKeyPairSync('ed25519').private)
+    writeFileSync(keyPath, stableKeyPair().private)
     const BLACKHOLE_ROWS = () => CORE_ROW_ONLY + `
 - id: win-mb-tool-ssh
   name: 'dsh-win-multi-bash/tool-ssh-shell'
@@ -2831,8 +2846,8 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
       arguments: { description: 'audit ssh', ...args },
     })
     /** The row's SECOND tool: same boot, same executor, same host registry. */
-    const scpCall = (ctx, args) => ctx.tools.execute({
-      signal: new AbortController().signal,
+    const scpCall = (ctx, args, signal = new AbortController().signal) => ctx.tools.execute({
+      signal,
       callId: ToolCallId('audit-scp-' + Math.random().toString(36).slice(2)),
       name: 'ssh_scp',
       arguments: args,
@@ -2924,6 +2939,15 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
           assert.equal(resolved.value?.error?.alias, 'blackhole', 'the default host was resolved by the same rule')
           assert.equal(typeof resolved.value?.sandbox?.mode, 'string')
           assert.equal(resolved.value?.sandbox?.remote, true)
+        }],
+        ['an aborted ssh_scp call surfaces as the platform abort, like ssh_shell', async () => {
+          const controller = new AbortController()
+          const pending = scpCall(ctx, { action: 'upload', localPath: 'README.md', remotePath: '/tmp/abort.txt' }, controller.signal)
+          setTimeout(() => controller.abort(), 50)
+          const result = await pending
+          assert.equal(result.isError, true, 'a cancelled call is an error result, not a transfer value')
+          const text = result.content.filter((block) => block.type === 'text').map((block) => block.text).join('')
+          assert.match(text, /abort/i, 'the platform abort text: ' + text)
         }],
         ['the tool advertises no sandbox_permissions it cannot honour', async () => {
           const definition = ctx.tools.get('ssh_shell')
@@ -3101,9 +3125,9 @@ console.log('\n[A] unit: the ssh_shell known_hosts verifier (strict host keys) (
     candidateNames, defaultKnownHostsPath, displayName, hostFiles, hostPatternMatches, parseKnownHosts, verifyHostKey,
   } = await import(libUrl('ssh-shell', 'known-hosts.js'))
 
-  const keypair = ssh2.utils.generateKeyPairSync('ed25519')
+  const keypair = stableKeyPair()
   const publicKey = ssh2.utils.parseKey(keypair.public)
-  const otherKey = ssh2.utils.parseKey(ssh2.utils.generateKeyPairSync('ed25519').public)
+  const otherKey = ssh2.utils.parseKey(stableKeyPair().public)
   const blob = publicKey.getPublicSSH()
   const fingerprintOf = (buffer) => 'SHA256:' + createHash('sha256').update(buffer).digest('base64').replace(/=+$/, '')
   const entryLine = (hosts, parsed) => hosts + ' ' + parsed.type + ' ' + parsed.getPublicSSH().toString('base64')
@@ -3550,8 +3574,8 @@ console.log('\n[A] unit: the ssh_shell connection pool (one client per host) (S8
   const { SshShellExecutor } = await import(libUrl('ssh-shell', 'index.js'))
 
   const scratch = mkdtempSync(join(tmpdir(), 'dsh-wmb-pool-'))
-  const hostKey = ssh2.utils.generateKeyPairSync('ed25519')
-  const clientKey = ssh2.utils.generateKeyPairSync('ed25519')
+  const hostKey = stableKeyPair()
+  const clientKey = stableKeyPair()
   const hostPublic = ssh2.utils.parseKey(hostKey.public)
   const keyPath = join(scratch, 'id_ed25519')
   writeFileSync(keyPath, clientKey.private)
@@ -3664,7 +3688,7 @@ console.log('\n[A] unit: the ssh_shell connection pool (one client per host) (S8
         await new Promise((resolve) => first.once('close', resolve))
         // The host now presents the same key, but the trusted file says otherwise: the
         // SECOND dial must be verified against the file as it is NOW, not cached.
-        const other = ssh2.utils.parseKey(ssh2.utils.generateKeyPairSync('ed25519').public)
+        const other = ssh2.utils.parseKey(stableKeyPair().public)
         writeFileSync(path, hostLine(fixture.port, other) + '\n')
         await assert.rejects(() => pool.get(entry), /host key mismatch/)
         assert.equal(fixture.connections(), 2, 'the second call really dialled again')
@@ -3677,7 +3701,7 @@ console.log('\n[A] unit: the ssh_shell connection pool (one client per host) (S8
 
     await testAsync('a changed host key is refused with the verifier reason, before any auth', async () => {
       const fixture = await startServer()
-      const other = ssh2.utils.parseKey(ssh2.utils.generateKeyPairSync('ed25519').public)
+      const other = ssh2.utils.parseKey(stableKeyPair().public)
       const pool = new SshPool({ knownHostsPath: knownHostsFor(fixture.port, hostLine(fixture.port, other)) })
       try {
         await assert.rejects(() => pool.get(entryFor(fixture.port)), /host key mismatch/)
@@ -3765,8 +3789,8 @@ console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (
   const { DEFAULT_SHELL_TEMPLATE } = await import(libUrl('ssh-shell', 'hosts.js'))
 
   const scratch = mkdtempSync(join(tmpdir(), 'dsh-wmb-exec-'))
-  const hostKey = ssh2.utils.generateKeyPairSync('ed25519')
-  const clientKey = ssh2.utils.generateKeyPairSync('ed25519')
+  const hostKey = stableKeyPair()
+  const clientKey = stableKeyPair()
   const hostPublic = ssh2.utils.parseKey(hostKey.public)
   const keyPath = join(scratch, 'id_ed25519')
   writeFileSync(keyPath, clientKey.private)
@@ -4202,8 +4226,8 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
   const localRoot = join(root, 'local')
   fs.mkdirSync(remoteRoot, { recursive: true })
   fs.mkdirSync(localRoot, { recursive: true })
-  const hostKey = ssh2.utils.generateKeyPairSync('ed25519')
-  const clientKey = ssh2.utils.generateKeyPairSync('ed25519')
+  const hostKey = stableKeyPair()
+  const clientKey = stableKeyPair()
   const hostPublic = ssh2.utils.parseKey(hostKey.public)
   const keyPath = join(root, 'id_ed25519')
   writeFileSync(keyPath, clientKey.private)
@@ -4231,8 +4255,8 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
    * @param options.ignoreSubsystem - never accept/reject the sftp subsystem request.
    * @param options.deny - remote paths answered with PERMISSION_DENIED.
    */
-  const startServer = async ({ holdOpen = false, ignoreSubsystem = false, deny = [], denyMkdir = [] } = {}) => {
-    const state = { connections: 0, sftpOpened: 0, sftpClosed: 0 }
+  const startServer = async ({ holdOpen = false, ignoreSubsystem = false, deny = [], denyMkdir = [], execDelayMs = 0, ignoreSftpRequests = 0 } = {}) => {
+    const state = { connections: 0, sftpOpened: 0, sftpClosed: 0, sftpRequests: 0 }
     const server = new ssh2.Server({ hostKeys: [hostKey.private] }, (client) => {
       state.connections += 1
       client.on('error', () => {})
@@ -4242,14 +4266,20 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
           const session = accept()
           session.on('exec', (acceptExec) => {
             const stream = acceptExec()
-            stream.write('fixture-ok')
-            stream.exit(0)
-            stream.end()
+            const answer = () => {
+              stream.write('fixture-ok')
+              stream.exit(0)
+              stream.end()
+            }
+            if (execDelayMs > 0) setTimeout(answer, execDelayMs)
+            else answer()
           })
           session.on('sftp', (acceptSftp) => {
             // The subsystem request is simply dropped: the client must still end at its
             // own deadline, before any SFTP session exists.
+            state.sftpRequests += 1
             if (ignoreSubsystem) return
+            if (state.sftpRequests <= ignoreSftpRequests) return
             state.sftpOpened += 1
             const sftp = acceptSftp()
             session.on('close', () => { state.sftpClosed += 1 })
@@ -4712,7 +4742,7 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
       assert.equal(closes, 1, 'and closed exactly once')
     })
 
-    await testAsync('a stalled SSH handshake times out in the connect phase and drops the client', async () => {
+    await testAsync('a stalled SSH handshake times out in the connect phase and retires the client', async () => {
       const net = await import('node:net')
       const sockets = []
       const silent = net.createServer((socket) => {
@@ -4736,12 +4766,103 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
         assert.equal(result.error.phase, 'connect')
         assert.match(result.error.message, /timed out after 200 ms/)
         assert.ok(elapsed < 3000, 'the deadline ended the call: ' + elapsed + ' ms')
-        assert.equal(pool.size(), 0, 'the wedged client was dropped so it cannot accumulate pending requests')
+        assert.equal(pool.size(), 0, 'the wedged connection was retired so new calls cannot queue behind it')
       } finally {
         pool.dispose()
         for (const socket of sockets) socket.destroy()
         await new Promise((resolve) => silent.close(resolve))
       }
+    })
+
+    await testAsync('a stalled transfer timeout does NOT kill a command sharing the client', async () => {
+      const fixture = await startServer({ execDelayMs: 400, ignoreSftpRequests: 1 })
+      const { SshShellExecutor } = await import(libUrl('ssh-shell', 'index.js'))
+      const pool = new SshPool({ knownHostsPath: knownHostsFor(fixture.port) })
+      const config = SshShellExecutor.Config({ hosts: [hostEntry(fixture.port)], timeoutMs: 5000, maxTimeoutMs: 60000 })
+      const executor = Object.assign(Object.create(SshShellExecutor.prototype), {
+        config, poolInstance: pool, internals: {}, processFacts: new Map(), warnedAbout: new Set(),
+        ctx: { sandboxPolicy: { defaultMode: 'workspace-write', resolve: () => ({ mode: 'workspace-write', workspaceRoot: localRoot }) }, logger: { warn: () => {}, debug: () => {} } },
+      })
+      try {
+        // The command runs for 400 ms on the client the stalled transfer is about to
+        // retire; retiring must not tear the connection down under it.
+        const command = (async () => (await executor.execute(executor.resolve({ command: 'true', timeoutMs: 5000 }))).result())()
+        const local = join(localRoot, 'lease-stall.txt')
+        writeFileSync(local, 'x')
+        const transfer = await executor.transferRunner().upload({ host: hostEntry(fixture.port), localPath: local, remotePath: '/lease-stall.txt', timeoutMs: 100 })
+        assert.equal(transfer.ok, false)
+        assert.equal(transfer.error.phase, 'connect')
+        assert.match(transfer.error.message, /timed out after 100 ms/)
+        const result = await command
+        assert.equal(result.exitCode, 0, 'the command sharing the client finished normally')
+        assert.equal(fixture.state.connections, 1, 'one connection served both')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('one stalled transfer does not stop a second, healthy transfer', async () => {
+      const fixture = await startServer({ ignoreSftpRequests: 1 })
+      const { pool, runner } = runnerFor(fixture)
+      try {
+        const first = join(localRoot, 'stall-one.txt')
+        const second = join(localRoot, 'healthy-two.txt')
+        writeFileSync(first, 'one')
+        writeFileSync(second, 'two')
+        const stalled = runner.upload({ host: hostEntry(fixture.port), localPath: first, remotePath: '/stall-one.txt', timeoutMs: 150 })
+        await new Promise((resolve) => setTimeout(resolve, 40))
+        const healthy = runner.upload({ host: hostEntry(fixture.port), localPath: second, remotePath: '/healthy-two.txt', timeoutMs: 5000 })
+        const [stalledResult, healthyResult] = await Promise.all([stalled, healthy])
+        assert.equal(stalledResult.ok, false)
+        assert.match(stalledResult.error.message, /timed out after 150 ms/)
+        assert.deepEqual(healthyResult, { ok: true, bytes: 3, files: 1 }, 'the healthy transfer completed on the shared connection')
+        assert.equal(readFileSync(join(remoteRoot, 'healthy-two.txt'), 'utf8'), 'two')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('a stale retire never kills the replacement connection', async () => {
+      const { SshPool } = await import(libUrl('ssh-shell', 'pool.js'))
+      const fixture = await startServer()
+      const pool = new SshPool({ knownHostsPath: knownHostsFor(fixture.port) })
+      try {
+        const host = hostEntry(fixture.port)
+        const first = await pool.get(host)
+        assert.equal(pool.retire(host.alias, first), true, 'the current generation is retired')
+        const second = await pool.get(host)
+        assert.notEqual(second, first, 'the next call dialled a fresh connection')
+        assert.equal(fixture.state.connections, 2)
+        assert.equal(pool.retire(host.alias, first), false, 'a late timeout for the OLD client cannot retire the new one')
+        assert.equal(pool.size(), 1, 'the replacement is still the current record')
+        const local = join(localRoot, 'replacement.txt')
+        writeFileSync(local, 'ok')
+        const runner = new ScpRunner({ pool })
+        const result = await runner.upload({ host, localPath: local, remotePath: '/replacement.txt', timeoutMs: 5000 })
+        assert.equal(result.ok, true, 'the replacement connection still works')
+        pool.release(second)
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('the registry verdict wins over a bad remote path claim', async () => {
+      const { createScpTool } = await import(libUrl('ssh-shell', 'scp-tool.js'))
+      const tools = []
+      const fakeCtx = { tools: { register: (definition) => tools.push(definition) }, sandboxPolicy: undefined, logger: {} }
+      const tool = createScpTool()
+      await tool.register(fakeCtx, {
+        executor: {
+          aliasChoices: () => ({ aliases: [], error: 'duplicate alias "dup"' }),
+          hostFor: () => { throw new Error('ssh-shell: sshShell.hosts is invalid (duplicate alias "dup"); every call fails until it is fixed') },
+        },
+      })
+      const definition = tools[0]
+      const value = await definition.execute(
+        { action: 'upload', localPath: 'a.txt', remotePath: 'C:/Users/me/x.txt' },
+        { agent: undefined, signal: new AbortController().signal },
+      )
+      assert.equal(value.ok, false)
+      assert.equal(value.error.phase, 'config')
+      assert.match(value.error.message, /sshShell\.hosts is invalid \(duplicate alias "dup"\)/, 'the registry verdict, not the path: ' + value.error.message)
+      // And the render carries no local-side claim for a refusal that never resolved one.
+      const rendered = definition.output.render({}, value)
+      assert.equal(rendered.length, 1)
+      assert.doesNotMatch(rendered[0].text, /local side ran/, rendered[0].text)
     })
 
     await testAsync('the runner never logs a file content, a key or a passphrase', async () => {
