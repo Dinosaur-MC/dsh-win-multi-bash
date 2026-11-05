@@ -7512,6 +7512,164 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
   })
 }
 
+console.log('\n[A] unit: the terminal session route (HTTP fence, method, body, dispatch)')
+{
+  // The Session header's data channel is exercised as the MODULE it is: the route
+  // factory, the endpoint dispatcher and the per-server registration guard are all
+  // imported directly, so the contract is tested without a web server or a PTY.
+  const { createSessionDispatch, createSessionRouteHandler, registerSessionRoute } = await import(libUrl('tool-bash', 'types', 'terminal.js'))
+  const fakeSessions = (over = {}) => ({
+    listAll: () => [],
+    list: () => [],
+    tail: () => undefined,
+    clearFinished: () => 0,
+    stop: async () => true,
+    ...over,
+  })
+  const makeRequest = ({ method = 'POST', url = '/win-mb/sessions.list', contentType = 'application/json', body = '{}' } = {}) => ({
+    method,
+    url,
+    headers: contentType === null ? {} : { 'content-type': contentType },
+    async *[Symbol.asyncIterator]() {
+      if (body !== undefined && body !== null) yield Buffer.from(body)
+    },
+  })
+  const makeResponse = () => {
+    const record = { status: undefined, headers: undefined, body: undefined, ended: false, writes: 0 }
+    let sent = false
+    return {
+      record,
+      res: {
+        get headersSent() { return sent },
+        writeHead(status, headers) { record.status = status; record.headers = headers; record.writes += 1; sent = true },
+        end(body) { record.ended = true; if (body !== undefined) record.body = String(body) },
+      },
+    }
+  }
+  const handlerFor = (hostCtx, over = {}) => createSessionRouteHandler({
+    hostCtx,
+    dispatch: createSessionDispatch(fakeSessions(over)),
+  })
+  const runRoute = async (handler, request = {}) => {
+    const { res, record } = makeResponse()
+    await handler(makeRequest(request), res)
+    return record
+  }
+  const json = (record) => JSON.parse(record.body)
+
+  test('the route factory registers ONE prefix route per web server and frees it on dispose', () => {
+    const registrations = []
+    let disposed = 0
+    const webServer = { register: (options) => { registrations.push(options); return () => { disposed += 1 } } }
+    const handler = () => {}
+    const dispose = registerSessionRoute(webServer, handler, () => {})
+    assert.deepEqual(registrations.map((options) => ({ kind: options.kind, path: options.path })), [{ kind: 'prefix', path: '/win-mb' }])
+    assert.equal(registrations[0].handler, handler)
+    assert.equal(typeof dispose, 'function')
+    // A repeated ctx.inject must not throw 'duplicate prefix route' or lose the handler.
+    assert.equal(registerSessionRoute(webServer, handler, () => {}), undefined, 'a second registration is a no-op')
+    assert.equal(registrations.length, 1)
+    dispose()
+    assert.equal(disposed, 1, 'the effect disposer takes the route down')
+    // ...and the server is forgotten, so a reload can register again.
+    const again = registerSessionRoute(webServer, handler, () => {})
+    assert.equal(registrations.length, 2)
+    assert.equal(typeof again, 'function')
+    again()
+  })
+
+  await testAsync('no trust fence is a 503; a rejection is echoed with its own status', async () => {
+    const bare = await runRoute(handlerFor({}), {})
+    assert.equal(bare.status, 503, 'a host without requestRejection fails closed')
+    for (const [status, body] of [[401, 'unauthorized'], [403, 'forbidden']]) {
+      const record = await runRoute(handlerFor({ connection: { requestRejection: () => status } }), {})
+      assert.equal(record.status, status)
+      assert.equal(record.body, body)
+    }
+  })
+
+  await testAsync('the route is POST and JSON only: 405 carries Allow, a missing content type is 415', async () => {
+    const hostCtx = { connection: { requestRejection: () => undefined } }
+    const get = await runRoute(handlerFor(hostCtx), { method: 'GET' })
+    assert.equal(get.status, 405)
+    assert.deepEqual(get.headers, { Allow: 'POST' })
+    const plain = await runRoute(handlerFor(hostCtx), { contentType: 'text/plain' })
+    assert.equal(plain.status, 415, 'a body that is not JSON is refused before it is parsed')
+    assert.deepEqual(plain.headers, { Allow: 'POST' })
+  })
+
+  await testAsync('the route refuses a body over 64 KiB and malformed JSON with a 400', async () => {
+    const hostCtx = { connection: { requestRejection: () => undefined } }
+    const huge = await runRoute(handlerFor(hostCtx), { body: 'x'.repeat(65537) })
+    assert.equal(huge.status, 400)
+    assert.equal(json(huge).error.code, 'terminal/bad-request')
+    const malformed = await runRoute(handlerFor(hostCtx), { body: '{oops' })
+    assert.equal(malformed.status, 400)
+    assert.equal(json(malformed).error.code, 'terminal/bad-request')
+  })
+
+  await testAsync('sessions.list over the route answers the registry envelope; an unknown endpoint is structured', async () => {
+    const hostCtx = { connection: { requestRejection: () => undefined } }
+    const list = await runRoute(handlerFor(hostCtx, { listAll: () => [], list: () => [] }), {})
+    assert.equal(list.status, 200)
+    assert.deepEqual(json(list), { ok: true, value: { sessions: [] } })
+    assert.match(list.headers['Content-Type'], /application\/json/)
+    const unknown = await runRoute(handlerFor(hostCtx), { url: '/win-mb/sessions.bogus' })
+    assert.equal(unknown.status, 200)
+    assert.equal(json(unknown).ok, false)
+    assert.equal(json(unknown).error.code, 'terminal/unknown-endpoint')
+  })
+
+  await testAsync('sessions.list scopes by ownerKey and sessions.tail needs a sessionId', async () => {
+    const hostCtx = { connection: { requestRejection: () => undefined } }
+    const seen = []
+    const dispatch = createSessionDispatch(fakeSessions({
+      listAll: () => [{ sessionId: 'all' }],
+      list: (ownerKey) => { seen.push(ownerKey); return [{ sessionId: 'scoped' }] },
+    }))
+    const response = await dispatch('sessions.list', { ownerKey: 'session-7' })
+    assert.deepEqual(seen, ['session-7'])
+    assert.deepEqual(response.value.sessions, [{ sessionId: 'scoped' }])
+    const unscoped = await dispatch('sessions.list', {})
+    assert.deepEqual(unscoped.value.sessions, [{ sessionId: 'all' }])
+    const tail = await dispatch('sessions.tail', {})
+    assert.equal(tail.ok, false)
+    assert.equal(tail.error.code, 'terminal/bad-request')
+    assert.match(tail.error.message, /needs a sessionId/)
+    const stop = await dispatch('sessions.stop', {})
+    assert.equal(stop.error.code, 'terminal/bad-request')
+    // The route writes the dispatcher's value unchanged, bad-request included.
+    const record = await runRoute(createSessionRouteHandler({ hostCtx, dispatch }), { url: '/win-mb/sessions.tail' })
+    assert.equal(record.status, 200)
+    assert.equal(json(record).error.code, 'terminal/bad-request')
+  })
+
+  await testAsync('a throwing dispatcher answers 400 once, and never writes headers twice', async () => {
+    const hostCtx = { connection: { requestRejection: () => undefined } }
+    const thrown = await runRoute(createSessionRouteHandler({
+      hostCtx,
+      dispatch: async () => { throw new Error('dispatch exploded') },
+    }), { url: '/win-mb/sessions.list' })
+    assert.equal(thrown.status, 400)
+    assert.equal(json(thrown).error.code, 'terminal/bad-request')
+    assert.equal(thrown.writes, 1)
+    // A handler that already began its response must not write headers again.
+    let writes = 0
+    let ended = false
+    const result = await new Promise((resolve) => {
+      const res = {
+        get headersSent() { return true },
+        writeHead() { writes += 1; throw new Error('headers are already sent') },
+        end() { ended = true; resolve({ writes, ended }) },
+      }
+      void createSessionRouteHandler({
+        hostCtx,
+        dispatch: async () => { throw new Error('too late') },
+      })(makeRequest({ url: '/win-mb/sessions.list' }), res)
+    })
+    assert.deepEqual(result, { writes: 0, ended: true }, 'the catch only ends an already-started response')
+  })
+}
 console.log('\n[B] boot integration: the terminal row over a REAL PTY (state must survive between calls)')
 {
   // The acceptance test the row exists for: one live interactive shell whose
@@ -7848,9 +8006,10 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
   })
 
   test('the session header panel registers on the declared slot when a connection exists', () => {
-    // The panel rides the deployment's own Connection RPC channel. The header slot
-    // is declared by ui-conversation, so `slots.inject` only fires where that shell
-    // renders; the inject face carries the connection into the component.
+    // The panel's data channel is the plugin's own `/win-mb` prefix route on the
+    // host web server (a 404/405 there falls back to Connection RPC). The header
+    // slot is declared by ui-conversation, so `slots.inject` only fires where that
+    // shell renders; the inject face carries the connection into the component.
     const registered = []
     const platform = {
       locale: { register: () => () => {}, t: (key) => key },
@@ -7883,6 +8042,12 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.equal(entry.options.order, 30, 'the panel follows the job list (order 20) in the header band')
     // Like the job list, the control renders nothing while no session exists.
     assert.equal(entry.component({ t: (key) => key, connection: platform.connection }), null, 'an empty registry hides the control')
+    // The hide is decided by the EMPTY LIST, not by a successful probe: a host whose
+    // channel rejects must not turn the header into an error banner either.
+    const failing = { rpc: { call: async () => { throw new Error('probe rejected') } } }
+    assert.equal(entry.component({ t: (key) => key, connection: failing }), null, 'a rejecting probe still hides the empty control')
+    const unavailable = entry.component({ t: (key) => key, sessionId: 'session-1' })
+    assert.equal(unavailable, null, 'a missing connection also renders nothing')
   })
 
   test('it declares the client services the page needs', () => {

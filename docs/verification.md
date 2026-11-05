@@ -22,7 +22,7 @@ pnpm test
 
 Boots a real composition over the profile runtime (modifying nothing) from its own fixture — which mounts the `git_bash` **and** `wsl_bash` rows explicitly, because the shipped patch ships the WSL row off — executes real commands (including an explicit `bashPath` variant), and asserts `ctx.shell` is still provided by the base bundle's own row (the regression this plugin once caused). The shipped patch's own default rows are verified by the audit instead (`pnpm run test:audit`, below).
 
-It is a **verdict, not a report**: a missing tool, a wrong description, a lost `ctx.shell` seat or a failed command fails the run. The fixture whose git row is disabled is used to prove the missing-tool case actually fails.
+It is a **verdict, not a report**: a missing tool, a wrong description, a lost `ctx.shell` seat or a failed command fails the run. It boots exactly two fixtures — the schema-default bash resolution and an explicit `bashPath` pin; neither disables the git row, so a missing-tool fixture is not part of this driver (the audit covers the misconfiguration cases it can boot: a stale pinned `bashPath`, a broken WSL backend, a nonexistent `wslDistro`).
 
 On a host where `wsl.exe` exists but no distribution answers (the GitHub-hosted Windows image installs WSL this way), the driver still asserts the `wsl_bash` row is registered and advertises its facts, but reports the real-WSL command as a skip instead of failing the verdict. Both entries accept `DSH_AUDIT_WSL` to point the probe at a non-default launcher.
 
