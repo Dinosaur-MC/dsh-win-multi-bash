@@ -4407,6 +4407,104 @@ console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (
         assert.equal(fixture.connections(), 0)
       } finally { pool.dispose(); await fixture.close() }
     })
+    await testAsync('the gate maps cancelled through the real wiring, and never dials', async () => {
+      const approval = fakeApproval(['cancelled'])
+      const fixture = await startServer(() => {})
+      const { executor, pool } = await executorFor(fixture, { host: { approval: 'session' }, approval })
+      try {
+        let failure
+        try { await executor.execute(executor.resolve({ command: 'echo never', timeoutMs: 5000, agent: fakeAgent(fakeSession()) })) } catch (error) { failure = error }
+        assert.equal(failure.name, 'ApprovalError')
+        assert.equal(failure.phase, 'approval')
+        assert.equal(failure.outcome, 'cancelled')
+        assert.match(failure.message, /cancelled before it was answered/)
+        assert.equal(fixture.connections(), 0)
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('the gate maps unavailable through the real wiring, naming the escape hatch', async () => {
+      const approval = fakeApproval(['unavailable'])
+      const fixture = await startServer(() => {})
+      const { executor, pool } = await executorFor(fixture, { host: { approval: 'session' }, approval })
+      try {
+        let failure
+        try { await executor.execute(executor.resolve({ command: 'echo never', timeoutMs: 5000, agent: fakeAgent(fakeSession()) })) } catch (error) { failure = error }
+        assert.equal(failure.outcome, 'unavailable')
+        assert.match(failure.message, /no approval answerer is available/)
+        assert.match(failure.message, /approval: trusted/)
+        assert.equal(fixture.connections(), 0)
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('the gate reads the PUBLIC policy surface: overrideOf(session) === never rejects without asking', async () => {
+      const approval = {
+        // No effectivePolicy at all: only the published public members.
+        overrideOf: () => 'never',
+        request: async () => { throw new Error('a never policy must not ask') },
+      }
+      const fixture = await startServer(() => {})
+      const { executor, pool } = await executorFor(fixture, { host: { approval: 'session' }, approval })
+      try {
+        let failure
+        try { await executor.execute(executor.resolve({ command: 'echo never', timeoutMs: 5000, agent: fakeAgent(fakeSession()) })) } catch (error) { failure = error }
+        assert.equal(failure.outcome, 'rejected')
+        assert.match(failure.message, /policy is "never"/)
+        assert.equal(fixture.connections(), 0)
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('the gate falls back to config.policy when the session has no override', async () => {
+      const approval = { config: { policy: 'never' }, request: async () => { throw new Error('a never policy must not ask') } }
+      const fixture = await startServer(() => {})
+      const { executor, pool } = await executorFor(fixture, { host: { approval: 'session' }, approval })
+      try {
+        let failure
+        try { await executor.execute(executor.resolve({ command: 'echo never', timeoutMs: 5000, agent: fakeAgent(fakeSession()) })) } catch (error) { failure = error }
+        assert.match(failure.message, /policy is "never"/)
+        assert.equal(fixture.connections(), 0)
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('the gate is rebuilt once an approval service appears (fail closed until then)', async () => {
+      const fixture = await startServer((stream) => { stream.write('ok\n'); stream.exit(0); stream.end() })
+      const { executor, pool } = await executorFor(fixture, { host: { approval: 'session' } })
+      try {
+        const agent = fakeAgent(fakeSession())
+        let first
+        try { await executor.execute(executor.resolve({ command: 'echo never', timeoutMs: 5000, agent })) } catch (error) { first = error }
+        assert.match(first.message, /no approval answerer is available/, 'without a service the row fails closed')
+        assert.equal(fixture.connections(), 0)
+        const approval = fakeApproval()
+        executor.ctx.approval = approval
+        const result = await (await executor.execute(executor.resolve({ command: 'echo now', timeoutMs: 5000, agent }))).result()
+        assert.equal(result.exitCode, 0, 'the late-composed service is picked up')
+        assert.equal(approval.calls.length, 1)
+        assert.equal(fixture.connections(), 1)
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('an abort during a pending approval settles as cancelled and never dials', async () => {
+      const approval = {
+        request: (request) => new Promise((resolve) => {
+          // Mimic the host: an aborted request signal settles the request as cancelled.
+          request.signal?.addEventListener?.('abort', () => resolve('cancelled'), { once: true })
+        }),
+      }
+      const fixture = await startServer(() => {})
+      const { executor, pool } = await executorFor(fixture, { host: { approval: 'session' }, approval })
+      const controller = new AbortController()
+      try {
+        const started = Date.now()
+        const pending = executor.execute(executor.resolve({ command: 'echo never', timeoutMs: 30000, agent: fakeAgent(fakeSession()), signal: controller.signal }))
+        setTimeout(() => controller.abort(), 40)
+        let failure
+        try { await pending } catch (error) { failure = error }
+        assert.equal(failure.name, 'ApprovalError')
+        assert.equal(failure.outcome, 'cancelled')
+        assert.ok(Date.now() - started < 1000, 'the abort settled the pending request')
+        assert.equal(fixture.connections(), 0)
+      } finally { pool.dispose(); await fixture.close() }
+    })
     await testAsync('a missing host alias names the aliases this row declares', async () => {
       const fixture = await startServer(() => {})
       const { executor, pool } = await executorFor(fixture)
@@ -5421,6 +5519,40 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
         assert.equal(shellResult.exitCode, 0)
         assert.equal(scpValue.ok, true, JSON.stringify(scpValue))
         assert.equal(fixture.state.connections, 1, 'one connection served both tools')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+    await testAsync('the ssh_scp gate never lets a raw throw escape (cancelled and unavailable)', async () => {
+      const approval = fakeApproval(['cancelled', 'unavailable'])
+      const fixture = await startServer()
+      const { SshShellExecutor } = await import(libUrl('ssh-shell', 'index.js'))
+      const { createScpTool } = await import(libUrl('ssh-shell', 'scp-tool.js'))
+      const pool = new SshPool({ knownHostsPath: knownHostsFor(fixture.port) })
+      const config = SshShellExecutor.Config({ hosts: [hostEntry(fixture.port, { approval: 'session' })], timeoutMs: 5000, maxTimeoutMs: 60000 })
+      const executor = Object.assign(Object.create(SshShellExecutor.prototype), {
+        config, poolInstance: pool, internals: {}, processFacts: new Map(), warnedAbout: new Set(),
+        ctx: { sandboxPolicy: { defaultMode: 'workspace-write', resolve: () => ({ mode: 'workspace-write', workspaceRoot: localRoot }) }, approval, logger: { warn: () => {}, debug: () => {} } },
+      })
+      const tools = []
+      const toolCtx = { tools: { register: (definition) => tools.push(definition) }, sandboxPolicy: { resolve: () => ({ mode: 'workspace-write', workspaceRoot: localRoot }) }, get: () => undefined, logger: { warn: () => {} } }
+      await createScpTool().register(toolCtx, { executor })
+      try {
+        const session = { id: 'scp-gate-session', header: { cwd: localRoot } }
+        const agent = fakeAgent(session)
+        const local = join(localRoot, 'gate-outcomes.txt')
+        writeFileSync(local, 'x')
+        const run = (callId) => tools[0].execute(
+          { action: 'upload', localPath: local, remotePath: '/gate-outcomes.txt', timeoutMs: 5000 },
+          { agent, callId, signal: new AbortController().signal },
+        )
+        const cancelled = await run('c1')
+        assert.equal(cancelled.ok, false)
+        assert.equal(cancelled.error.phase, 'approval')
+        assert.match(cancelled.error.message, /cancelled before it was answered/)
+        const unavailable = await run('c2')
+        assert.equal(unavailable.ok, false)
+        assert.equal(unavailable.error.phase, 'approval')
+        assert.match(unavailable.error.message, /no approval answerer is available/)
+        assert.equal(fixture.state.connections, 0, 'neither refusal dialled')
       } finally { pool.dispose(); await fixture.close() }
     })
     await testAsync('two operations reuse ONE pooled connection and one SFTP session each', async () => {
