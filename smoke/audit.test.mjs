@@ -4256,10 +4256,11 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
    * @param options.deny - remote paths answered with PERMISSION_DENIED.
    */
   const startServer = async ({ holdOpen = false, ignoreSubsystem = false, deny = [], denyMkdir = [], execDelayMs = 0, ignoreSftpRequests = 0 } = {}) => {
-    const state = { connections: 0, sftpOpened: 0, sftpClosed: 0, sftpRequests: 0 }
+    const state = { connections: 0, disconnects: 0, sftpOpened: 0, sftpClosed: 0, sftpRequests: 0 }
     const server = new ssh2.Server({ hostKeys: [hostKey.private] }, (client) => {
       state.connections += 1
       client.on('error', () => {})
+      client.on('close', () => { state.disconnects += 1 })
       client.on('authentication', (context) => context.accept())
       client.on('ready', () => {
         client.on('session', (accept) => {
@@ -4742,7 +4743,7 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
       assert.equal(closes, 1, 'and closed exactly once')
     })
 
-    await testAsync('a stalled SSH handshake times out in the connect phase and retires the client', async () => {
+    await testAsync('a stalled SSH handshake times out in the connect phase and does not accumulate dials', async () => {
       const net = await import('node:net')
       const sockets = []
       const silent = net.createServer((socket) => {
@@ -4766,14 +4767,23 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
         assert.equal(result.error.phase, 'connect')
         assert.match(result.error.message, /timed out after 200 ms/)
         assert.ok(elapsed < 3000, 'the deadline ended the call: ' + elapsed + ' ms')
-        assert.equal(pool.size(), 0, 'the wedged connection was retired so new calls cannot queue behind it')
+        // No lease existed when the deadline fired, so nothing is retired: the DIAL is
+        // still pending on the host's own connect ceiling. The anti-accumulation fact
+        // is that it is ONE shared record — a second attempt joins it, not a new socket.
+        assert.equal(pool.size(), 1, 'one pending dial is tracked')
+        assert.equal(pool.leases.size, 0, 'no lease was ever handed out (get never resolved)')
+        const again = await runner.upload({ host: hostEntry(port), localPath: local, remotePath: '/stalled.txt', timeoutMs: 150 })
+        assert.equal(again.error.phase, 'connect')
+        assert.equal(sockets.length, 1, 'the second attempt reused the one pending connection')
+        assert.equal(pool.size(), 1)
       } finally {
         pool.dispose()
+        assert.equal(pool.size(), 0)
+        assert.equal(pool.leases.size, 0)
         for (const socket of sockets) socket.destroy()
         await new Promise((resolve) => silent.close(resolve))
       }
     })
-
     await testAsync('a stalled transfer timeout does NOT kill a command sharing the client', async () => {
       const fixture = await startServer({ execDelayMs: 400, ignoreSftpRequests: 1 })
       const { SshShellExecutor } = await import(libUrl('ssh-shell', 'index.js'))
@@ -4818,28 +4828,28 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
       } finally { pool.dispose(); await fixture.close() }
     })
 
-    await testAsync('a stale retire never kills the replacement connection', async () => {
-      const { SshPool } = await import(libUrl('ssh-shell', 'pool.js'))
-      const fixture = await startServer()
-      const pool = new SshPool({ knownHostsPath: knownHostsFor(fixture.port) })
+    await testAsync('the runner retires only the client it leased, and the replacement survives', async () => {
+      const fixture = await startServer({ ignoreSftpRequests: 1 })
+      const { pool, runner } = runnerFor(fixture)
       try {
         const host = hostEntry(fixture.port)
-        const first = await pool.get(host)
-        assert.equal(pool.retire(host.alias, first), true, 'the current generation is retired')
-        const second = await pool.get(host)
-        assert.notEqual(second, first, 'the next call dialled a fresh connection')
-        assert.equal(fixture.state.connections, 2)
-        assert.equal(pool.retire(host.alias, first), false, 'a late timeout for the OLD client cannot retire the new one')
-        assert.equal(pool.size(), 1, 'the replacement is still the current record')
-        const local = join(localRoot, 'replacement.txt')
-        writeFileSync(local, 'ok')
-        const runner = new ScpRunner({ pool })
-        const result = await runner.upload({ host, localPath: local, remotePath: '/replacement.txt', timeoutMs: 5000 })
-        assert.equal(result.ok, true, 'the replacement connection still works')
-        pool.release(second)
+        // Lease the current client first, so the stale retire below has a generation
+        // that the runner itself already retired.
+        const firstClient = await pool.get(host)
+        pool.release(firstClient)
+        const local = join(localRoot, 'stale.txt')
+        writeFileSync(local, 'one')
+        const stalled = await runner.upload({ host, localPath: local, remotePath: '/stale.txt', timeoutMs: 120 })
+        assert.equal(stalled.ok, false)
+        assert.match(stalled.error.message, /timed out after 120 ms/)
+        assert.equal(pool.leases.size, 0, 'the timed-out call handed its own lease back')
+        assert.equal(pool.retire(host.alias, firstClient), false, 'the runner retired that generation itself; a stale retire is refused')
+        writeFileSync(local, 'two')
+        const replacement = await runner.upload({ host, localPath: local, remotePath: '/stale-2.txt', timeoutMs: 5000 })
+        assert.deepEqual(replacement, { ok: true, bytes: 3, files: 1 }, 'the replacement connection still works')
+        assert.equal(fixture.state.connections, 2, 'exactly one replacement was dialled')
       } finally { pool.dispose(); await fixture.close() }
     })
-
     await testAsync('the registry verdict wins over a bad remote path claim', async () => {
       const { createScpTool } = await import(libUrl('ssh-shell', 'scp-tool.js'))
       const tools = []
@@ -4863,6 +4873,11 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
       const rendered = definition.output.render({}, value)
       assert.equal(rendered.length, 1)
       assert.doesNotMatch(rendered[0].text, /local side ran/, rendered[0].text)
+      // A CONNECT failure resolved a local path but moved nothing: the note must say so.
+      const connectValue = { ok: false, bytes: 0, error: { phase: 'connect', alias: 'a', message: 'timed out' }, sandbox: { mode: 'workspace-write', remote: true }, outsideWorkspace: true }
+      const connectText = definition.output.render({}, connectValue)[0].text
+      assert.match(connectText, /local path resolved OUTSIDE the workspace/, connectText)
+      assert.doesNotMatch(connectText, /local side ran/, connectText)
     })
 
     await testAsync('the runner never logs a file content, a key or a passphrase', async () => {
@@ -4883,6 +4898,24 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
       } finally { pool.dispose(); await fixture.close() }
     })
 
+    await testAsync('repeated ignored-subsystem timeouts release every lease and close every retired connection', async () => {
+      const fixture = await startServer({ ignoreSubsystem: true })
+      const { pool, runner } = runnerFor(fixture)
+      try {
+        const local = join(localRoot, 'leak.txt')
+        writeFileSync(local, 'x')
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          const result = await runner.upload({ host: hostEntry(fixture.port), localPath: local, remotePath: '/leak.txt', timeoutMs: 100 })
+          assert.equal(result.ok, false)
+          assert.equal(result.error.phase, 'connect')
+          assert.equal(pool.leases.size, 0, 'attempt ' + attempt + ': no lease is left behind (was ' + pool.leases.size + ')')
+          assert.equal(pool.size(), 0, 'attempt ' + attempt + ': nothing is left current')
+          assert.equal(fixture.state.connections, attempt, 'each attempt dialled a fresh connection')
+        }
+        await waitFor(() => fixture.state.disconnects === 3, 2000)
+        assert.equal(fixture.state.disconnects, 3, 'every retired connection was actually closed')
+      } finally { pool.dispose(); await fixture.close() }
+    })
     await testAsync('two operations reuse ONE pooled connection and one SFTP session each', async () => {
       const fixture = await startServer()
       const { pool, runner } = runnerFor(fixture)
