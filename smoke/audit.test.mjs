@@ -8956,6 +8956,8 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     walk(root)
     return nodes
   }
+  /** Expansion overrides for editor rows whose alias makes them start collapsed. */
+  const expandRows = (rows) => ({ expandedRows: Object.fromEntries(rows.map((row) => [row.__rowId, true])) })
   test('the hosts card renders the TABLE: one fieldset per host, no JSON text, no navigation', () => {
     const sshRow = ROWS.find((row) => row.rowId === 'win-mb-tool-ssh')
     const stored = [{ alias: 'prod', host: 'h.example', user: 'u', keyPath: 'k', default: true }]
@@ -8966,7 +8968,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     const editor = flattenTree(tree).find((node) => node.type === HostsEditor)
     assert.ok(editor !== undefined, 'the ssh page renders the table, not a text box')
     assert.equal(editor.props.knob.kind, 'hosts')
-    const nodes = flattenTree(HostsEditor(editor.props))
+    const nodes = flattenTree(HostsEditor({ ...editor.props, expandedRows: { 'stored-0': true } }))
     assert.equal(nodes.filter((node) => node.type === 'fieldset').length, 1, 'one card per host')
     assert.equal(nodes.filter((node) => node.type === 'input' && node.props.type === 'radio').length, 1, 'one default radio')
     assert.equal(nodes.filter((node) => node.type === 'input' && node.props.type === 'checkbox').length, 1, 'acceptNewHostKeys is a checkbox')
@@ -9054,11 +9056,98 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
       assert.doesNotMatch(dictionary['hosts.required'], /\{field\}/)
     }
   })
+  test('the hosts table carries its own Save, wired to the form save action', () => {
+    const saves = []
+    const complete = blankHostRow()
+    complete.alias = 'prod'; complete.host = 'h.example'; complete.user = 'u'; complete.keyPath = 'k'
+    const propsFor = (save) => ({ ...expandRows([complete]), knob: { key: 'sshShell.hosts', rows: [complete], rowErrors: hostRowErrors([complete]) }, disabled: false, t: (key) => en[key] ?? key, edit: () => {}, resetField: () => {}, save })
+    const nodes = flattenTree(HostsEditor(propsFor(() => saves.push(1))))
+    const button = nodes.find((node) => node.props?.['data-action'] === 'save')
+    assert.ok(button !== undefined, 'the table has its own Save')
+    assert.equal(button.props.disabled, false)
+    button.props.onClick()
+    assert.equal(saves.length, 1, 'one click is one save')
+    // A seat without the action still renders the table; its Save is inert, not a crash.
+    const bare = flattenTree(HostsEditor(propsFor(undefined)))
+    const inert = bare.find((node) => node.props?.['data-action'] === 'save')
+    assert.equal(inert.props.disabled, true)
+    inert.props.onClick()
+  })
+
+  test('Add host is disabled while any row is invalid and re-enables when every row is valid', () => {
+    const propsFor = (rows) => ({ knob: { key: 'sshShell.hosts', rows, rowErrors: hostRowErrors(rows) }, disabled: false, t: (key) => en[key] ?? key, edit: () => {}, resetField: () => {} })
+    const addOf = (rows) => flattenTree(HostsEditor(propsFor(rows))).find((node) => node.props?.['data-action'] === 'add')
+    const invalid = addOf([blankHostRow()])
+    assert.equal(invalid.props.disabled, true, 'a blank row blocks adding')
+    assert.match(invalid.props.title, /highlighted fields/)
+    const complete = blankHostRow()
+    complete.alias = 'prod'; complete.host = 'h.example'; complete.user = 'u'; complete.keyPath = 'k'
+    assert.equal(addOf([complete]).props.disabled, false, 'a valid table can add')
+    assert.equal(addOf([complete, blankHostRow()]).props.disabled, true, 'one invalid row among valid ones still blocks adding')
+  })
+
+  test('a named row starts collapsed and its toggle flips aria-expanded; a blank row starts open', () => {
+    // A second client instance with a React stub whose useState really stores, so the
+    // collapse transition can be observed; the shared stub above is intentionally inert.
+    const hooks = []
+    let cursor = 0
+    let renderFn
+    const statefulReact = {
+      createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+      useState(initial) {
+        const at = cursor
+        cursor += 1
+        if (at >= hooks.length) hooks[at] = initial
+        return [hooks[at], (value) => { hooks[at] = typeof value === 'function' ? value(hooks[at]) : value }]
+      },
+    }
+    const begin = (render) => { renderFn = render; hooks.length = 0; cursor = 0 }
+    const mount = () => { cursor = 0; return renderFn() }
+    let statefulInternals
+    const previousHook = globalThis.__dshWinMbClientTest__
+    globalThis.__dshWinMbClientTest__ = (value) => { statefulInternals = value }
+    try {
+      registrations[0].factory((id) => {
+        if (id === 'react') return statefulReact
+        if (id === '@deepseek-ai/dsh-client-ui-primitives')
+          return { SettingsForm: 'SettingsForm', SettingsValueField: 'SettingsValueField', Checkbox: 'Checkbox', SegmentedControl: 'SegmentedControl', Button: 'Button', DisclosureRow: 'DisclosureRow', TextShimmer: 'TextShimmer', IconApiOutlineRegular: 'IconApiOutlineRegular', IconInspectOutlineRegular: 'IconInspectOutlineRegular', TerminalBlock: 'TerminalBlock' }
+        throw new Error(`unexpected client require: "${id}"`)
+      })
+    }
+    finally {
+      globalThis.__dshWinMbClientTest__ = previousHook
+    }
+    const propsFor = (rows) => ({ knob: { key: 'sshShell.hosts', rows, rowErrors: hostRowErrors(rows) }, disabled: false, t: (key) => en[key] ?? key, edit: () => {}, resetField: () => {}, save: () => {} })
+    const toggleOf = (nodes) => nodes.find((node) => node.props?.['data-action'] === 'toggle')
+    const named = blankHostRow()
+    named.alias = 'prod'; named.host = 'h.example'; named.user = 'u'; named.keyPath = 'k'
+    begin(() => statefulInternals.HostsEditor(propsFor([named])))
+    let nodes = flattenTree(mount())
+    assert.equal(toggleOf(nodes).props['aria-expanded'], false, 'a named row starts collapsed')
+    assert.equal(nodes.filter((node) => node.type === 'input').length, 0, 'a collapsed row renders no fields')
+    assert.match(nodes.filter((node) => typeof node.text === 'string').map((node) => node.text).join(' '), /prod@h\.example/, 'the collapsed header summarises alias@host')
+    toggleOf(nodes).props.onClick()
+    nodes = flattenTree(mount())
+    assert.equal(toggleOf(nodes).props['aria-expanded'], true, 'the toggle flips aria-expanded')
+    assert.ok(nodes.some((node) => node.type === 'input'), 'expanding unmounts nothing but shows the fields')
+    // An invalid named row stays collapsed but still reports its problem count.
+    const broken = blankHostRow()
+    broken.alias = 'prod'; broken.host = 'h.example'; broken.user = 'u'
+    begin(() => statefulInternals.HostsEditor(propsFor([broken])))
+    nodes = flattenTree(mount())
+    assert.equal(toggleOf(nodes).props['aria-expanded'], false)
+    assert.match(nodes.filter((node) => typeof node.text === 'string').map((node) => node.text).join(' '), /1 problems/, 'the collapsed header keeps the validation count')
+    // A blank/new row is open from the start.
+    begin(() => statefulInternals.HostsEditor(propsFor([blankHostRow()])))
+    nodes = flattenTree(mount())
+    assert.equal(toggleOf(nodes).props['aria-expanded'], true, 'a blank row starts open')
+    assert.ok(nodes.some((node) => node.type === 'input'))
+  })
   test('the default radio is EXCLUSIVE: marking a row clears every other row', () => {
     const staged = []
     const rows = [blankHostRow(), blankHostRow()]
     rows[0].alias = 'one'; rows[1].alias = 'two'; rows[0].default = true
-    const props = { knob: { key: 'sshShell.hosts', rows, rowErrors: hostRowErrors(rows) }, disabled: false, t: (key) => en[key] ?? key, edit: (_key, value) => staged.push(value), resetField: () => {} }
+    const props = { ...expandRows(rows), knob: { key: 'sshShell.hosts', rows, rowErrors: hostRowErrors(rows) }, disabled: false, t: (key) => en[key] ?? key, edit: (_key, value) => staged.push(value), resetField: () => {} }
     const radios = flattenTree(HostsEditor(props)).filter((node) => node.type === 'input' && node.props.type === 'radio')
     assert.equal(radios.length, 2)
     radios[1].props.onChange()
@@ -9070,7 +9159,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     const staged = []
     const rows = [blankHostRow()]
     rows[0].alias = 'prod'
-    const props = { knob: { key: 'sshShell.hosts', rows, rowErrors: hostRowErrors(rows) }, disabled: false, t: (key) => en[key] ?? key, edit: (_key, value) => staged.push(value), resetField: () => {} }
+    const props = { ...expandRows(rows), knob: { key: 'sshShell.hosts', rows, rowErrors: hostRowErrors(rows) }, disabled: false, t: (key) => en[key] ?? key, edit: (_key, value) => staged.push(value), resetField: () => {} }
     const select = flattenTree(HostsEditor(props)).find((node) => node.type === 'select')
     assert.equal(select.props.value, 'session', 'session is the default')
     select.props.onChange({ target: { value: 'trusted' } })
@@ -9084,7 +9173,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     rows[0].passphraseEnv = 'SSH_PASS'
     rows[0].startupCommand = 'source ~/.profile'
     assert.deepEqual(Object.keys(hostObjectFromRow(rows[0])).sort(), ['alias', 'approval', 'passphraseEnv', 'startupCommand'])
-    const props = { knob: { key: 'sshShell.hosts', rows, rowErrors: hostRowErrors(rows) }, disabled: false, t: (key) => en[key] ?? key, edit: (_key, value) => staged.push(value), resetField: () => {} }
+    const props = { ...expandRows(rows), knob: { key: 'sshShell.hosts', rows, rowErrors: hostRowErrors(rows) }, disabled: false, t: (key) => en[key] ?? key, edit: (_key, value) => staged.push(value), resetField: () => {} }
     const input = flattenTree(HostsEditor(props)).find((node) => node.props?.['data-field'] === 'passphraseEnv')
     input.props.onChange({ target: { value: '' } })
     assert.equal(Object.hasOwn(staged.at(-1)[0], 'passphraseEnv'), false, 'a blank optional field is cleared')
@@ -9100,7 +9189,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     const errors = hostRowErrors(rows)
     assert.equal(errors[0].alias, 'aliasFormat')
     assert.equal(errors[0].port, 'portRange')
-    const nodes = flattenTree(HostsEditor({ knob: { key: 'sshShell.hosts', rows, rowErrors: errors, invalid: true }, disabled: false, t: (key) => en[key] ?? key, edit: () => {}, resetField: () => {} }))
+    const nodes = flattenTree(HostsEditor({ ...expandRows(rows), knob: { key: 'sshShell.hosts', rows, rowErrors: errors, invalid: true }, disabled: false, t: (key) => en[key] ?? key, edit: () => {}, resetField: () => {} }))
     const warnings = nodes.filter((node) => node.type === 'span' && node.props.role === 'alert').map((node) => node.children[0])
     assert.ok(warnings.some((text) => /An alias starts with a letter or digit/.test(text)), 'alias error is shown')
     assert.ok(warnings.some((text) => /1 to 65535/.test(text)), 'port error is shown')
@@ -9176,7 +9265,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     const staged = []
     const rows = [blankHostRow(), blankHostRow()]
     rows[0].alias = 'one'; rows[1].alias = 'two'
-    const props = { knob: { key: 'sshShell.hosts', rows, rowErrors: hostRowErrors(rows) }, disabled: false, t: (key) => en[key] ?? key, edit: (_key, value) => staged.push(value), resetField: () => {} }
+    const props = { ...expandRows(rows), knob: { key: 'sshShell.hosts', rows, rowErrors: hostRowErrors(rows) }, disabled: false, t: (key) => en[key] ?? key, edit: (_key, value) => staged.push(value), resetField: () => {} }
     const ids = flattenTree(HostsEditor(props)).filter((node) => node.type === 'fieldset').map((node) => node.props['data-row-id'])
     assert.equal(new Set(ids).size, 2, 'each row has its own id')
     assert.deepEqual(ids, rows.map((row) => row.__rowId))

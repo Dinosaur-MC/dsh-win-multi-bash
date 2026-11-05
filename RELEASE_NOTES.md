@@ -25,6 +25,7 @@
 - The hosts table refuses to save a table the Host would reject — blank required fields, malformed or duplicate aliases, a port outside the range, a non-object entry, or more than one default — instead of persisting an inventory every call then fails on.
 - An approval answer that fails no longer marks the request settled: the card re-enables its buttons, shows the failure, and leaves the request pending.
 - Stale single-host pins no longer fall back silently to one host: a profile that still carries them comes up with no hosts and the call error says what to add.
+- The hosts table can save itself: it now carries its own **Save hosts** button (the page-level Save still works), so a host added on the Configure page is written by the flow the user actually follows. Rows collapse to an `alias@host` summary and **Add host** refuses while any existing row is invalid, so blank rows can no longer stack up unseen.
 - The hosts table no longer shows literal placeholders: row titles read `Host 1` (not `Host {index}`) and required warnings read `Alias is required.` (not `{field} is required.`), in both languages.
 - The terminal session header works on DSH 0.2.2-rc.1 again: the panel's `/win-mb` route is registered directly on the injected web server (the host's `connection.rpc.handle` now throws `cannot get property "webServer" without inject`), and a zero-session header stays hidden even when its probe fails. This compatibility is a manual boot-gate check only — the automated suite remains pinned to 0.2.1-rc.2.
 
