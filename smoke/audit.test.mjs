@@ -5258,8 +5258,9 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
 
 console.log('\n[A] unit: the ssh session authorization gate (S12)')
 {
-  // The gate is pure: fake sessions and a fake request cover every path with no boot
-  // and no network. Grants are per Session object and per host fingerprint, in memory.
+  // The gate is pure: fake sessions/agents and a fake request cover every path with no
+  // boot and no network. Grants are per Session object and per host fingerprint, in
+  // memory only, and a request is only ever made under a REAL agent.
   const { ApprovalError, createApprovalGate, fingerprintOf } = await import(libUrl('ssh-shell', 'approval.js'))
 
   const hostEntry = (over = {}) => ({
@@ -5267,7 +5268,9 @@ console.log('\n[A] unit: the ssh session authorization gate (S12)')
     keyPath: '/home/me/.ssh/id_prod', passphraseEnv: 'PROD_KEY_PASSPHRASE',
     approval: 'session', ...over,
   })
-  const fakeSession = () => ({ id: Math.random().toString(36) })
+  let sessionCounter = 0
+  const fakeSession = () => ({ id: ++sessionCounter })
+  const fakeAgent = (session) => ({ id: 'agent-' + session.id, session })
   /** A gate whose request answers from a queue and records every call. */
   const makeGate = (outcomes = [], { policyFor } = {}) => {
     const calls = []
@@ -5285,102 +5288,140 @@ console.log('\n[A] unit: the ssh session authorization gate (S12)')
     })
     return { gate, calls, lines }
   }
+  /** Catch one authorize() refusal. */
+  const refusalOf = async (run) => {
+    try { await run() } catch (error) { return error }
+    throw new Error('expected the gate to refuse')
+  }
 
-  await testAsync('a trusted host bypasses the gate without asking', async () => {
+  await testAsync('a trusted host bypasses the gate without asking or needing an agent', async () => {
     const { gate, calls } = makeGate([])
     const result = await gate.authorize({ session: fakeSession(), host: hostEntry({ approval: 'trusted' }), toolName: 'ssh_shell', callId: 'c1' })
     assert.deepEqual(result, { granted: true, trusted: true })
     assert.equal(calls.length, 0, 'a trusted host never prompts')
   })
 
-  await testAsync('a first miss asks ONCE, names the host and the session scope, then remembers', async () => {
+  await testAsync('a first miss asks ONCE under the caller agent, then remembers for the session', async () => {
     const { gate, calls } = makeGate([])
     const session = fakeSession()
-    assert.deepEqual(await gate.authorize({ session, host: hostEntry(), toolName: 'ssh_shell', callId: 'call-1' }), { granted: true })
+    const agent = fakeAgent(session)
+    assert.deepEqual(await gate.authorize({ session, agent, host: hostEntry(), toolName: 'ssh_shell', callId: 'call-1' }), { granted: true })
     assert.equal(calls.length, 1)
     const request = calls[0]
+    assert.equal(request.agent, agent, 'the REAL agent is passed through, never a fabricated one')
     assert.equal(request.toolName, 'ssh_shell')
     assert.equal(request.callId, 'call-1')
     assert.match(request.reason, /host "prod" \(deploy@10\.0\.0\.9:22\)/)
     assert.match(request.reason, /THIS session only/)
     assert.match(request.displayReason, /allow this session to use/)
     assert.notEqual(request.reason, request.displayReason, 'the human sentence is its own field')
-    await gate.authorize({ session, host: hostEntry(), toolName: 'ssh_scp', callId: 'call-2' })
+    await gate.authorize({ session, agent, host: hostEntry(), toolName: 'ssh_scp', callId: 'call-2' })
     assert.equal(calls.length, 1, 'the second call on the same session and host never asks again')
   })
 
   await testAsync('a second session asks again: grants are per Session object', async () => {
     const { gate, calls } = makeGate([])
-    await gate.authorize({ session: fakeSession(), host: hostEntry(), toolName: 'ssh_shell', callId: 'a' })
-    await gate.authorize({ session: fakeSession(), host: hostEntry(), toolName: 'ssh_shell', callId: 'b' })
+    const first = fakeSession()
+    const second = fakeSession()
+    await gate.authorize({ session: first, agent: fakeAgent(first), host: hostEntry(), toolName: 'ssh_shell', callId: 'a' })
+    await gate.authorize({ session: second, agent: fakeAgent(second), host: hostEntry(), toolName: 'ssh_shell', callId: 'b' })
     assert.equal(calls.length, 2, 'a new session has no grant')
   })
 
   await testAsync('rejected fails closed with phase approval, and a later call may ask again', async () => {
     const { gate, calls, lines } = makeGate(['rejected', 'allowed-once'])
     const session = fakeSession()
-    let failure
-    try { await gate.authorize({ session, host: hostEntry(), toolName: 'ssh_shell', callId: 'x' }) } catch (error) { failure = error }
+    const agent = fakeAgent(session)
+    const failure = await refusalOf(() => gate.authorize({ session, agent, host: hostEntry(), toolName: 'ssh_shell', callId: 'x' }))
     assert.ok(failure instanceof ApprovalError)
     assert.equal(failure.phase, 'approval')
     assert.equal(failure.alias, 'prod')
     assert.equal(failure.outcome, 'rejected')
     assert.match(failure.message, /not authorized for this session/)
     assert.match(failure.message, /rejected/)
-    await gate.authorize({ session, host: hostEntry(), toolName: 'ssh_shell', callId: 'y' })
+    await gate.authorize({ session, agent, host: hostEntry(), toolName: 'ssh_shell', callId: 'y' })
     assert.equal(calls.length, 2, 'a rejection is not cached as a grant')
     assert.ok(lines.some((line) => /rejected/.test(line)), 'the outcome is on the log')
   })
 
   await testAsync('cancelled fails closed with its own wording', async () => {
     const { gate } = makeGate(['cancelled'])
-    let failure
-    try { await gate.authorize({ session: fakeSession(), host: hostEntry(), toolName: 'ssh_scp' }) } catch (error) { failure = error }
+    const session = fakeSession()
+    const failure = await refusalOf(() => gate.authorize({ session, agent: fakeAgent(session), host: hostEntry(), toolName: 'ssh_scp' }))
     assert.equal(failure.outcome, 'cancelled')
     assert.match(failure.message, /cancelled before it was answered/)
   })
 
   await testAsync('unavailable fails closed naming the answerer and the trusted escape hatch', async () => {
     const { gate } = makeGate(['unavailable'])
-    let failure
-    try { await gate.authorize({ session: fakeSession(), host: hostEntry(), toolName: 'ssh_shell' }) } catch (error) { failure = error }
+    const session = fakeSession()
+    const failure = await refusalOf(() => gate.authorize({ session, agent: fakeAgent(session), host: hostEntry(), toolName: 'ssh_shell' }))
     assert.equal(failure.outcome, 'unavailable')
     assert.match(failure.message, /no approval answerer is available/)
     assert.match(failure.message, /approval: trusted/)
   })
 
-  await testAsync('an approval request that throws is unavailable, never a grant', async () => {
+  await testAsync('a request that throws is unavailable, never a grant', async () => {
     const gate = createApprovalGate({ request: async () => { throw new Error('no open turn') }, logger: { warn: () => {} } })
-    let failure
-    try { await gate.authorize({ session: fakeSession(), host: hostEntry(), toolName: 'ssh_shell' }) } catch (error) { failure = error }
+    const session = fakeSession()
+    const failure = await refusalOf(() => gate.authorize({ session, agent: fakeAgent(session), host: hostEntry(), toolName: 'ssh_shell' }))
     assert.equal(failure.outcome, 'unavailable')
     assert.match(failure.message, /no open turn/, 'the underlying reason is kept')
   })
 
+  await testAsync('a missing AGENT fails closed without a request (never a fabricated principal)', async () => {
+    const { gate, calls } = makeGate([])
+    const session = fakeSession()
+    const failure = await refusalOf(() => gate.authorize({ session, host: hostEntry(), toolName: 'ssh_shell', callId: 'no-agent' }))
+    assert.equal(failure.outcome, 'unavailable')
+    assert.match(failure.message, /no agent context is available/)
+    assert.match(failure.message, /not authorized for this session/)
+    assert.equal(calls.length, 0, 'no request is made without the agent that would own it')
+  })
+
+  await testAsync('a cached grant needs no agent (nothing to ask)', async () => {
+    const { gate, calls } = makeGate([])
+    const session = fakeSession()
+    await gate.authorize({ session, agent: fakeAgent(session), host: hostEntry(), toolName: 'ssh_shell', callId: 'a' })
+    assert.deepEqual(await gate.authorize({ session, host: hostEntry(), toolName: 'ssh_scp', callId: 'b' }), { granted: true })
+    assert.equal(calls.length, 1)
+  })
+
   await testAsync('a "never" session policy rejects deterministically, without asking', async () => {
     const { gate, calls } = makeGate([], { policyFor: () => 'never' })
-    let failure
-    try { await gate.authorize({ session: fakeSession(), host: hostEntry(), toolName: 'ssh_shell' }) } catch (error) { failure = error }
+    const session = fakeSession()
+    const failure = await refusalOf(() => gate.authorize({ session, agent: fakeAgent(session), host: hostEntry(), toolName: 'ssh_shell' }))
     assert.equal(failure.outcome, 'rejected')
     assert.match(failure.message, /policy is "never"/)
     assert.equal(calls.length, 0, 'policy never has no request to answer')
   })
 
+  await testAsync('a THROWING policy reader fails closed instead of escaping raw', async () => {
+    const { gate } = makeGate([], { policyFor: () => { throw new Error('policy store unavailable') } })
+    const session = fakeSession()
+    const failure = await refusalOf(() => gate.authorize({ session, agent: fakeAgent(session), host: hostEntry(), toolName: 'ssh_shell' }))
+    assert.equal(failure.outcome, 'unavailable')
+    assert.match(failure.message, /session approval policy could not be read: policy store unavailable/)
+    assert.equal(failure.name, 'ApprovalError')
+  })
+
   await testAsync('editing a connection field invalidates the grant (fingerprint change)', async () => {
     const { gate, calls } = makeGate([])
     const session = fakeSession()
-    await gate.authorize({ session, host: hostEntry(), toolName: 'ssh_shell', callId: 'a' })
+    const agent = fakeAgent(session)
+    await gate.authorize({ session, agent, host: hostEntry(), toolName: 'ssh_shell', callId: 'a' })
     assert.notEqual(fingerprintOf(hostEntry({ keyPath: '/x' })), fingerprintOf(hostEntry()))
-    await gate.authorize({ session, host: hostEntry({ keyPath: '/x' }), toolName: 'ssh_shell', callId: 'b' })
+    await gate.authorize({ session, agent, host: hostEntry({ keyPath: '/x' }), toolName: 'ssh_shell', callId: 'b' })
     assert.equal(calls.length, 2, 'a changed key path asks again')
-    await gate.authorize({ session, host: hostEntry({ port: 2222 }), toolName: 'ssh_shell', callId: 'c' })
+    await gate.authorize({ session, agent, host: hostEntry({ port: 2222 }), toolName: 'ssh_shell', callId: 'c' })
     assert.equal(calls.length, 3, 'a changed port asks again')
-    await gate.authorize({ session, host: hostEntry({ passphraseEnv: 'OTHER_PASS' }), toolName: 'ssh_shell', callId: 'd' })
+    await gate.authorize({ session, agent, host: hostEntry({ passphraseEnv: 'OTHER_PASS' }), toolName: 'ssh_shell', callId: 'd' })
     assert.equal(calls.length, 4, 'a changed passphrase variable asks again')
   })
 
   await testAsync('concurrent misses for the SAME host share ONE request', async () => {
     const session = fakeSession()
+    const agent = fakeAgent(session)
     let resolveRequest
     const calls = []
     const gate = createApprovalGate({
@@ -5391,8 +5432,8 @@ console.log('\n[A] unit: the ssh session authorization gate (S12)')
       logger: { info: () => {}, warn: () => {} },
     })
     const both = Promise.all([
-      gate.authorize({ session, host: hostEntry(), toolName: 'ssh_shell', callId: 'one' }),
-      gate.authorize({ session, host: hostEntry(), toolName: 'ssh_scp', callId: 'two' }),
+      gate.authorize({ session, agent, host: hostEntry(), toolName: 'ssh_shell', callId: 'one' }),
+      gate.authorize({ session, agent, host: hostEntry(), toolName: 'ssh_scp', callId: 'two' }),
     ])
     await new Promise((resolve) => setTimeout(resolve, 20))
     resolveRequest('allowed-once')
@@ -5400,19 +5441,31 @@ console.log('\n[A] unit: the ssh session authorization gate (S12)')
     assert.equal(calls.length, 1, 'one flight, two waiters')
   })
 
-  await testAsync('a call with no session fails closed', async () => {
-    const { gate } = makeGate([])
-    let failure
-    try { await gate.authorize({ host: hostEntry(), toolName: 'ssh_shell' }) } catch (error) { failure = error }
+  await testAsync('a call with no session fails closed with the SESSION sentence', async () => {
+    const { gate, calls } = makeGate([])
+    const agent = { id: 'agent-nosession', session: fakeSession() }
+    const failure = await refusalOf(() => gate.authorize({ agent, host: hostEntry(), toolName: 'ssh_shell' }))
     assert.equal(failure.outcome, 'unavailable')
-    assert.match(failure.message, /no approval answerer is available/)
+    assert.match(failure.message, /no session context is available/)
+    assert.doesNotMatch(failure.message, /no approval answerer/)
+    assert.equal(calls.length, 0)
+  })
+
+  await testAsync('a PRIMITIVE session fails closed instead of throwing a TypeError', async () => {
+    const { gate, calls } = makeGate([])
+    const failure = await refusalOf(() => gate.authorize({ session: 'not-a-session', agent: { id: 'a', session: fakeSession() }, host: hostEntry(), toolName: 'ssh_shell' }))
+    assert.equal(failure.name, 'ApprovalError')
+    assert.equal(failure.outcome, 'unavailable')
+    assert.match(failure.message, /no session context is available/)
+    assert.equal(calls.length, 0)
   })
 
   await testAsync('the gate never logs key material', async () => {
     const { gate, lines } = makeGate(['rejected', 'unavailable'])
     const session = fakeSession()
+    const agent = fakeAgent(session)
     for (const callId of ['a', 'b']) {
-      try { await gate.authorize({ session, host: hostEntry(), toolName: 'ssh_shell', callId }) } catch {}
+      try { await gate.authorize({ session, agent, host: hostEntry(), toolName: 'ssh_shell', callId }) } catch {}
     }
     assert.ok(lines.length >= 2)
     const all = lines.join('\n')
