@@ -2837,6 +2837,7 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
           user: 'tester'
           keyPath: '${keyPath.split(BS).join(BS + BS)}'
           connectTimeoutMs: 1000
+          approval: 'trusted'
           default: true
 `
     const sshCall = (ctx, args) => ctx.tools.execute({
@@ -3799,10 +3800,11 @@ console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (
     writeFileSync(path, '[127.0.0.1]:' + port + ' ' + hostPublic.type + ' ' + hostPublic.getPublicSSH().toString('base64') + '\n')
     return path
   }
-  const entryFor = (port) => ({
+  const entryFor = (port, over = {}) => ({
     alias: 'exec', host: '127.0.0.1', port, user: 'tester', keyPath,
     shellTemplate: DEFAULT_SHELL_TEMPLATE, connectTimeoutMs: 5000,
     acceptNewHostKeys: false, approval: 'trusted', default: true,
+    ...over,
   })
   /**
    * An in-process ssh2 server whose exec behaviour each case supplies.
@@ -3814,7 +3816,9 @@ console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (
     let sessionRequests = 0
     let refusals = 0
     let closes = 0
+    let connections = 0
     const server = new ssh2.Server({ hostKeys: [hostKey.private] }, (client) => {
+      connections += 1
       client.on('error', () => {})
       client.on('authentication', (context) => context.accept())
       client.on('ready', () => {
@@ -3853,6 +3857,7 @@ console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (
       sessionRequests: () => sessionRequests,
       refusals: () => refusals,
       closes: () => closes,
+      connections: () => connections,
       close: () => new Promise((resolve) => server.close(resolve)),
     }
   }
@@ -3880,9 +3885,27 @@ console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (
     }
     return sent;
   };
-  const executorFor = async (fixture, over = {}) => {
+  /** A fake approval service: answers from a queue and records every request. */
+  const fakeApproval = (outcomes = []) => {
+    const calls = []
+    let cursor = 0
+    return {
+      calls,
+      request: async (request) => {
+        calls.push(request)
+        const outcome = outcomes[cursor]
+        cursor += 1
+        return outcome ?? 'allowed-once'
+      },
+      effectivePolicy: () => 'ask',
+    }
+  }
+  let sessionCounter = 0
+  const fakeSession = () => ({ id: ++sessionCounter })
+  const fakeAgent = (session) => ({ id: 'agent-' + session.id, session })
+  const executorFor = async (fixture, { host = {}, approval } = {}) => {
     const pool = new SshPool({ knownHostsPath: knownHostsFor(fixture.port) })
-    const config = SshShellExecutor.Config({ hosts: [entryFor(fixture.port)], timeoutMs: 5000, maxTimeoutMs: 60000 })
+    const config = SshShellExecutor.Config({ hosts: [entryFor(fixture.port, host)], timeoutMs: 5000, maxTimeoutMs: 60000 })
     const executor = Object.assign(Object.create(SshShellExecutor.prototype), {
       config,
       poolInstance: pool,
@@ -3892,9 +3915,10 @@ console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (
       ctx: {
         sandboxPolicy: { defaultMode: 'workspace-write', resolve: () => ({ mode: 'workspace-write', workspaceRoot: 'C:/ws' }) },
         logger: { warn: () => {} },
+        ...(approval === undefined ? {} : { approval }),
       },
     })
-    return { executor, pool, ...over }
+    return { executor, pool, approval }
   }
 
   try {
@@ -4311,6 +4335,78 @@ console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (
         assert.equal(pool.size(), 0)
       } finally { pool.dispose(); await fixture.close() }
     })
+    await testAsync('the authorization gate: trusted connects without asking', async () => {
+      const approval = fakeApproval()
+      const fixture = await startServer((stream) => { stream.write('ok\n'); stream.exit(0); stream.end() })
+      const { executor, pool } = await executorFor(fixture, { approval })
+      try {
+        const agent = fakeAgent(fakeSession())
+        const result = await (await executor.execute(executor.resolve({ command: 'echo ok', timeoutMs: 5000, agent }))).result()
+        assert.equal(result.exitCode, 0)
+        assert.equal(approval.calls.length, 0, 'a trusted host never prompts')
+        assert.ok(fixture.connections() >= 1, 'and it did dial')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('the authorization gate: a session miss prompts once, then the grant is cached', async () => {
+      const approval = fakeApproval()
+      const fixture = await startServer((stream) => { stream.write('ok\n'); stream.exit(0); stream.end() })
+      const { executor, pool } = await executorFor(fixture, { host: { approval: 'session' }, approval })
+      try {
+        const session = fakeSession()
+        const agent = fakeAgent(session)
+        const first = await (await executor.execute(executor.resolve({ command: 'echo one', timeoutMs: 5000, agent }))).result()
+        assert.equal(first.exitCode, 0, 'allowed-once proceeds to the dial')
+        assert.equal(approval.calls.length, 1)
+        assert.equal(approval.calls[0].agent, agent, 'the FULL agent is passed through')
+        assert.equal(approval.calls[0].toolName, 'ssh_shell')
+        const second = await (await executor.execute(executor.resolve({ command: 'echo two', timeoutMs: 5000, agent }))).result()
+        assert.equal(second.exitCode, 0)
+        assert.equal(approval.calls.length, 1, 'the cached grant is not asked again')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('the authorization gate: a rejection throws phase approval and NEVER dials', async () => {
+      const approval = fakeApproval(['rejected'])
+      const fixture = await startServer(() => {})
+      const { executor, pool } = await executorFor(fixture, { host: { approval: 'session' }, approval })
+      try {
+        const agent = fakeAgent(fakeSession())
+        let failure
+        try { await executor.execute(executor.resolve({ command: 'echo never', timeoutMs: 5000, agent })) } catch (error) { failure = error }
+        assert.ok(failure !== undefined, 'the call rejects instead of running')
+        assert.equal(failure.name, 'ApprovalError')
+        assert.equal(failure.phase, 'approval')
+        assert.match(failure.message, /not authorized for this session/)
+        assert.equal(fixture.connections(), 0, 'a rejected host is never dialled')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('the authorization gate: a second session asks again', async () => {
+      const approval = fakeApproval()
+      const fixture = await startServer((stream) => { stream.write('ok\n'); stream.exit(0); stream.end() })
+      const { executor, pool } = await executorFor(fixture, { host: { approval: 'session' }, approval })
+      try {
+        await (await executor.execute(executor.resolve({ command: 'echo a', timeoutMs: 5000, agent: fakeAgent(fakeSession()) }))).result()
+        await (await executor.execute(executor.resolve({ command: 'echo b', timeoutMs: 5000, agent: fakeAgent(fakeSession()) }))).result()
+        assert.equal(approval.calls.length, 2, 'grants are per Session object')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('the authorization gate: a call without an agent fails closed', async () => {
+      const approval = fakeApproval()
+      const fixture = await startServer(() => {})
+      const { executor, pool } = await executorFor(fixture, { host: { approval: 'session' }, approval })
+      try {
+        let failure
+        try { await executor.execute(executor.resolve({ command: 'echo never', timeoutMs: 5000 })) } catch (error) { failure = error }
+        assert.ok(failure !== undefined)
+        assert.equal(failure.name, 'ApprovalError')
+        assert.match(failure.message, /no session context is available|no agent context is available/)
+        assert.equal(approval.calls.length, 0, 'no request without the agent that would own it')
+        assert.equal(fixture.connections(), 0)
+      } finally { pool.dispose(); await fixture.close() }
+    })
     await testAsync('a missing host alias names the aliases this row declares', async () => {
       const fixture = await startServer(() => {})
       const { executor, pool } = await executorFor(fixture)
@@ -4424,9 +4520,10 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
     writeFileSync(path, '[127.0.0.1]:' + port + ' ' + hostPublic.type + ' ' + hostPublic.getPublicSSH().toString('base64') + '\n')
     return path
   }
-  const hostEntry = (port) => ({
+  const hostEntry = (port, over = {}) => ({
     alias: 'scp-fixture', host: '127.0.0.1', port, user: 'tester', keyPath,
     connectTimeoutMs: 5000, acceptNewHostKeys: false, approval: 'trusted', default: true,
+    ...over,
   })
   /** The local file a remote path names inside this fixture's scratch root. */
   const localOf = (remotePath) => {
@@ -4614,6 +4711,23 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
     const port = server.address().port
     return { port, state, close: () => new Promise((resolve) => server.close(resolve)) }
   }
+  /** A fake approval service for the gate tests (answers from a queue). */
+  const fakeApproval = (outcomes = []) => {
+    const calls = []
+    let cursor = 0
+    return {
+      calls,
+      request: async (request) => {
+        calls.push(request)
+        const outcome = outcomes[cursor]
+        cursor += 1
+        return outcome ?? 'allowed-once'
+      },
+      effectivePolicy: () => 'ask',
+    }
+  }
+  const fakeSession = () => ({ id: Math.random().toString(36) })
+  const fakeAgent = (session) => ({ id: 'agent', session })
   /** Poll a cheap predicate (the fixture's counters) for a bounded time. */
   const waitFor = async (predicate, timeoutMs = 2000) => {
     const until = Date.now() + timeoutMs
@@ -5233,6 +5347,82 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
         assert.match(rendered, /OUTSIDE the workspace/, rendered)
       } finally { pool.dispose(); await fixture.close() }
     })
+    await testAsync('the ssh_scp gate: a rejection is a structured approval failure and never dials', async () => {
+      const approval = fakeApproval(['rejected'])
+      const fixture = await startServer()
+      const { SshShellExecutor } = await import(libUrl('ssh-shell', 'index.js'))
+      const { createScpTool } = await import(libUrl('ssh-shell', 'scp-tool.js'))
+      const pool = new SshPool({ knownHostsPath: knownHostsFor(fixture.port) })
+      const config = SshShellExecutor.Config({ hosts: [hostEntry(fixture.port, { approval: 'session' })], timeoutMs: 5000, maxTimeoutMs: 60000 })
+      const executor = Object.assign(Object.create(SshShellExecutor.prototype), {
+        config, poolInstance: pool, internals: {}, processFacts: new Map(), warnedAbout: new Set(),
+        ctx: { sandboxPolicy: { defaultMode: 'workspace-write', resolve: () => ({ mode: 'workspace-write', workspaceRoot: localRoot }) }, approval, logger: { warn: () => {}, debug: () => {} } },
+      })
+      const tools = []
+      const toolCtx = { tools: { register: (definition) => tools.push(definition) }, sandboxPolicy: { resolve: () => ({ mode: 'workspace-write', workspaceRoot: localRoot }) }, get: () => undefined, logger: { warn: () => {} } }
+      await createScpTool().register(toolCtx, { executor })
+      try {
+        const session = fakeSession()
+        const agent = fakeAgent(session)
+        const local = join(localRoot, 'gate-denied.txt')
+        writeFileSync(local, 'x')
+        const value = await tools[0].execute(
+          { action: 'upload', localPath: local, remotePath: '/gate-denied.txt', timeoutMs: 5000 },
+          { agent, callId: 'call-scp', signal: new AbortController().signal },
+        )
+        assert.equal(value.ok, false)
+        assert.equal(value.bytes, 0)
+        assert.equal(value.error.phase, 'approval', 'the refusal is this tool\'s approval phase')
+        assert.equal(value.error.alias, 'scp-fixture')
+        assert.match(value.error.message, /not authorized for this session/)
+        assert.equal(approval.calls.length, 1)
+        assert.equal(approval.calls[0].agent, agent, 'the REAL agent is what the gate asked under')
+        assert.equal(fixture.state.connections, 0, 'a rejected host is never dialled')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('the gate coalesces a concurrent ssh_shell + ssh_scp first miss into ONE request', async () => {
+      const fixture = await startServer()
+      const { SshShellExecutor } = await import(libUrl('ssh-shell', 'index.js'))
+      const { createScpTool } = await import(libUrl('ssh-shell', 'scp-tool.js'))
+      const pool = new SshPool({ knownHostsPath: knownHostsFor(fixture.port) })
+      let resolveRequest
+      const calls = []
+      const approval = {
+        calls,
+        request: (request) => {
+          calls.push(request)
+          return new Promise((resolve) => { resolveRequest = resolve })
+        },
+        effectivePolicy: () => 'ask',
+      }
+      const config = SshShellExecutor.Config({ hosts: [hostEntry(fixture.port, { approval: 'session' })], timeoutMs: 5000, maxTimeoutMs: 60000 })
+      const executor = Object.assign(Object.create(SshShellExecutor.prototype), {
+        config, poolInstance: pool, internals: {}, processFacts: new Map(), warnedAbout: new Set(),
+        ctx: { sandboxPolicy: { defaultMode: 'workspace-write', resolve: () => ({ mode: 'workspace-write', workspaceRoot: localRoot }) }, approval, logger: { warn: () => {}, debug: () => {} } },
+      })
+      const tools = []
+      const toolCtx = { tools: { register: (definition) => tools.push(definition) }, sandboxPolicy: { resolve: () => ({ mode: 'workspace-write', workspaceRoot: localRoot }) }, get: () => undefined, logger: { warn: () => {} } }
+      await createScpTool().register(toolCtx, { executor })
+      try {
+        const session = { id: 'coalesced-session', header: { cwd: localRoot } }
+        const agent = fakeAgent(session)
+        const local = join(localRoot, 'coalesced.txt')
+        writeFileSync(local, 'coalesced')
+        const shellRun = (async () => (await executor.execute(executor.resolve({ command: 'true', timeoutMs: 5000, agent }))).result())()
+        const scpRun = tools[0].execute(
+          { action: 'upload', localPath: local, remotePath: '/coalesced.txt', timeoutMs: 5000 },
+          { agent, callId: 'call-scp', signal: new AbortController().signal },
+        )
+        await new Promise((resolve) => setTimeout(resolve, 40))
+        assert.equal(calls.length, 1, 'two first misses for the same host share one request')
+        resolveRequest('allowed-once')
+        const [shellResult, scpValue] = await Promise.all([shellRun, scpRun])
+        assert.equal(shellResult.exitCode, 0)
+        assert.equal(scpValue.ok, true, JSON.stringify(scpValue))
+        assert.equal(fixture.state.connections, 1, 'one connection served both tools')
+      } finally { pool.dispose(); await fixture.close() }
+    })
     await testAsync('two operations reuse ONE pooled connection and one SFTP session each', async () => {
       const fixture = await startServer()
       const { pool, runner } = runnerFor(fixture)
@@ -5460,6 +5650,15 @@ console.log('\n[A] unit: the ssh session authorization gate (S12)')
     assert.equal(calls.length, 0)
   })
 
+  await testAsync('a mismatched agent/session pair fails closed with no request', async () => {
+    const { gate, calls } = makeGate([])
+    const session = fakeSession()
+    const other = fakeSession()
+    const failure = await refusalOf(() => gate.authorize({ session, agent: fakeAgent(other), host: hostEntry(), toolName: 'ssh_shell' }))
+    assert.equal(failure.outcome, 'unavailable')
+    assert.match(failure.message, /the agent and the session disagree/)
+    assert.equal(calls.length, 0, 'a wiring mistake never asks')
+  })
   await testAsync('the gate never logs key material', async () => {
     const { gate, lines } = makeGate(['rejected', 'unavailable'])
     const session = fakeSession()
