@@ -7902,7 +7902,7 @@ console.log('\n[A] unit: the terminal session route\'s hosts.test endpoint and t
 
   test('the probe fails closed and classifies auth, host-key, credential, close and deadline failures', async () => {
     class FailingClient {
-      constructor(mode) { this.mode = mode; this.ended = false; this.events = {}; FailingClient.last = this }
+      constructor(mode) { this.mode = mode; this.ended = false; this.ends = 0; this.events = {}; FailingClient.last = this }
       once(event, handler) { this.events[event] = handler; return this }
       connect(config) {
         this.config = config
@@ -7913,34 +7913,54 @@ console.log('\n[A] unit: the terminal session route\'s hosts.test endpoint and t
           }
           else if (this.mode === 'auth') this.events.error(new Error('All configured authentication methods failed'))
           else if (this.mode === 'passphrase') this.events.error(new Error('Encrypted private OpenSSH key detected, but no passphrase given'))
+          else if (this.mode === 'host-key-close') {
+            config.hostVerifier(Buffer.from('not a key'))
+            this.events.close()
+          }
+          else if (this.mode === 'missing-known-hosts') {
+            config.hostVerifier(Buffer.from('key'))
+            this.events.error(new Error('Host key verification failed'))
+          }
           else if (this.mode === 'close') this.events.close()
           else if (this.mode === 'ready-no-verifier') this.events.ready()
           // 'timeout' never settles: the deadline must.
         })
       }
-      end() { this.ended = true }
+      end() { this.ended = true; this.ends += 1 }
     }
     const make = (mode, over = {}) => probeHost({ alias: 'prod', host: 'h.example', user: 'u', keyPath: PROBE_KEY }, { Client: class extends FailingClient { constructor() { super(mode) } }, env: {}, deadlineMs: 1000, ...over })
     const auth = await make('auth')
     assert.equal(auth.phase, 'auth')
+    assert.equal(FailingClient.last.ends, 1, 'a failed probe closes the client exactly once')
     assert.match(auth.message, /authentication failed for "prod \(u@h\.example:22\)"/)
     assert.equal(FailingClient.last.ended, true)
     const hostKey = await make('host-key')
     assert.equal(hostKey.phase, 'host-key')
+    assert.equal(FailingClient.last.ends, 1)
     assert.match(hostKey.message, /host key verification failed for "prod \(u@h\.example:22\)"/)
     const credential = await make('passphrase')
     assert.equal(credential.phase, 'config', 'an unusable credential is a configuration failure, not connect')
+    assert.equal(FailingClient.last.ends, 1)
     assert.match(credential.message, /cannot use the private key/)
     assert.doesNotMatch(credential.message, /SEKRET|hunter2/)
     const closed = await make('close')
     assert.equal(closed.phase, 'connect')
+    assert.equal(FailingClient.last.ends, 1)
+    const closedAfterReject = await make('host-key-close')
+    assert.equal(closedAfterReject.phase, 'host-key', 'a close after a rejecting verifier keeps the host-key verdict')
+    assert.match(closedAfterReject.message, /host key verification failed/)
+    const missingKnownHosts = await make('missing-known-hosts', { verifyHostKey: () => ({ ok: false, reason: 'no known_hosts file was found for this host' }) })
+    assert.equal(missingKnownHosts.phase, 'host-key', 'a missing known_hosts file has nothing to verify against')
+    assert.match(missingKnownHosts.message, /no known_hosts file was found/)
     assert.match(closed.message, /closed before it was ready/)
     const unverified = await make('ready-no-verifier')
     assert.equal(unverified.phase, 'host-key', 'a ready without a verifier fails closed')
+    assert.equal(FailingClient.last.ends, 1)
     assert.match(unverified.message, /not verified/)
     const timeout = await make('timeout', { deadlineMs: 25 })
     assert.equal(timeout.phase, 'connect')
     assert.match(timeout.message, /timed out after 25 ms/)
+    assert.equal(FailingClient.last.ends, 1, 'the deadline still closes the client exactly once')
   })
 }
 
@@ -8254,7 +8274,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
   })
 
   const client = registrations[0].factory((id) => {
-    if (id === 'react') return { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }), useState: (initial) => [initial, () => {}] }
+    if (id === 'react') return { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }), useState: (initial) => [initial, () => {}], useRef: (initial) => ({ current: initial }) }
     if (id === '@deepseek-ai/dsh-client-ui-primitives')
       return { SettingsForm: 'SettingsForm', SettingsValueField: 'SettingsValueField', Checkbox: 'Checkbox', SegmentedControl: 'SegmentedControl', Button: 'Button', DisclosureRow: 'DisclosureRow', TextShimmer: 'TextShimmer', IconApiOutlineRegular: 'IconApiOutlineRegular', IconInspectOutlineRegular: 'IconInspectOutlineRegular', TerminalBlock: 'TerminalBlock' }
     throw new Error(`unexpected client require: "${id}"`)
@@ -9120,6 +9140,8 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.deepEqual(opaque, { ok: false, message: 'HTTP 500' }, 'a non-JSON refusal still names its status')
     const missingRoute = await testHostConnection(row, fakeFetch({}, 404, false))
     assert.match(missingRoute.message, /not registered on this host/, 'a 404 names the missing route (the terminal row is disabled)')
+    const spaFallback = await testHostConnection(row, async () => ({ status: 200, ok: true, json: async () => { throw new SyntaxError('<!doctype html>') } }))
+    assert.match(spaFallback.message, /not registered on this host/, 'a 200 SPA fallback gets the same missing-route message')
   })
   test('required warnings and row labels use the same placeholder the helper fills', () => {
     const rows = [blankHostRow()]
@@ -9150,6 +9172,9 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     const inert = bare.find((node) => node.props?.['data-action'] === 'save')
     assert.equal(inert.props.disabled, true)
     inert.props.onClick()
+    // An invalid table is never written: the in-table Save refuses while any row is invalid.
+    const invalidRow = blankHostRow()
+    assert.equal(flattenTree(HostsEditor({ ...expandRows([invalidRow]), knob: { key: 'sshShell.hosts', rows: [invalidRow], rowErrors: hostRowErrors([invalidRow]) }, disabled: false, t: (key) => en[key] ?? key, edit: () => {}, resetField: () => {}, save: () => saves.push(1) })).find((node) => node.props?.['data-action'] === 'save').props.disabled, true, 'an invalid row blocks Save')
   })
 
   test('Add host is disabled while any row is invalid and re-enables when every row is valid', () => {
@@ -9167,7 +9192,9 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
   /** A client instance whose React stub stores state, so transitions are observable. */
   const makeStatefulHostClient = () => {
     const hooks = []
+    const refs = []
     let cursor = 0
+    let refCursor = 0
     let renderFn
     const statefulReact = {
       createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
@@ -9176,6 +9203,12 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
         cursor += 1
         if (at >= hooks.length) hooks[at] = initial
         return [hooks[at], (value) => { hooks[at] = typeof value === 'function' ? value(hooks[at]) : value }]
+      },
+      useRef(initial) {
+        const at = refCursor
+        refCursor += 1
+        if (at >= refs.length) refs[at] = { current: initial }
+        return refs[at]
       },
     }
     let captured
@@ -9192,7 +9225,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     finally {
       globalThis.__dshWinMbClientTest__ = previousHook
     }
-    return { begin: (render) => { renderFn = render; hooks.length = 0; cursor = 0 }, mount: () => { cursor = 0; return renderFn() }, internals: captured }
+    return { begin: (render) => { renderFn = render; hooks.length = 0; refs.length = 0; cursor = 0; refCursor = 0 }, mount: () => { cursor = 0; refCursor = 0; return renderFn() }, internals: captured }
   }
 
   test('a learned host key warning is shown with the success line', async () => {
@@ -9233,6 +9266,28 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.equal(nodes.some((node) => node.props?.role === 'status'), false)
   })
 
+  test('Reset invalidates an in-flight test; a late answer never repopulates the row', async () => {
+    const stateful = makeStatefulHostClient()
+    let resolveProbe
+    const pending = new Promise((resolve) => { resolveProbe = resolve })
+    const row = blankHostRow()
+    row.alias = 'prod'; row.host = 'h.example'; row.user = 'u'; row.keyPath = 'k'
+    const resets = []
+    const props = () => ({ knob: { key: 'sshShell.hosts', rows: [row], rowErrors: hostRowErrors([row]), overridden: true }, disabled: false, t: (key) => en[key] ?? key, edit: () => {}, resetField: (key) => resets.push(key), save: () => {}, testHost: () => pending })
+    stateful.begin(() => stateful.internals.HostsEditor(props()))
+    let nodes = flattenTree(stateful.mount())
+    nodes.find((node) => node.props?.['data-action'] === 'toggle').props.onClick()
+    flattenTree(stateful.mount()).find((node) => node.props?.['data-action'] === 'test').props.onClick()
+    const resetButton = flattenTree(stateful.mount()).find((node) => node.type === 'Button' && String(node.children?.[0] ?? '').includes('Reset'))
+    assert.ok(resetButton !== undefined, 'the host head carries Reset')
+    resetButton.props.onClick()
+    assert.deepEqual(resets, ['sshShell.hosts'])
+    resolveProbe({ ok: true, fingerprint: 'SHA256:stale' })
+    await Promise.resolve()
+    await Promise.resolve()
+    const text = flattenTree(stateful.mount()).filter((node) => typeof node.text === 'string').map((node) => node.text).join(' ')
+    assert.doesNotMatch(text, /SHA256:stale|Connection OK/, 'a probe started before Reset cannot report into the reset table')
+  })
   test('an unknown validation code falls back to a generic sentence, never a placeholder', () => {
     const rows = [blankHostRow()]
     const nodes = flattenTree(HostsEditor({ knob: { key: 'sshShell.hosts', rows, rowErrors: [{ alias: 'someFutureCode' }] }, disabled: false, t: (key) => en[key] ?? key, edit: () => {}, resetField: () => {} }))
@@ -9330,7 +9385,9 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
    */
   const makeStatefulReact = () => {
     const hooks = []
+    const refs = []
     let cursor = 0
+    let refCursor = 0
     let renderFn
     const react = {
       createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
@@ -9340,11 +9397,17 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
         if (index >= hooks.length) hooks[index] = initial
         return [hooks[index], (value) => { hooks[index] = value }]
       },
+      useRef(initial) {
+        const index = refCursor
+        refCursor += 1
+        if (index >= refs.length) refs[index] = { current: initial }
+        return refs[index]
+      },
     }
     /** Point the stub at one component invocation and reset the hook cursor. */
-    react.begin = (render) => { renderFn = render; hooks.length = 0; cursor = 0 }
+    react.begin = (render) => { renderFn = render; hooks.length = 0; refs.length = 0; cursor = 0; refCursor = 0 }
     /** Render once with the current hook values (the test drives re-renders). */
-    react.mount = () => { cursor = 0; return renderFn() }
+    react.mount = () => { cursor = 0; refCursor = 0; return renderFn() }
     return react
   }
   /** A second client instance with custom React/primitives stubs (fresh hook state). */
@@ -9471,6 +9534,24 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.deepEqual(answered, ['allowed-once'])
   })
 
+  test('a SYNCHRONOUS throw from answer re-enables the card and shows the failure', async () => {
+    const react = makeStatefulReact()
+    const seam = makeClientInstance(react, { Button: 'Button' })
+    const answered = []
+    const pending = { kind: 'approval', toolName: 'ssh_shell', answerable: true, answer: (outcome) => { answered.push(outcome); throw new Error('sync boom') } }
+    const props = { matched: pending, t: (key) => seam.en[key] ?? key }
+    react.begin(() => seam.SshApprovalCard(props))
+    let tree = react.mount()
+    // On the old code this throws out of onClick before setSubmitting can be undone.
+    flattenTree(tree).find((node) => node.type === 'Button').props.onClick()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    tree = react.mount()
+    const buttons = flattenTree(tree).filter((node) => node.type === 'Button')
+    assert.ok(buttons.every((node) => node.props.disabled === false), 'the call is still pending, so the buttons come back')
+    const text = flattenTree(tree).filter((node) => typeof node.text === 'string').map((node) => node.text).join(' ')
+    assert.match(text, /could not be delivered/, 'the synchronous failure is visible')
+    assert.deepEqual(answered, ['allowed-once'])
+  })
   test('a RESOLVED answer settles the card and ignores later clicks', async () => {
     const react = makeStatefulReact()
     const seam = makeClientInstance(react, { Button: 'Button' })
@@ -9527,7 +9608,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
   test('a deployment without the card primitives gets no row at all, not a broken one', () => {
     const slotRegistrations = []
     const bare = registrations[0].factory((id) => {
-      if (id === 'react') return { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }), useState: (initial) => [initial, () => {}] }
+      if (id === 'react') return { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }), useState: (initial) => [initial, () => {}], useRef: (initial) => ({ current: initial }) }
       if (id === '@deepseek-ai/dsh-client-ui-primitives')
         return { SettingsForm: 'SettingsForm', SettingsValueField: 'SettingsValueField', Checkbox: 'Checkbox', SegmentedControl: 'SegmentedControl', Button: 'Button' }
       throw new Error('unexpected client require: "' + id + '"')
@@ -9729,7 +9810,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     for (const missing of CARD) {
       const slotRegistrations = []
       const partial = registrations[0].factory((id) => {
-        if (id === 'react') return { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }), useState: (initial) => [initial, () => {}] }
+        if (id === 'react') return { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }), useState: (initial) => [initial, () => {}], useRef: (initial) => ({ current: initial }) }
         if (id === '@deepseek-ai/dsh-client-ui-primitives')
           return Object.fromEntries([...CARD, 'SettingsForm', 'SettingsValueField', 'Checkbox', 'SegmentedControl', 'Button']
             .filter((name) => name !== missing)
@@ -9753,7 +9834,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     for (const nulled of CARD) {
       const slotRegistrations = []
       const partial = registrations[0].factory((id) => {
-        if (id === 'react') return { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }), useState: (initial) => [initial, () => {}] }
+        if (id === 'react') return { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }), useState: (initial) => [initial, () => {}], useRef: (initial) => ({ current: initial }) }
         if (id === '@deepseek-ai/dsh-client-ui-primitives')
           return Object.fromEntries([...CARD, 'SettingsForm', 'SettingsValueField', 'Checkbox', 'SegmentedControl', 'Button']
             .map((name) => [name, name === nulled ? null : name]))
@@ -9773,7 +9854,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
   test('a deployment with the card primitives but no TerminalBlock keeps the generic body', () => {
     const slotRegistrations = []
     const partial = registrations[0].factory((id) => {
-      if (id === 'react') return { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }), useState: (initial) => [initial, () => {}] }
+      if (id === 'react') return { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }), useState: (initial) => [initial, () => {}], useRef: (initial) => ({ current: initial }) }
       if (id === '@deepseek-ai/dsh-client-ui-primitives')
         return { DisclosureRow: 'DisclosureRow', TextShimmer: 'TextShimmer', IconApiOutlineRegular: 'IconApiOutlineRegular', IconInspectOutlineRegular: 'IconInspectOutlineRegular' }
       throw new Error('unexpected client require: ' + id)
