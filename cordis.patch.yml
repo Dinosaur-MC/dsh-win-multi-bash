@@ -6,8 +6,9 @@
 # ./tool-wsl-bash, ./tool-msys2-bash and ./tool-ssh-shell, or through
 # ./tool-terminal — nothing depends on runtime packages beyond the published
 # @deepseek-ai base packages (dsh-bash-local, dsh-sandbox, dsh-tools, dsh-shell,
-# dsh-llm, ...). `ssh_shell` additionally uses the `ssh2` package for its transport
-# (see THIRD_PARTY_NOTICES).
+# dsh-llm, ...). `ssh_shell` and `ssh_scp` additionally use the `ssh2` package for
+# their transport: exec channels and SFTP transfers on one pooled connection per host,
+# with host-key verification on every dial (see THIRD_PARTY_NOTICES).
 #
 # ── What the rows do ─────────────────────────────────────────────────────────
 #   win-mb-plugin       — the package row: the plugin's core row. `name` is the
@@ -60,11 +61,15 @@
 #                         and the user enables it. It exists to prove the
 #                         skeleton: adding a shell is one executor file plus one
 #                         declaration in lib/shell-dialects.js.
-#   win-mb-tool-ssh     — the `ssh_shell` tool, owning its own SshShellExecutor: the
-#                         family's only REMOTE dialect (`effects: 'remote'` in the
-#                         registry). **Opt-in** for the same reason plus one of
-#                         its own — it needs a host, which only a deployment can
-#                         name. Nothing local bounds its file effects, so it reports
+#   win-mb-tool-ssh     — the `ssh_shell` and `ssh_scp` tools, sharing ONE
+#                         SshShellExecutor (and so one host registry, one policy, one
+#                         pooled connection per host): the family's only REMOTE
+#                         dialect (`effects: 'remote'` in the registry). `ssh_shell`
+#                         runs commands over per-call exec channels; `ssh_scp` moves
+#                         files and trees over SFTP on that same connection.
+#                         **Opt-in** for the same reason plus one of its own — it
+#                         needs a host, which only a deployment can name. Nothing
+#                         local bounds its file effects, so it reports
 #                         `sandbox: { mode, remote: true }` rather than a verdict.
 #
 # Every inserted row is win32-only; POSIX keeps the base bundle's own bash wiring.

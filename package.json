@@ -6,7 +6,7 @@
     "type": "git",
     "url": "git+https://github.com/Dinosaur-MC/dsh-win-multi-bash.git"
   },
-  "description": "Windows multi-bash plugin for dsh: git_bash, wsl_bash and opt-in msys2_bash model tools, an opt-in ssh_shell dialect that runs commands over a pooled ssh2 connection (a host registry, per-call exec channels), and a terminal tool that keeps a persistent PTY session — its ssh sessions still use the OpenSSH client. Each dialect owns its own executor and leaves the ctx.shell seat to dsh's own pwsh executor.",
+  "description": "Windows multi-bash plugin for dsh: git_bash, wsl_bash and opt-in msys2_bash model tools, an opt-in ssh row that serves ssh_shell (commands over a pooled ssh2 connection: a host registry, per-call exec channels) and ssh_scp (SFTP file and tree transfers on the same pooled connection), and a terminal tool that keeps a persistent PTY session — its ssh sessions still use the OpenSSH client. Each dialect owns its own executor and leaves the ctx.shell seat to dsh's own pwsh executor.",
   "keywords": [
     "dsh-plugin",
     "windows",

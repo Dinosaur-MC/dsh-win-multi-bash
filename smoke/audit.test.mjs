@@ -5201,6 +5201,38 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
       assert.match(result.error.message, /the transfer deadline of 150 ms expired during channel retries/, result.error.message)
       assert.ok(calls >= 2, 'it retried before the deadline: ' + calls)
     })
+    await testAsync('the REAL ssh_scp tool honours danger-full-access and reports outsideWorkspace', async () => {
+      const fixture = await startServer()
+      const { SshShellExecutor } = await import(libUrl('ssh-shell', 'index.js'))
+      const { createScpTool } = await import(libUrl('ssh-shell', 'scp-tool.js'))
+      const pool = new SshPool({ knownHostsPath: knownHostsFor(fixture.port) })
+      const workspace = join(localRoot, 'tool-workspace')
+      fs.mkdirSync(workspace, { recursive: true })
+      const outside = join(localRoot, 'tool-outside', 'dfa.txt')
+      fs.mkdirSync(join(localRoot, 'tool-outside'), { recursive: true })
+      writeFileSync(outside, 'outside-bytes')
+      const policy = { mode: 'danger-full-access', workspaceRoot: workspace }
+      const config = SshShellExecutor.Config({ hosts: [hostEntry(fixture.port)], timeoutMs: 5000, maxTimeoutMs: 60000 })
+      const executor = Object.assign(Object.create(SshShellExecutor.prototype), {
+        config, poolInstance: pool, internals: {}, processFacts: new Map(), warnedAbout: new Set(),
+        ctx: { sandboxPolicy: { defaultMode: 'danger-full-access', resolve: () => policy }, logger: { warn: () => {}, debug: () => {} } },
+      })
+      const tools = []
+      const toolCtx = { tools: { register: (definition) => tools.push(definition) }, sandboxPolicy: { resolve: () => policy }, get: () => undefined, logger: { warn: () => {} } }
+      await createScpTool().register(toolCtx, { executor })
+      try {
+        const value = await tools[0].execute(
+          { action: 'upload', localPath: outside, remotePath: '/tool-dfa.txt', timeoutMs: 5000 },
+          { agent: { session: { header: { cwd: workspace } } }, signal: new AbortController().signal },
+        )
+        assert.equal(value.ok, true, JSON.stringify(value))
+        assert.equal(value.outsideWorkspace, true, 'the local side left the workspace, and the result says so')
+        assert.deepEqual(value.sandbox, { mode: 'danger-full-access', remote: true })
+        assert.equal(readFileSync(join(remoteRoot, 'tool-dfa.txt'), 'utf8'), 'outside-bytes')
+        const rendered = tools[0].output.render({}, value)[0].text
+        assert.match(rendered, /OUTSIDE the workspace/, rendered)
+      } finally { pool.dispose(); await fixture.close() }
+    })
     await testAsync('two operations reuse ONE pooled connection and one SFTP session each', async () => {
       const fixture = await startServer()
       const { pool, runner } = runnerFor(fixture)

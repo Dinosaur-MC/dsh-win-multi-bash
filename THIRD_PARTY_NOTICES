@@ -52,7 +52,7 @@ installed by the package manager.
 
 | Package | License | Used by |
 | --- | --- | --- |
-| `ssh2` | MIT | `lib/ssh-shell/` — the SSH transport for `ssh_shell` (connection pool per host, one exec channel per call, host-key verification) |
+| `ssh2` | MIT | `lib/ssh-shell/` — the SSH transport for BOTH tools on the ssh row: `ssh_shell` (one connection pool per host, one exec channel per call) and `ssh_scp` (SFTP file and tree transfers on that same pooled connection); every dial verifies the host key |
 
 `ssh2` is distributed under the MIT License:
 
