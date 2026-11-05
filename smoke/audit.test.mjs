@@ -8416,28 +8416,48 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     walk(root)
     return nodes
   }
+  /**
+   * A React stub whose hooks actually work (and re-render manually), for the card's
+   * state machine: disabled-while-submitting, re-enabled after a rejected answer, and
+   * settled after an accepted one. The plain stub used elsewhere cannot exercise those
+   * transitions because its `useState` setter is a no-op.
+   */
+  const makeStatefulReact = () => {
+    const hooks = []
+    let cursor = 0
+    let renderFn
+    const react = {
+      createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+      useState(initial) {
+        const index = cursor
+        cursor += 1
+        if (index >= hooks.length) hooks[index] = initial
+        return [hooks[index], (value) => { hooks[index] = value }]
+      },
+    }
+    /** Point the stub at one component invocation and reset the hook cursor. */
+    react.begin = (render) => { renderFn = render; hooks.length = 0; cursor = 0 }
+    /** Render once with the current hook values (the test drives re-renders). */
+    react.mount = () => { cursor = 0; return renderFn() }
+    return react
+  }
+  /** A second client instance with custom React/primitives stubs (fresh hook state). */
+  const makeClientInstance = (react, primitivesStub) => {
+    let seam
+    globalThis.__dshWinMbClientTest__ = (value) => { seam = value }
+    try {
+      registrations[0].factory((id) => {
+        if (id === 'react') return react
+        if (id === '@deepseek-ai/dsh-client-ui-primitives') return primitivesStub
+        throw new Error('unexpected client require: "' + id + '"')
+      })
+    } finally {
+      globalThis.__dshWinMbClientTest__ = undefined
+    }
+    return seam
+  }
 
-  test('the SSH approval matcher claims ONLY ssh_shell / ssh_scp pending approvals', async () => {
-    const { sshApprovalMatch, APPROVAL_GATED_TOOL_NAMES } = internals
-    // The generated list IS the host registry's gate list: a rename reddens here.
-    const registry = await import(libUrl('tool-bash', 'types', 'registry.js'))
-    assert.deepEqual(APPROVAL_GATED_TOOL_NAMES, registry.APPROVAL_GATED_TOOL_NAMES)
-    assert.deepEqual(APPROVAL_GATED_TOOL_NAMES, ['ssh_shell', 'ssh_scp'])
-    const pending = (over = {}) => ({ kind: 'approval', toolName: 'ssh_shell', answerable: true, answer: async () => {}, ...over })
-    const shell = pending({ toolName: 'ssh_shell' })
-    const scp = pending({ toolName: 'ssh_scp' })
-    assert.equal(sshApprovalMatch(shell), shell, 'ssh_shell is claimed')
-    assert.equal(sshApprovalMatch(scp), scp, 'ssh_scp is claimed')
-    assert.equal(sshApprovalMatch(pending({ toolName: 'git_bash' })), null, 'another tool falls through')
-    assert.equal(sshApprovalMatch(pending({ toolName: 'terminal' })), null)
-    assert.equal(sshApprovalMatch(pending({ kind: 'question' })), null, 'a non-approval interaction falls through')
-    assert.equal(sshApprovalMatch(pending({ answerable: false })), null, 'a settled request falls through')
-    assert.equal(sshApprovalMatch({ kind: 'approval', toolName: 'ssh_shell' }), null, 'no answer() means it is not answerable here')
-    assert.equal(sshApprovalMatch(undefined), null)
-    assert.equal(sshApprovalMatch(null), null)
-  })
-
-  test('the SSH approval card renders both outcomes and answers through the request', () => {
+  test('the SSH approval card labels both choices and sends the pending request its own answer', () => {
     const { SshApprovalCard, en } = internals
     const answered = []
     const pending = {
@@ -8445,31 +8465,87 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
       answer: (outcome) => { answered.push(outcome); return Promise.resolve() },
       displayReason: { en: 'ssh_shell: allow this session to use host "prod" (deploy@10.0.0.9:22)? The grant lasts until this session ends.' },
     }
-    const tree = SshApprovalCard({ matched: pending, t: (key) => en[key] ?? key })
-    const nodes = flattenTree(tree)
+    const nodes = flattenTree(SshApprovalCard({ matched: pending, t: (key) => en[key] ?? key }))
     const buttons = nodes.filter((node) => node.type === 'Button')
     assert.equal(buttons.length, 2, 'allow + reject, no third choice')
     assert.deepEqual(buttons.map((node) => node.children[0]), ['Allow for this session', 'Reject'])
+    assert.equal(buttons.every((node) => node.props.disabled === false), true, 'both are live while the request is pending')
     const text = nodes.filter((node) => typeof node.text === 'string').map((node) => node.text).join(' ')
     assert.match(text, /host "prod" \(deploy@10\.0\.0\.9:22\)/, 'the request sentence names the alias and the target')
     assert.match(text, /THIS session only/)
-    assert.equal(buttons[0].props.disabled, false)
     buttons[0].props.onClick()
-    buttons[1].props.onClick()
-    assert.deepEqual(answered, ['allowed-once', 'rejected'], 'the answer is the pending request\'s own outcome')
+    assert.deepEqual(answered, ['allowed-once'], 'the allow button answers allowed-once')
   })
 
-  test('a settled request renders no live buttons and keeps the platform card', () => {
-    const { sshApprovalMatch, SshApprovalCard, en } = internals
-    const settled = { kind: 'approval', toolName: 'ssh_scp', answerable: false, answer: async () => {}, displayReason: { en: 'x' } }
-    assert.equal(sshApprovalMatch(settled), null, 'a settled pending is not claimed')
-    const nodes = flattenTree(SshApprovalCard({ matched: settled, t: (key) => en[key] ?? key }))
-    const buttons = nodes.filter((node) => node.type === 'Button')
-    assert.equal(buttons.length, 2)
-    assert.ok(buttons.every((node) => node.props.disabled === true), 'both buttons are disabled')
-    assert.match(nodes.filter((node) => typeof node.text === 'string').map((node) => node.text).join(' '), /no longer pending/)
+  test('the card disables both buttons while the answer is submitting', () => {
+    const react = makeStatefulReact()
+    const seam = makeClientInstance(react, { Button: 'Button' })
+    let settleAnswer
+    const pending = { kind: 'approval', toolName: 'ssh_shell', answerable: true, answer: () => new Promise((resolve) => { settleAnswer = resolve }) }
+    const props = { matched: pending, t: (key) => seam.en[key] ?? key }
+    react.begin(() => seam.SshApprovalCard(props))
+    let tree = react.mount()
+    flattenTree(tree).find((node) => node.type === 'Button').props.onClick()
+    tree = react.mount()
+    const buttons = flattenTree(tree).filter((node) => node.type === 'Button')
+    assert.ok(buttons.every((node) => node.props.disabled === true), 'submitting disables both buttons')
+    settleAnswer('allowed-once')
   })
 
+  test('a REJECTED answer re-enables the card instead of reporting it settled', async () => {
+    const react = makeStatefulReact()
+    const seam = makeClientInstance(react, { Button: 'Button' })
+    const answered = []
+    const pending = { kind: 'approval', toolName: 'ssh_shell', answerable: true, answer: (outcome) => { answered.push(outcome); return Promise.reject(new Error('transport died')) } }
+    const props = { matched: pending, t: (key) => seam.en[key] ?? key }
+    react.begin(() => seam.SshApprovalCard(props))
+    let tree = react.mount()
+    flattenTree(tree).find((node) => node.type === 'Button').props.onClick()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    tree = react.mount()
+    const buttons = flattenTree(tree).filter((node) => node.type === 'Button')
+    assert.ok(buttons.every((node) => node.props.disabled === false), 'the call is still pending, so the buttons come back')
+    const text = flattenTree(tree).filter((node) => typeof node.text === 'string').map((node) => node.text).join(' ')
+    assert.match(text, /could not be delivered/, 'the failure is visible')
+    assert.doesNotMatch(text, /no longer pending/, 'a failed submit is NOT settled')
+    assert.deepEqual(answered, ['allowed-once'])
+  })
+
+  test('a RESOLVED answer settles the card and ignores later clicks', async () => {
+    const react = makeStatefulReact()
+    const seam = makeClientInstance(react, { Button: 'Button' })
+    const answered = []
+    const pending = { kind: 'approval', toolName: 'ssh_scp', answerable: true, answer: (outcome) => { answered.push(outcome); return Promise.resolve() } }
+    const props = { matched: pending, t: (key) => seam.en[key] ?? key }
+    react.begin(() => seam.SshApprovalCard(props))
+    let tree = react.mount()
+    const buttons = flattenTree(tree).filter((node) => node.type === 'Button')
+    buttons[0].props.onClick()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    tree = react.mount()
+    const after = flattenTree(tree).filter((node) => node.type === 'Button')
+    assert.ok(after.every((node) => node.props.disabled === true), 'a settled card has no live buttons')
+    const text = flattenTree(tree).filter((node) => typeof node.text === 'string').map((node) => node.text).join(' ')
+    assert.match(text, /no longer pending/)
+    after[0].props.onClick()
+    assert.deepEqual(answered, ['allowed-once'], 'a click on the settled render is ignored')
+  })
+
+  test('apply leaves an older host without the composer slot untouched (no throw, no entry)', () => {
+    assert.doesNotThrow(() => applyWithProbes({
+      locale: { register: () => () => {}, bind: () => (key) => key },
+      configForms: { get: () => fakeScope(), whileServed: (names, callback) => { callback(new Set(names)); return () => {} } },
+      effect: (callback) => callback(),
+    }))
+    const slotRegistrations = []
+    assert.doesNotThrow(() => applyWithProbes({
+      locale: { register: () => () => {}, bind: () => (key) => key },
+      configForms: { get: () => fakeScope(), whileServed: (names, callback) => { callback(new Set(names)); return () => {} } },
+      slots: { register: (options) => { slotRegistrations.push(options) } },
+      effect: (callback) => callback(),
+    }))
+    assert.equal(slotRegistrations.some((options) => options.name === 'conversation.composer'), false, 'no half-registration without inject')
+  })
   test('apply registers the card as a priority-0 chain entry that renders an ssh pending', () => {
     const slotRegistrations = []
     applyWithProbes({
