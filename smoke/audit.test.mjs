@@ -5837,6 +5837,184 @@ console.log('\n[A] unit: the ssh session authorization gate (S12)')
     assert.equal(timers, 0, '0 disables the approval timer')
   })
 
+  await testAsync('TIMEOUT WINS over a request that settles cancelled on abort', async () => {
+    let fire
+    const calls = []
+    const gate = createApprovalGate({
+      request: (request) => {
+        calls.push(request)
+        return new Promise((resolve) => { request.signal?.addEventListener?.('abort', () => resolve('cancelled'), { once: true }) })
+      },
+      logger: { info: () => {}, warn: () => {} },
+      setTimeout: (callback) => { fire = callback; return 'timer-cancel' },
+      clearTimeout: () => {},
+    })
+    const session = fakeSession()
+    const agent = fakeAgent(session)
+    const host = hostEntry({ approvalTimeoutMs: 2000 })
+    const first = gate.authorize({ session, agent, host, toolName: 'ssh_shell', callId: 'cancel-abort' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(calls.length, 1)
+    fire()
+    await assert.rejects(first, (error) => {
+      assert.equal(error.phase, 'approval')
+      assert.equal(error.outcome, 'timeout', 'the request\'s cancelled outcome must NOT win')
+      assert.match(error.message, /approval timed out after 2000 ms/)
+      return true
+    })
+    // Nothing cached: the next call asks again.
+    const second = gate.authorize({ session, agent, host, toolName: 'ssh_shell', callId: 'cancel-abort-2' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(calls.length, 2, 'a timed-out approval leaves no grant')
+    fire()
+    await assert.rejects(second, /approval timed out after 2000 ms/)
+  })
+
+  await testAsync('TIMEOUT WINS over a request that settles allowed-once on abort: no grant, no consume', async () => {
+    let fire
+    const gate = createApprovalGate({
+      request: (request) => new Promise((resolve) => { request.signal?.addEventListener?.('abort', () => resolve('allowed-once'), { once: true }) }),
+      logger: { info: () => {}, warn: () => {} },
+      setTimeout: (callback) => { fire = callback; return 'timer-grant' },
+      clearTimeout: () => {},
+    })
+    const session = fakeSession()
+    const agent = fakeAgent(session)
+    const host = hostEntry({ approvalTimeoutMs: 1500 })
+    markApprovalScope('abort-grant', 'once')
+    const run = gate.authorize({ session, agent, host, toolName: 'ssh_shell', callId: 'abort-grant' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    fire()
+    await assert.rejects(run, (error) => {
+      assert.equal(error.outcome, 'timeout')
+      assert.match(error.message, /approval timed out after 1500 ms/)
+      return true
+    })
+    assert.equal(consumeApprovalScope('abort-grant'), 'once', 'the scope was NOT consumed by the aborted grant')
+  })
+
+  await testAsync('a waiter behind a cancel-on-abort owner gets timeout too, with ONE prompt', async () => {
+    let fire
+    const calls = []
+    const gate = createApprovalGate({
+      request: (request) => {
+        calls.push(request)
+        return new Promise((resolve) => { request.signal?.addEventListener?.('abort', () => resolve('cancelled'), { once: true }) })
+      },
+      logger: { info: () => {}, warn: () => {} },
+      setTimeout: (callback) => { fire = callback; return 'timer-w' },
+      clearTimeout: () => {},
+    })
+    const session = fakeSession()
+    const agent = fakeAgent(session)
+    const host = hostEntry({ approvalTimeoutMs: 2500 })
+    const first = gate.authorize({ session, agent, host, toolName: 'ssh_shell', callId: 'cancel-wa' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const second = gate.authorize({ session, agent, host, toolName: 'ssh_scp', callId: 'cancel-wb' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(calls.length, 1)
+    fire()
+    const settled = await Promise.allSettled([first, second])
+    for (const result of settled) {
+      assert.equal(result.status, 'rejected')
+      assert.equal(result.reason.outcome, 'timeout')
+      assert.match(result.reason.message, /approval timed out after 2500 ms/)
+    }
+    assert.equal(calls.length, 1, 'no second prompt for the waiter')
+  })
+
+  await testAsync('an aborted WAITER fails cancelled without removing the owner\'s in-flight ask', async () => {
+    let resolveRequest
+    const calls = []
+    const gate = createApprovalGate({
+      request: (request) => { calls.push(request); return new Promise((resolve) => { resolveRequest = resolve }) },
+      logger: { info: () => {}, warn: () => {} },
+      setTimeout: () => { throw new Error('0 must not schedule a timer') },
+      clearTimeout: () => {},
+    })
+    const session = fakeSession()
+    const agent = fakeAgent(session)
+    const host = hostEntry({ approvalTimeoutMs: 0 })
+    const owner = gate.authorize({ session, agent, host, toolName: 'ssh_shell', callId: 'waiter-owner' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const controller = new AbortController()
+    const waiter = gate.authorize({ session, agent, host, toolName: 'ssh_scp', callId: 'waiter-abort', signal: controller.signal })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(calls.length, 1)
+    controller.abort()
+    await assert.rejects(waiter, (error) => {
+      assert.equal(error.phase, 'approval')
+      assert.equal(error.outcome, 'cancelled')
+      return true
+    })
+    assert.equal(calls.length, 1, 'the aborted waiter neither re-prompts nor drops the owner')
+    resolveRequest('allowed-once')
+    assert.deepEqual(await owner, { granted: true }, 'the owner still settles normally')
+  })
+
+  await testAsync('the timeout timer is cleared on success and on a non-timeout rejection', async () => {
+    const clears = []
+    let nextId = 0
+    const makeGateWith = (request) => createApprovalGate({
+      request,
+      logger: { info: () => {}, warn: () => {} },
+      setTimeout: () => 'timer-' + (++nextId),
+      clearTimeout: (id) => clears.push(id),
+    })
+    const session = fakeSession()
+    const agent = fakeAgent(session)
+    const host = hostEntry({ approvalTimeoutMs: 1000 })
+    const success = makeGateWith(async () => 'allowed-once')
+    await success.authorize({ session, agent, host, toolName: 'ssh_shell', callId: 'clear-success' })
+    assert.deepEqual(clears, ['timer-1'], 'cleared when the answer settles')
+    const failing = makeGateWith(async () => { throw new Error('channel closed') })
+    await assert.rejects(failing.authorize({ session, agent, host, toolName: 'ssh_shell', callId: 'clear-fail' }), /approval request failed/)
+    assert.deepEqual(clears, ['timer-1', 'timer-2'], 'cleared on a non-timeout rejection too')
+  })
+
+  await testAsync('the timeout fallback still aborts the request when AbortSignal.any is absent', async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(AbortSignal, 'any')
+    let seenSignal
+    let fire
+    const gate = createApprovalGate({
+      request: (request) => { seenSignal = request.signal; return new Promise(() => {}) },
+      logger: { info: () => {}, warn: () => {} },
+      setTimeout: (callback) => { fire = callback; return 'timer-fallback' },
+      clearTimeout: () => {},
+    })
+    try {
+      Object.defineProperty(AbortSignal, 'any', { value: undefined, configurable: true, writable: true })
+      const session = fakeSession()
+      const run = gate.authorize({ session, agent: fakeAgent(session), host: hostEntry({ approvalTimeoutMs: 1200 }), toolName: 'ssh_shell', callId: 'fallback' })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      fire()
+      await assert.rejects(run, /approval timed out after 1200 ms/)
+      assert.equal(seenSignal.aborted, true, 'the fallback combined controller aborted the request')
+    } finally {
+      if (descriptor !== undefined) Object.defineProperty(AbortSignal, 'any', descriptor)
+      else delete AbortSignal.any
+    }
+  })
+
+  await testAsync('undefined and invalid approvalTimeoutMs fall back to the 120000 timer', async () => {
+    for (const value of [undefined, -1, 500, 3_600_001, 1.5]) {
+      let fire
+      const scheduled = []
+      const gate = createApprovalGate({
+        request: () => new Promise(() => {}),
+        logger: { info: () => {}, warn: () => {} },
+        setTimeout: (callback, ms) => { scheduled.push(ms); fire = callback; return 'timer-default' },
+        clearTimeout: () => {},
+      })
+      const host = hostEntry(value === undefined ? {} : { approvalTimeoutMs: value })
+      const session = fakeSession()
+      const run = gate.authorize({ session, agent: fakeAgent(session), host, toolName: 'ssh_shell', callId: 'default-' + String(value) })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      assert.deepEqual(scheduled, [120000], 'value ' + String(value) + ' uses the default')
+      fire()
+      await assert.rejects(run, /approval timed out after 120000 ms/)
+    }
+  })
   await testAsync('clearing a stale session mark stops a later standard-card answer from caching', async () => {
     const { gate, calls } = makeGate(['rejected', 'allowed-once', 'allowed-once'])
     const session = fakeSession()
@@ -9914,6 +10092,28 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.ok(buttons.every((node) => node.props.disabled === false))
   })
 
+  await testAsync('the scope clear posts {scope:clear} and requires the JSON ok envelope', async () => {
+    const { clearHostApprovalScope } = internals
+    const posts = []
+    await clearHostApprovalScope('call-ok', async (url, init) => {
+      posts.push([url, JSON.parse(init.body)])
+      return { ok: true, status: 200, json: async () => ({ ok: true }) }
+    })
+    assert.deepEqual(posts, [['/win-mb/hosts.approvalScope', { callId: 'call-ok', scope: 'clear' }]])
+    // A 200 SPA fallback (HTML, not the route's JSON envelope) must not count as cleared.
+    await assert.rejects(
+      () => clearHostApprovalScope('call-spa', async () => ({ ok: true, status: 200, json: async () => { throw new SyntaxError('Unexpected token <') } })),
+      /non-JSON body/,
+    )
+    await assert.rejects(
+      () => clearHostApprovalScope('call-refused', async () => ({ ok: true, status: 200, json: async () => ({ ok: false }) })),
+      /was refused/,
+    )
+    await assert.rejects(
+      () => clearHostApprovalScope('call-500', async () => ({ ok: false, status: 500, json: async () => ({ ok: false }) })),
+      /HTTP 500/,
+    )
+  })
   await testAsync('the waiting latch makes a rapid double click answer once', async () => {
     const { SshApprovalCard, en } = internals
     const answered = []
