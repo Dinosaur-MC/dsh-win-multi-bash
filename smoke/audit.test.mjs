@@ -2879,12 +2879,10 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
           assert.match(definition.description, /blackhole/, 'the alias hint comes from the row registry')
           const output = definition.output?.schema?.properties ?? {}
           assert.deepEqual(Object.keys(output).sort(), ['bytes', 'error', 'files', 'ok'])
-          // The row's own tools are the ones serving the registry's alias parameter;
-          // other composed plugins register their own (the jobs tools, for one).
-          const rowTools = ctx.tools.schemas()
-            .filter((tool) => tool.parameters?.properties?.alias !== undefined)
-            .map((tool) => tool.name).sort()
-          assert.deepEqual(rowTools, ['ssh_scp', 'ssh_shell'], 'the host-registry row mounts exactly its two tools')
+          // Assert by NAME, not by a parameter proxy: a third ssh_* tool that did not
+          // serve the registry's alias would otherwise be invisible here.
+          const sshToolNames = ctx.tools.schemas().map((tool) => tool.name).filter((name) => /^ssh_/.test(name)).sort()
+          assert.deepEqual(sshToolNames, ['ssh_scp', 'ssh_shell'], 'the host-registry row mounts exactly its two ssh_* tools')
           // The row still serves exactly the shell tool and this one.
           assert.ok(ctx.tools.get('ssh_shell') !== undefined)
         }],
@@ -4115,7 +4113,7 @@ if (process.platform !== 'win32') {
 
     test('a path outside the workspace is refused with the standard sandbox sentence', () => {
       // The escape shapes: a .. walk, and a path on another volume (Windows).
-      for (const requested of ['..' + BS + 'evil.txt', 'C:' + BS + 'elsewhere' + BS + 'x.txt']) {
+      for (const requested of ['..' + BS + 'evil.txt', 'D:' + BS + 'elsewhere' + BS + 'x.txt']) {
         assert.throws(() => inside(requested), (error) => {
           assert.match(error.message, /\[sandbox: file access denied under workspace-write mode\]/, 'the family sentence, not a new wording')
           assert.match(error.message, /outside this session's workspace/)
@@ -4126,7 +4124,7 @@ if (process.platform !== 'win32') {
       // A sibling that merely shares a prefix is still outside: same-volume, not inside.
       assert.equal(isInsideRoot(root, 'C:' + BS + 'workspace-evil' + BS + 'x'), false)
       if (process.platform === 'win32')
-        assert.equal(isInsideRoot(root, 'C:' + BS + 'workspace' + BS + 'x'), true, 'Windows paths compare case-insensitively')
+        assert.equal(isInsideRoot(root, 'c:' + BS + 'WORKSPACE' + BS + 'x'), true, 'Windows paths compare case-insensitively')
     })
 
     test('danger-full-access allows an outside path and SAYS it is outside', () => {
@@ -4145,6 +4143,365 @@ if (process.platform !== 'win32') {
     })
   } finally {
     // nothing to clean up: every case above is lexical (no file is created)
+  }
+}
+
+console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, errors) (S11)')
+{
+  // An in-process ssh2 SFTP server backed by a scratch directory: it speaks enough of
+  // the protocol (OPEN/READ/WRITE/CLOSE/STAT/OPENDIR/READDIR/MKDIR/...) for the REAL
+  // client streams to move real files, so the runner is exercised end to end without a
+  // network or an sshd.
+  const fs = await import('node:fs')
+  const ssh2 = (await import('ssh2')).default ?? (await import('ssh2'))
+  // ssh2's package root does not export the SFTP protocol constants (they live in
+  // its internal SFTP module); these are the stable wire numbers the fixture needs.
+  const SFTP_STATUS = { OK: 0, EOF: 1, NO_SUCH_FILE: 2, FAILURE: 4 }
+  const SFTP_OPEN = { READ: 0x1, WRITE: 0x2, APPEND: 0x4, CREAT: 0x8, TRUNC: 0x10 }
+  const { ScpRunner } = await import(libUrl('ssh-shell', 'scp.js'))
+  const { SshPool } = await import(libUrl('ssh-shell', 'pool.js'))
+
+  const root = mkdtempSync(join(tmpdir(), 'dsh-wmb-scp-'))
+  const remoteRoot = join(root, 'remote')
+  const localRoot = join(root, 'local')
+  fs.mkdirSync(remoteRoot, { recursive: true })
+  fs.mkdirSync(localRoot, { recursive: true })
+  const hostKey = ssh2.utils.generateKeyPairSync('ed25519')
+  const clientKey = ssh2.utils.generateKeyPairSync('ed25519')
+  const hostPublic = ssh2.utils.parseKey(hostKey.public)
+  const keyPath = join(root, 'id_ed25519')
+  writeFileSync(keyPath, clientKey.private)
+  const knownHostsFor = (port) => {
+    const path = join(root, 'kh-' + port)
+    writeFileSync(path, '[127.0.0.1]:' + port + ' ' + hostPublic.type + ' ' + hostPublic.getPublicSSH().toString('base64') + '\n')
+    return path
+  }
+  const hostEntry = (port) => ({
+    alias: 'scp-fixture', host: '127.0.0.1', port, user: 'tester', keyPath,
+    connectTimeoutMs: 5000, acceptNewHostKeys: false, approval: 'trusted', default: true,
+  })
+  /** The local file a remote path names inside this fixture's scratch root. */
+  const localOf = (remotePath) => {
+    const parts = String(remotePath).replace(/^\/+/, '').split('/').filter((part) => part.length > 0)
+    return parts.length === 0 ? remoteRoot : join(remoteRoot, ...parts)
+  }
+  const attrsOf = (stat) => ({
+    mode: stat.mode, uid: stat.uid, gid: stat.gid, size: stat.size,
+    atime: stat.atimeMs / 1000, mtime: stat.mtimeMs / 1000,
+  })
+  /**
+   * Start the SFTP fixture.
+   * @param options.holdOpen - never answer OPEN, so a client waits until it gives up.
+   */
+  const startServer = async ({ holdOpen = false } = {}) => {
+    const state = { connections: 0, sftpSessions: 0 }
+    const server = new ssh2.Server({ hostKeys: [hostKey.private] }, (client) => {
+      state.connections += 1
+      client.on('error', () => {})
+      client.on('authentication', (context) => context.accept())
+      client.on('ready', () => {
+        client.on('session', (accept) => {
+          const session = accept()
+          session.on('sftp', (acceptSftp) => {
+            state.sftpSessions += 1
+            const sftp = acceptSftp()
+            const handles = new Map()
+            let next = 0
+            const open = (value) => {
+              const handle = Buffer.alloc(4)
+              handle.writeUInt32BE(next++, 0)
+              handles.set(handle.readUInt32BE(0), value)
+              return handle
+            }
+            const lookup = (handle) => handle.length === 4 ? handles.get(handle.readUInt32BE(0)) : undefined
+            sftp.on('OPEN', (reqid, filename, flags) => {
+              if (holdOpen) return
+              const { OPEN_MODE, STATUS_CODE } = { OPEN_MODE: SFTP_OPEN, STATUS_CODE: SFTP_STATUS }
+              const wantsWrite = (flags & (OPEN_MODE.WRITE | OPEN_MODE.APPEND | OPEN_MODE.CREAT | OPEN_MODE.TRUNC)) !== 0
+              try {
+                const fd = fs.openSync(localOf(filename), wantsWrite ? ((flags & OPEN_MODE.APPEND) !== 0 ? 'a' : 'w') : 'r')
+                sftp.handle(reqid, open({ fd }))
+              }
+              catch {
+                sftp.status(reqid, STATUS_CODE.NO_SUCH_FILE)
+              }
+            })
+            sftp.on('WRITE', (reqid, handle, offset, data) => {
+              const entry = lookup(handle)
+              if (entry === undefined) return sftp.status(reqid, SFTP_STATUS.FAILURE)
+              try {
+                fs.writeSync(entry.fd, data, 0, data.length, offset)
+                sftp.status(reqid, SFTP_STATUS.OK)
+              }
+              catch {
+                sftp.status(reqid, SFTP_STATUS.FAILURE)
+              }
+            })
+            sftp.on('READ', (reqid, handle, offset, length) => {
+              const entry = lookup(handle)
+              if (entry === undefined) return sftp.status(reqid, SFTP_STATUS.FAILURE)
+              const buffer = Buffer.alloc(length)
+              let read = 0
+              try {
+                read = fs.readSync(entry.fd, buffer, 0, length, offset)
+              }
+              catch {
+                return sftp.status(reqid, SFTP_STATUS.FAILURE)
+              }
+              if (read === 0) return sftp.status(reqid, SFTP_STATUS.EOF)
+              sftp.data(reqid, buffer.subarray(0, read))
+            })
+            sftp.on('FSTAT', (reqid, handle) => {
+              const entry = lookup(handle)
+              if (entry === undefined) return sftp.status(reqid, SFTP_STATUS.FAILURE)
+              try {
+                sftp.attrs(reqid, attrsOf(fs.fstatSync(entry.fd)))
+              }
+              catch {
+                sftp.status(reqid, SFTP_STATUS.FAILURE)
+              }
+            })
+            sftp.on('CLOSE', (reqid, handle) => {
+              const entry = lookup(handle)
+              if (entry !== undefined) {
+                if (entry.fd !== undefined) {
+                  try {
+                    fs.closeSync(entry.fd)
+                  }
+                  catch {
+                    // A closed handle is the outcome either way.
+                  }
+                }
+                handles.delete(handle.readUInt32BE(0))
+              }
+              sftp.status(reqid, SFTP_STATUS.OK)
+            })
+            const statHandler = (reqid, path) => {
+              try {
+                sftp.attrs(reqid, attrsOf(fs.statSync(localOf(path))))
+              }
+              catch {
+                sftp.status(reqid, SFTP_STATUS.NO_SUCH_FILE)
+              }
+            }
+            sftp.on('STAT', statHandler).on('LSTAT', statHandler)
+            sftp.on('REALPATH', (reqid, path) => sftp.name(reqid, [{ filename: path, longname: path, attrs: {} }]))
+            sftp.on('OPENDIR', (reqid, path) => {
+              try {
+                sftp.handle(reqid, open({ dir: localOf(path), names: fs.readdirSync(localOf(path)), sent: false }))
+              }
+              catch {
+                sftp.status(reqid, SFTP_STATUS.NO_SUCH_FILE)
+              }
+            })
+            sftp.on('READDIR', (reqid, handle) => {
+              const entry = lookup(handle)
+              if (entry === undefined) return sftp.status(reqid, SFTP_STATUS.FAILURE)
+              if (entry.sent) return sftp.status(reqid, SFTP_STATUS.EOF)
+              entry.sent = true
+              sftp.name(reqid, entry.names.map((name) => {
+                const stat = fs.statSync(join(entry.dir, name))
+                return { filename: name, longname: name, attrs: attrsOf(stat) }
+              }))
+            })
+            sftp.on('MKDIR', (reqid, path) => {
+              try {
+                fs.mkdirSync(localOf(path))
+                sftp.status(reqid, SFTP_STATUS.OK)
+              }
+              catch {
+                // SFTP has no EEXIST status: an existing directory is reported as a
+                // failure, which is exactly what ensureRemoteDir tolerates.
+                sftp.status(reqid, SFTP_STATUS.FAILURE)
+              }
+            })
+            sftp.on('REMOVE', (reqid, path) => {
+              try {
+                fs.unlinkSync(localOf(path))
+                sftp.status(reqid, SFTP_STATUS.OK)
+              }
+              catch {
+                sftp.status(reqid, SFTP_STATUS.FAILURE)
+              }
+            })
+            sftp.on('RMDIR', (reqid, path) => {
+              try {
+                fs.rmdirSync(localOf(path))
+                sftp.status(reqid, SFTP_STATUS.OK)
+              }
+              catch {
+                sftp.status(reqid, SFTP_STATUS.FAILURE)
+              }
+            })
+            sftp.on('SETSTAT', (reqid) => sftp.status(reqid, SFTP_STATUS.OK))
+            sftp.on('FSETSTAT', (reqid) => sftp.status(reqid, SFTP_STATUS.OK))
+          })
+        })
+      })
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const port = server.address().port
+    return { port, state, close: () => new Promise((resolve) => server.close(resolve)) }
+  }
+  const runnerFor = (fixture, logger) => {
+    const pool = new SshPool({ knownHostsPath: knownHostsFor(fixture.port) })
+    return { pool, runner: new ScpRunner({ pool, logger }) }
+  }
+  try {
+    await testAsync('a file upload streams every byte and creates the remote parents', async () => {
+      const fixture = await startServer()
+      const { pool, runner } = runnerFor(fixture)
+      try {
+        const local = join(localRoot, 'hello.txt')
+        writeFileSync(local, 'hello ssh_scp\n')
+        const result = await runner.upload({ host: hostEntry(fixture.port), localPath: local, remotePath: '/in/hello.txt', timeoutMs: 5000 })
+        assert.deepEqual(result, { ok: true, bytes: 14, files: 1 })
+        assert.equal(readFileSync(join(remoteRoot, 'in', 'hello.txt'), 'utf8'), 'hello ssh_scp\n', 'content and parent directory arrived')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('a file download lands byte-identical, creating local parents', async () => {
+      const fixture = await startServer()
+      const { pool, runner } = runnerFor(fixture)
+      try {
+        fs.mkdirSync(join(remoteRoot, 'out'), { recursive: true })
+        writeFileSync(join(remoteRoot, 'out', 'payload.bin'), Buffer.from([0, 1, 2, 3, 250, 251, 252, 253]))
+        const local = join(localRoot, 'nested', 'deeper', 'payload.bin')
+        const result = await runner.download({ host: hostEntry(fixture.port), localPath: local, remotePath: '/out/payload.bin', timeoutMs: 5000 })
+        assert.deepEqual(result, { ok: true, bytes: 8, files: 1 })
+        assert.deepEqual([...readFileSync(local)], [0, 1, 2, 3, 250, 251, 252, 253], 'binary content survives')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('a directory tree uploads recursively and reports the file count', async () => {
+      const fixture = await startServer()
+      const { pool, runner } = runnerFor(fixture)
+      try {
+        const tree = join(localRoot, 'tree')
+        fs.mkdirSync(join(tree, 'sub'), { recursive: true })
+        writeFileSync(join(tree, 'a.txt'), 'aaaa')
+        writeFileSync(join(tree, 'sub', 'b.txt'), 'bbbbbb')
+        const result = await runner.upload({ host: hostEntry(fixture.port), localPath: tree, remotePath: '/up', recursive: true, timeoutMs: 5000 })
+        assert.deepEqual(result, { ok: true, bytes: 10, files: 2 })
+        assert.equal(readFileSync(join(remoteRoot, 'up', 'a.txt'), 'utf8'), 'aaaa')
+        assert.equal(readFileSync(join(remoteRoot, 'up', 'sub', 'b.txt'), 'utf8'), 'bbbbbb', 'the nested shape is preserved')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('a directory tree downloads recursively and reports the file count', async () => {
+      const fixture = await startServer()
+      const { pool, runner } = runnerFor(fixture)
+      try {
+        fs.mkdirSync(join(remoteRoot, 'down', 'sub'), { recursive: true })
+        writeFileSync(join(remoteRoot, 'down', 'a.txt'), 'aaaa')
+        writeFileSync(join(remoteRoot, 'down', 'sub', 'b.txt'), 'bbbbbb')
+        const target = join(localRoot, 'pulled')
+        const result = await runner.download({ host: hostEntry(fixture.port), localPath: target, remotePath: '/down', recursive: true, timeoutMs: 5000 })
+        assert.deepEqual(result, { ok: true, bytes: 10, files: 2 })
+        assert.equal(readFileSync(join(target, 'a.txt'), 'utf8'), 'aaaa')
+        assert.equal(readFileSync(join(target, 'sub', 'b.txt'), 'utf8'), 'bbbbbb')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('a directory without recursive is a named error, in both directions', async () => {
+      const fixture = await startServer()
+      const { pool, runner } = runnerFor(fixture)
+      try {
+        const tree = join(localRoot, 'nosrec')
+        fs.mkdirSync(tree, { recursive: true })
+        writeFileSync(join(tree, 'x.txt'), 'x')
+        const upload = await runner.upload({ host: hostEntry(fixture.port), localPath: tree, remotePath: '/nope', timeoutMs: 5000 })
+        assert.equal(upload.ok, false)
+        assert.equal(upload.error.phase, 'sftp')
+        assert.equal(upload.error.alias, 'scp-fixture')
+        assert.match(upload.error.message, /is a directory; pass recursive: true/)
+        fs.mkdirSync(join(remoteRoot, 'rdir'), { recursive: true })
+        const download = await runner.download({ host: hostEntry(fixture.port), localPath: join(localRoot, 'rdir-local'), remotePath: '/rdir', timeoutMs: 5000 })
+        assert.equal(download.ok, false)
+        assert.match(download.error.message, /is a directory; pass recursive: true/)
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('a missing local file and a missing remote path are structured failures', async () => {
+      const fixture = await startServer()
+      const { pool, runner } = runnerFor(fixture)
+      try {
+        const missingLocal = await runner.upload({ host: hostEntry(fixture.port), localPath: join(localRoot, 'absent.txt'), remotePath: '/absent.txt', timeoutMs: 5000 })
+        assert.equal(missingLocal.ok, false)
+        assert.equal(missingLocal.error.phase, 'sftp')
+        assert.match(missingLocal.error.message, /absent\.txt/)
+        const missingRemote = await runner.download({ host: hostEntry(fixture.port), localPath: join(localRoot, 'x.bin'), remotePath: '/nothing.bin', timeoutMs: 5000 })
+        assert.equal(missingRemote.ok, false)
+        assert.match(missingRemote.error.message, /does not exist/)
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('a stalled SFTP session times out with a named error and does not hang', async () => {
+      const fixture = await startServer({ holdOpen: true })
+      const { pool, runner } = runnerFor(fixture)
+      try {
+        const local = join(localRoot, 'stall.txt')
+        writeFileSync(local, 'x')
+        const started = Date.now()
+        const result = await runner.upload({ host: hostEntry(fixture.port), localPath: local, remotePath: '/stall.txt', timeoutMs: 200 })
+        const elapsed = Date.now() - started
+        assert.equal(result.ok, false)
+        assert.equal(result.error.phase, 'sftp')
+        assert.match(result.error.message, /timed out after 200 ms/)
+        assert.ok(elapsed < 5000, 'the deadline, not the socket, ended the call: ' + elapsed + ' ms')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('a caller abort ends the transfer and says it was aborted', async () => {
+      const fixture = await startServer({ holdOpen: true })
+      const { pool, runner } = runnerFor(fixture)
+      try {
+        const local = join(localRoot, 'abort.txt')
+        writeFileSync(local, 'x')
+        const controller = new AbortController()
+        setTimeout(() => controller.abort(), 50)
+        const result = await runner.upload({ host: hostEntry(fixture.port), localPath: local, remotePath: '/abort.txt', timeoutMs: 30000, signal: controller.signal })
+        assert.equal(result.ok, false)
+        assert.equal(result.error.aborted, true)
+        assert.match(result.error.message, /aborted by the caller/)
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('the runner never logs a file content, a key or a passphrase', async () => {
+      const fixture = await startServer()
+      const messages = []
+      const pool = new SshPool({ knownHostsPath: knownHostsFor(fixture.port) })
+      const runner = new ScpRunner({ pool, logger: { debug: (message) => messages.push(String(message)), info: (message) => messages.push(String(message)) } })
+      try {
+        const local = join(localRoot, 'secret.txt')
+        writeFileSync(local, 'TOP-SECRET-CONTENT')
+        await runner.upload({ host: hostEntry(fixture.port), localPath: local, remotePath: '/secret.txt', timeoutMs: 5000 })
+        assert.ok(messages.length >= 1, 'the transfer did log its summary')
+        for (const message of messages) {
+          assert.ok(!message.includes('TOP-SECRET-CONTENT'), 'a file content must never reach the log: ' + message)
+          assert.ok(!message.includes(clientKey.private.slice(0, 40)), 'a key must never reach the log')
+        }
+        assert.match(messages.join('\n'), /1 file\(s\), 18 byte\(s\) on "scp-fixture"/, 'the summary names the alias, files and bytes only')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('two operations reuse ONE pooled connection and one SFTP session each', async () => {
+      const fixture = await startServer()
+      const { pool, runner } = runnerFor(fixture)
+      try {
+        const one = join(localRoot, 'one.txt')
+        const two = join(localRoot, 'two.txt')
+        writeFileSync(one, 'one')
+        writeFileSync(two, 'two')
+        await runner.upload({ host: hostEntry(fixture.port), localPath: one, remotePath: '/one.txt', timeoutMs: 5000 })
+        await runner.upload({ host: hostEntry(fixture.port), localPath: two, remotePath: '/two.txt', timeoutMs: 5000 })
+        assert.equal(fixture.state.connections, 1, 'one TCP connection served both transfers')
+        assert.equal(fixture.state.sftpSessions, 2, 'and each operation opened its own SFTP session')
+        assert.equal(pool.size(), 1)
+      } finally { pool.dispose(); await fixture.close() }
+    })
+  } finally {
+    removeFixtureDir(root)
   }
 }
 
