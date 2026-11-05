@@ -90,7 +90,7 @@ Each tool description keeps only its own dialect facts. When the core row is swi
 - registers one `plugins.row.config` page per row (key `dsh-win-multi-bash#<row id>`) while the Host serves that row's namespace;
 - registers the conversation rows through the keyed `tool.call.toolview` slot (see [Conversation rows](conversation-rows.md));
 - renders the `sshShell.hosts` registry as a **table** on the ssh row's Configure page: one card per host with every registry field, `approval` as a select and `default` as an exclusive radio (at most one, zero allowed), staging the host-object array — there is no JSON text control;
-- registers the Session header's terminal list (`conversation.session.header.actions`): `sessions.list` / `sessions.tail` over the `/win-mb` RPC, and `sessions.stop` for a human Stop;
+- registers the Session header's terminal list (`conversation.session.header.actions`): `sessions.list` / `sessions.tail` over the plugin's `/win-mb` JSON route on the web server (legacy hosts fall back to Connection RPC), and `sessions.stop` for a human Stop;
 - registers the dedicated SSH authorization card as a `conversation.composer` chain entry at priority 0 (see [Conversation rows](conversation-rows.md#host-authorization-card)): it claims only a pending, answerable approval whose tool is `ssh_shell` or `ssh_scp`, and returns null for everything else so the platform's shared approval composer at priority 1 keeps the standard card;
 - registers the core-row note via `plugins.detail.section`.
 

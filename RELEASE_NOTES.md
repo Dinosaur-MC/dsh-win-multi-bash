@@ -24,6 +24,7 @@
 - The hosts table refuses to save a table the Host would reject — blank required fields, malformed or duplicate aliases, a port outside the range, a non-object entry, or more than one default — instead of persisting an inventory every call then fails on.
 - An approval answer that fails no longer marks the request settled: the card re-enables its buttons, shows the failure, and leaves the request pending.
 - Stale single-host pins no longer fall back silently to one host: a profile that still carries them comes up with no hosts and the call error says what to add.
+- The terminal session header works on DSH 0.2.2-rc.1 again: the panel's `/win-mb` route is registered directly on the injected web server (the host's `connection.rpc.handle` now throws `cannot get property "webServer" without inject`), and a zero-session header stays hidden even when its probe fails.
 
 ## Breaking changes
 
