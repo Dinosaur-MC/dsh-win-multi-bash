@@ -6006,6 +6006,32 @@ console.log('\n[A] unit: the ssh session authorization gate (S12)')
     assert.deepEqual(await waiter, { granted: true }, 'the waiter settles by its own answer')
   })
 
+  await testAsync('an abort racing an owner cancellation still returns cancelled and starts no new ask', async () => {
+    const resolvers = []
+    const calls = []
+    const gate = createApprovalGate({
+      request: (request) => { calls.push(request); return new Promise((resolve) => resolvers.push(resolve)) },
+      logger: { info: () => {}, warn: () => {} },
+      setTimeout: () => { throw new Error('no timer expected') },
+      clearTimeout: () => {},
+    })
+    const session = fakeSession()
+    const agent = fakeAgent(session)
+    const host = hostEntry({ approvalTimeoutMs: 0 })
+    const owner = gate.authorize({ session, agent, host, toolName: 'ssh_shell', callId: 'race-owner' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const controller = new AbortController()
+    const waiter = gate.authorize({ session, agent, host, toolName: 'ssh_scp', callId: 'race-waiter', signal: controller.signal })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(calls.length, 1, 'one in-flight ask first')
+    // Same tick: the owner settles cancelled AND the waiter's signal aborts.
+    resolvers[0]('cancelled')
+    controller.abort()
+    await assert.rejects(owner, (error) => error.outcome === 'cancelled')
+    await assert.rejects(waiter, (error) => error.outcome === 'cancelled' && error.phase === 'approval')
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(calls.length, 1, 'the aborted waiter starts NO new approval')
+  })
   await testAsync('a waiter behind an allowed-once-on-abort owner still times out with ONE prompt', async () => {
     let fire
     const calls = []
