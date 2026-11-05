@@ -5635,8 +5635,8 @@ console.log('\n[A] unit: the ssh session authorization gate (S12)')
     assert.equal(request.callId, 'call-1')
     assert.match(request.reason, /host "prod" \(deploy@10\.0\.0\.9:22\)/)
     assert.match(request.reason, /THIS session only/)
-    assert.match(request.displayReason, /allow this session to use/)
-    assert.notEqual(request.reason, request.displayReason, 'the human sentence is its own field')
+    assert.match(request.displayReason.en, /allow this session to use/, 'displayReason is the localized record the platform card resolves')
+    assert.notEqual(request.reason, request.displayReason.en, 'the human sentence is its own field')
     await gate.authorize({ session, agent, host: hostEntry(), toolName: 'ssh_scp', callId: 'call-2' })
     assert.equal(calls.length, 1, 'the second call on the same session and host never asks again')
   })
@@ -8359,7 +8359,14 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
       assert.equal(typeof entry.options.inject().hooks.rowForm.getSnapshot, 'function')
     }
     // The bundle page also gets the core-row note, on its own slot.
-    const detail = slotRegistrations.filter((entry) => entry.options.name !== 'plugins.row.config' && entry.options.name !== 'tool.call.toolview')
+    const detail = slotRegistrations.filter((entry) => !['plugins.row.config', 'tool.call.toolview', 'conversation.composer'].includes(entry.options.name))
+    // The SSH authorization card: one conversation.composer CHAIN entry at priority 0.
+    const composer = slotRegistrations.filter((entry) => entry.options.name === 'conversation.composer')
+    assert.equal(composer.length, 1, 'exactly one composer entry')
+    assert.equal(composer[0].options.priority, 0, 'it runs before the shared approval composer (priority 1)')
+    assert.equal(composer[0].options.locale, internals.NS)
+    assert.equal(typeof composer[0].options.select, 'function')
+    assert.equal(typeof composer[0].component, 'function')
     // The bundle seat comes first, under both candidate keys; then the note. No
     // `settings.section` entry: that surface showed the same form a second time.
     assert.deepEqual(detail.map((entry) => entry.options.name), ['plugins.bundle.config', 'plugins.bundle.config', 'plugins.detail.section'])
@@ -8396,6 +8403,91 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.deepEqual(pages.map((entry) => entry.options.key), REGISTRY_ROWS.map((row) => rowKey(row.rowId)))
   })
 
+  /** Flatten a React-stub element tree into its nodes (and text leaves). */
+  const flattenTree = (root) => {
+    const nodes = []
+    const walk = (node) => {
+      if (node === undefined || node === null) return
+      if (typeof node === 'string') { nodes.push({ text: node }); return }
+      if (typeof node !== 'object') return
+      nodes.push(node)
+      for (const child of node.children ?? []) walk(child)
+    }
+    walk(root)
+    return nodes
+  }
+
+  test('the SSH approval matcher claims ONLY ssh_shell / ssh_scp pending approvals', async () => {
+    const { sshApprovalMatch, APPROVAL_GATED_TOOL_NAMES } = internals
+    // The generated list IS the host registry's gate list: a rename reddens here.
+    const registry = await import(libUrl('tool-bash', 'types', 'registry.js'))
+    assert.deepEqual(APPROVAL_GATED_TOOL_NAMES, registry.APPROVAL_GATED_TOOL_NAMES)
+    assert.deepEqual(APPROVAL_GATED_TOOL_NAMES, ['ssh_shell', 'ssh_scp'])
+    const pending = (over = {}) => ({ kind: 'approval', toolName: 'ssh_shell', answerable: true, answer: async () => {}, ...over })
+    const shell = pending({ toolName: 'ssh_shell' })
+    const scp = pending({ toolName: 'ssh_scp' })
+    assert.equal(sshApprovalMatch(shell), shell, 'ssh_shell is claimed')
+    assert.equal(sshApprovalMatch(scp), scp, 'ssh_scp is claimed')
+    assert.equal(sshApprovalMatch(pending({ toolName: 'git_bash' })), null, 'another tool falls through')
+    assert.equal(sshApprovalMatch(pending({ toolName: 'terminal' })), null)
+    assert.equal(sshApprovalMatch(pending({ kind: 'question' })), null, 'a non-approval interaction falls through')
+    assert.equal(sshApprovalMatch(pending({ answerable: false })), null, 'a settled request falls through')
+    assert.equal(sshApprovalMatch({ kind: 'approval', toolName: 'ssh_shell' }), null, 'no answer() means it is not answerable here')
+    assert.equal(sshApprovalMatch(undefined), null)
+    assert.equal(sshApprovalMatch(null), null)
+  })
+
+  test('the SSH approval card renders both outcomes and answers through the request', () => {
+    const { SshApprovalCard, en } = internals
+    const answered = []
+    const pending = {
+      kind: 'approval', toolName: 'ssh_shell', answerable: true,
+      answer: (outcome) => { answered.push(outcome); return Promise.resolve() },
+      displayReason: { en: 'ssh_shell: allow this session to use host "prod" (deploy@10.0.0.9:22)? The grant lasts until this session ends.' },
+    }
+    const tree = SshApprovalCard({ matched: pending, t: (key) => en[key] ?? key })
+    const nodes = flattenTree(tree)
+    const buttons = nodes.filter((node) => node.type === 'Button')
+    assert.equal(buttons.length, 2, 'allow + reject, no third choice')
+    assert.deepEqual(buttons.map((node) => node.children[0]), ['Allow for this session', 'Reject'])
+    const text = nodes.filter((node) => typeof node.text === 'string').map((node) => node.text).join(' ')
+    assert.match(text, /host "prod" \(deploy@10\.0\.0\.9:22\)/, 'the request sentence names the alias and the target')
+    assert.match(text, /THIS session only/)
+    assert.equal(buttons[0].props.disabled, false)
+    buttons[0].props.onClick()
+    buttons[1].props.onClick()
+    assert.deepEqual(answered, ['allowed-once', 'rejected'], 'the answer is the pending request\'s own outcome')
+  })
+
+  test('a settled request renders no live buttons and keeps the platform card', () => {
+    const { sshApprovalMatch, SshApprovalCard, en } = internals
+    const settled = { kind: 'approval', toolName: 'ssh_scp', answerable: false, answer: async () => {}, displayReason: { en: 'x' } }
+    assert.equal(sshApprovalMatch(settled), null, 'a settled pending is not claimed')
+    const nodes = flattenTree(SshApprovalCard({ matched: settled, t: (key) => en[key] ?? key }))
+    const buttons = nodes.filter((node) => node.type === 'Button')
+    assert.equal(buttons.length, 2)
+    assert.ok(buttons.every((node) => node.props.disabled === true), 'both buttons are disabled')
+    assert.match(nodes.filter((node) => typeof node.text === 'string').map((node) => node.text).join(' '), /no longer pending/)
+  })
+
+  test('apply registers the card as a priority-0 chain entry that renders an ssh pending', () => {
+    const slotRegistrations = []
+    applyWithProbes({
+      locale: { register: () => () => {}, bind: () => (key) => key, resolveText: (record) => record?.zh ?? record?.en },
+      configForms: { get: () => fakeScope(), whileServed: (names, callback) => { callback(new Set(names)); return () => {} } },
+      slots: { inject: (_name, register) => register(), register: (options, component) => { slotRegistrations.push({ options, component }); return () => {} } },
+      effect: (callback) => callback(),
+    })
+    const composer = slotRegistrations.find((entry) => entry.options.name === 'conversation.composer')
+    assert.ok(composer !== undefined, 'the composer chain entry is registered')
+    assert.equal(composer.options.priority, 0, 'before the shared approval composer')
+    const pending = { kind: 'approval', toolName: 'ssh_shell', answerable: true, answer: async () => {}, displayReason: { en: 'allow?' } }
+    assert.equal(composer.options.select({ pendingInteraction: pending }), pending)
+    assert.equal(composer.options.select({ pendingInteraction: { kind: 'approval', toolName: 'ui-other' } }), null, 'other approvals fall through')
+    const injected = composer.options.inject()
+    const nodes = flattenTree(composer.component({ matched: pending, t: (key) => internals.en[key] ?? key, resolver: injected.resolver }))
+    assert.equal(nodes.filter((node) => node.type === 'Button').length, 2, 'the card renders through the registered entry')
+  })
   test('a deployment without the card primitives gets no row at all, not a broken one', () => {
     const slotRegistrations = []
     const bare = registrations[0].factory((id) => {

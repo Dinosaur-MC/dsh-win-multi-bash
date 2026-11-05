@@ -21,7 +21,7 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { CLIENT_ROWS, LEAF_RULES, TERMINAL_ROW } from '../lib/tool-bash/types/registry.js';
+import { APPROVAL_GATED_TOOL_NAMES, CLIENT_ROWS, LEAF_RULES, TERMINAL_ROW } from '../lib/tool-bash/types/registry.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CLIENT_PATH = join(HERE, '..', 'lib', 'client.js');
@@ -75,6 +75,13 @@ export function renderClientRegistry() {
     lines.push(`\t\tconst TERMINAL_ROW_ID = ${JSON.stringify(TERMINAL_ROW.rowId)};`);
     lines.push(`\t\tconst TERMINAL_TOOL_NAME = ${JSON.stringify(TERMINAL_ROW.toolName)};`);
     lines.push(`\t\tconst TERMINAL_CONFIG_KEY = ${JSON.stringify(TERMINAL_ROW.configKey)};`);
+    lines.push('\t\t/**');
+    lines.push('\t\t * The tools whose host authorization uses this bundle\'s own approval card');
+    lines.push('\t\t * (the remote dialect\'s tool plus the extra tools its row serves), from the');
+    lines.push('\t\t * registry. A rename reddens here instead of silently falling back to the');
+    lines.push('\t\t * platform card.');
+    lines.push('\t\t */');
+    lines.push(`\t\tconst APPROVAL_GATED_TOOL_NAMES = [${APPROVAL_GATED_TOOL_NAMES.map((name) => JSON.stringify(name)).join(', ')}];`);
     return `${lines.join('\n')}\n`;
 }
 
