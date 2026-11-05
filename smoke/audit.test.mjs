@@ -7836,7 +7836,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
    */
   const applyWithProbes = (ctx) => client.apply(Object.assign({ get: (name) => ctx[name] }, ctx))
 
-  const { ROWS, rowKey, planOps, RowConfigForm, RowConfigCard, HostsEditor, hostRowsFrom, hostObjectFromRow, hostObjectsFrom, hostRowErrors, blankHostRow, HOST_FIELDS, en, zh, SHELL_TOOL_NAMES, TERMINAL_TOOL_NAME, ToolCard, toolCardBody, toolCardIo, terminalBody, terminalLabels, cardTitle, shellCard, shellExitLabel, shellStatus, displayCwd, normalizeSegments, cardSummary, cardState, cardOutput, cardInput } = internals
+  const { ROWS, rowKey, planOps, RowConfigForm, RowConfigCard, HostsEditor, hostRowsFrom, hostObjectFromRow, hostObjectsFrom, hostDraftFrom, hostRowErrors, hostsValueProblem, blankHostRow, HOST_FIELDS, en, zh, SHELL_TOOL_NAMES, TERMINAL_TOOL_NAME, ToolCard, toolCardBody, toolCardIo, terminalBody, terminalLabels, cardTitle, shellCard, shellExitLabel, shellStatus, displayCwd, normalizeSegments, cardSummary, cardState, cardOutput, cardInput } = internals
 
   test('the client entry exports exactly the platform plugin triple', () => {
     // Official package-surface rule: a /client entry must not export implementation
@@ -8166,6 +8166,74 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     form.dispose()
   })
 
+  await testAsync('a hosts array with a NON-OBJECT entry is refused, never saved', async () => {
+    // A legacy or hand-edited array can carry a primitive or null. hostRowsFrom has no
+    // row to show for it, so the FIELD warning and the write gate must both reject it:
+    // saving it would persist an inventory every call then fails on.
+    const sshRow = ROWS.find((row) => row.rowId === 'win-mb-tool-ssh')
+    const form = new RowConfigForm(fakeScope(), sshRow)
+    const field = () => form.project().fields.find((entry) => entry.key === 'sshShell.hosts')
+    for (const bad of [[1], ['x'], [null]]) {
+      form.discard()
+      form.edit('sshShell.hosts', JSON.stringify(bad))
+      assert.equal(field().invalid, true, JSON.stringify(bad) + ' is flagged')
+      assert.equal(field().invalidReason, 'hosts', JSON.stringify(bad) + ' carries the field warning')
+      await form.save()
+      assert.equal(form.scope.calls.length, 0, JSON.stringify(bad) + ' writes nothing')
+    }
+    // The same shape staged as a draft (what a stored/legacy array would produce).
+    form.discard()
+    form.edit('sshShell.hosts', [null])
+    assert.equal(field().invalidReason, 'hosts')
+    await form.save()
+    assert.equal(form.scope.calls.length, 0)
+    form.dispose()
+  })
+
+  await testAsync('a stored hosts array with a bad entry is flagged before any edit', async () => {
+    const sshRow = ROWS.find((row) => row.rowId === 'win-mb-tool-ssh')
+    const scope = fakeScope({ value: { sshShell: { hosts: [null] } }, user: { sshShell: { hosts: [null] } } })
+    const form = new RowConfigForm(scope, sshRow)
+    const field = form.project().fields.find((entry) => entry.key === 'sshShell.hosts')
+    assert.deepEqual(field.rows, [], 'a null entry has no row to render')
+    assert.equal(field.invalid, true, 'but the field still reports the broken inventory')
+    assert.equal(field.invalidReason, 'hosts')
+    form.dispose()
+  })
+
+  await testAsync('TWO defaults are refused: the row errors name it and nothing is saved', async () => {
+    // At most one host may be the default (spec §6). The radio enforces it while
+    // editing; a stored/hand-edited pair must not slip through.
+    const sshRow = ROWS.find((row) => row.rowId === 'win-mb-tool-ssh')
+    const scope = fakeScope()
+    const form = new RowConfigForm(scope, sshRow)
+    const host = (alias) => ({ alias, host: 'h.example', port: '', user: 'u', keyPath: 'k', passphraseEnv: '', startupCommand: '', shellTemplate: '', connectTimeoutMs: '', approval: 'session', acceptNewHostKeys: false, default: true, description: '' })
+    form.edit('sshShell.hosts', hostObjectsFrom([host('one'), host('two')]))
+    const field = form.project().fields.find((entry) => entry.key === 'sshShell.hosts')
+    assert.equal(field.invalid, true, 'two defaults is invalid')
+    assert.deepEqual(field.rowErrors.map((errors) => errors.default), ['defaultDuplicate', 'defaultDuplicate'])
+    assert.equal(form.project().dirty, true)
+    await form.save()
+    assert.equal(scope.calls.length, 0, 'two defaults writes nothing')
+    form.dispose()
+  })
+
+  await testAsync('the editor row id is STRIPPED from the saved value', async () => {
+    const sshRow = ROWS.find((row) => row.rowId === 'win-mb-tool-ssh')
+    const scope = fakeScope()
+    const form = new RowConfigForm(scope, sshRow)
+    const row = blankHostRow()
+    row.alias = 'prod'; row.host = 'h.example'; row.user = 'u'; row.keyPath = 'k'
+    const draft = hostDraftFrom([row])
+    assert.equal(typeof draft[0].__rowId, 'string', 'the draft carries the editor id')
+    form.edit('sshShell.hosts', draft)
+    await form.save()
+    const saved = scope.calls[0].ops[0].value
+    assert.equal(saved.length, 1)
+    assert.equal(Object.hasOwn(saved[0], '__rowId'), false, 'the saved host has no editor id')
+    assert.equal(saved[0].alias, 'prod')
+    form.dispose()
+  })
   await testAsync('a legacy JSON OBJECT draft warns and writes nothing', async () => {
     const sshRow = ROWS.find((row) => row.rowId === 'win-mb-tool-ssh')
     const scope = fakeScope()
