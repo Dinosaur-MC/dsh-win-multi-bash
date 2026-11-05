@@ -2878,7 +2878,7 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
           assert.match(definition.description, /foreground only/)
           assert.match(definition.description, /blackhole/, 'the alias hint comes from the row registry')
           const output = definition.output?.schema?.properties ?? {}
-          assert.deepEqual(Object.keys(output).sort(), ['bytes', 'error', 'files', 'ok'])
+          assert.deepEqual(Object.keys(output).sort(), ['bytes', 'error', 'files', 'ok', 'outsideWorkspace', 'sandbox'])
           // Assert by NAME, not by a parameter proxy: a third ssh_* tool that did not
           // serve the registry's alias would otherwise be invisible here.
           const sshToolNames = ctx.tools.schemas().map((tool) => tool.name).filter((name) => /^ssh_/.test(name)).sort()
@@ -2886,18 +2886,44 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
           // The row still serves exactly the shell tool and this one.
           assert.ok(ctx.tools.get('ssh_shell') !== undefined)
         }],
-        ['ssh_scp applies the same alias rule as ssh_shell, before any transfer', async () => {
+        ['ssh_scp answers every expected refusal as a STRUCTURED result (no raw throw)', async () => {
+          // 1. Unknown alias: the §8.1 rule, reported as a config-phase result.
           const unknown = await scpCall(ctx, { action: 'upload', localPath: 'a.txt', remotePath: '/tmp/a.txt', alias: 'nope' })
-          const text = unknown.content.filter((block) => block.type === 'text').map((block) => block.text).join('')
-          assert.equal(unknown.isError, true)
-          assert.match(text, /no host with alias "nope"; this row declares blackhole/)
-          const resolved = await scpCall(ctx, { action: 'upload', localPath: 'a.txt', remotePath: '/tmp/a.txt' })
-          const resolvedText = resolved.content.filter((block) => block.type === 'text').map((block) => block.text).join('')
-          assert.equal(resolved.isError, false, 'the transfer stub answers with a structured result: ' + resolvedText)
-          assert.equal(resolved.value?.ok, false, 'the transfer engine is not wired yet, so the result is a structured failure: ' + JSON.stringify(resolved.value))
-          assert.equal(resolved.value?.bytes, 0)
-          assert.equal(resolved.value?.error?.phase, 'sftp')
+          const unknownText = unknown.content.filter((block) => block.type === 'text').map((block) => block.text).join('')
+          assert.equal(unknown.isError, false, 'an unknown alias is a result, not an exception: ' + unknownText)
+          assert.equal(unknown.value?.ok, false)
+          assert.equal(unknown.value?.bytes, 0)
+          assert.equal(unknown.value?.error?.phase, 'config')
+          assert.match(unknown.value?.error?.message, /no host with alias "nope"; this row declares blackhole/)
+          assert.equal(typeof unknown.value?.sandbox?.mode, 'string', 'the remote fact rides on failures too')
+          assert.equal(unknown.value?.sandbox?.remote, true)
+
+          // 2. A Windows drive path for remotePath is a config refusal, before any dial.
+          const drive = await scpCall(ctx, { action: 'upload', localPath: 'a.txt', remotePath: 'C:' + BS + 'Users' + BS + 'x.txt' })
+          assert.equal(drive.isError, false)
+          assert.equal(drive.value?.error?.phase, 'config')
+          assert.match(drive.value?.error?.message, /is a local Windows path/)
+          const relative = await scpCall(ctx, { action: 'upload', localPath: 'a.txt', remotePath: 'relative/x.txt' })
+          assert.equal(relative.value?.error?.phase, 'config')
+          assert.match(relative.value?.error?.message, /is relative/)
+
+          // 3. A local path outside the session workspace is a sandbox refusal.
+          const outside = await scpCall(ctx, { action: 'upload', localPath: winPath('C:', 'definitely-outside', 'x.txt'), remotePath: '/tmp/x.txt' })
+          const outsideValue = outside.value
+          assert.equal(outside.isError, false)
+          assert.equal(outsideValue?.error?.phase, 'sandbox')
+          assert.match(outsideValue?.error?.message, /\[sandbox: file access denied under .+ mode\]/, 'the family sentence, whatever the effective mode is')
+          assert.equal(outsideValue?.outsideWorkspace, undefined, 'a refused path is not a transfer')
+
+          // 4. The declared default host is unreachable here, so the real dial fails in
+          //    the connect phase — still a structured result with the alias named.
+          const resolved = await scpCall(ctx, { action: 'upload', localPath: 'README.md', remotePath: '/tmp/a.txt' })
+          assert.equal(resolved.isError, false, 'a refused dial is a result too')
+          assert.equal(resolved.value?.ok, false)
+          assert.equal(resolved.value?.error?.phase, 'connect')
           assert.equal(resolved.value?.error?.alias, 'blackhole', 'the default host was resolved by the same rule')
+          assert.equal(typeof resolved.value?.sandbox?.mode, 'string')
+          assert.equal(resolved.value?.sandbox?.remote, true)
         }],
         ['the tool advertises no sandbox_permissions it cannot honour', async () => {
           const definition = ctx.tools.get('ssh_shell')
@@ -4096,6 +4122,7 @@ if (process.platform !== 'win32') {
   // touching the filesystem, or it would be a second racy access next to the transfer.
   const BS = String.fromCharCode(92)
   const { resolveLocalPath, isInsideRoot } = await import(libUrl('ssh-shell', 'local-path.js'))
+  const { assertRemotePath } = await import(libUrl('ssh-shell', 'hosts.js'))
   const root = 'C:' + BS + 'workspace'
   const ww = 'workspace-write'
   const inside = (requested, over = {}) => resolveLocalPath({ sessionCwd: root, requested, workspaceRoot: root, sandboxMode: ww, ...over })
@@ -4133,6 +4160,15 @@ if (process.platform !== 'win32') {
       assert.deepEqual(allowed, { path: outside, outsideWorkspace: true, mode: 'danger-full-access' })
       const stillInside = inside('local.txt', { sandboxMode: 'danger-full-access' })
       assert.equal(stillInside.outsideWorkspace, false, 'inside stays inside under full access')
+    })
+
+    test('a remote path must be an absolute POSIX path (the /C:/ form IS allowed)', () => {
+      assert.equal(assertRemotePath('/home/me/x.txt'), '/home/me/x.txt')
+      assert.equal(assertRemotePath('/C:/Users/me/x.txt'), '/C:/Users/me/x.txt', 'the Windows OpenSSH drive form is POSIX-absolute')
+      assert.throws(() => assertRemotePath('C:' + BS + 'Users' + BS + 'x.txt'), /is a local Windows path/)
+      assert.throws(() => assertRemotePath('relative/x.txt'), /is relative/)
+      assert.throws(() => assertRemotePath(''), /must be a non-empty absolute POSIX path/)
+      assert.throws(() => assertRemotePath('a' + BS + 'b'), /is a local Windows path/)
     })
 
     test('a blank localPath is a named argument error, and a rootless session fails closed', () => {
@@ -4195,7 +4231,7 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
    * @param options.ignoreSubsystem - never accept/reject the sftp subsystem request.
    * @param options.deny - remote paths answered with PERMISSION_DENIED.
    */
-  const startServer = async ({ holdOpen = false, ignoreSubsystem = false, deny = [] } = {}) => {
+  const startServer = async ({ holdOpen = false, ignoreSubsystem = false, deny = [], denyMkdir = [] } = {}) => {
     const state = { connections: 0, sftpOpened: 0, sftpClosed: 0 }
     const server = new ssh2.Server({ hostKeys: [hostKey.private] }, (client) => {
       state.connections += 1
@@ -4204,6 +4240,12 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
       client.on('ready', () => {
         client.on('session', (accept) => {
           const session = accept()
+          session.on('exec', (acceptExec) => {
+            const stream = acceptExec()
+            stream.write('fixture-ok')
+            stream.exit(0)
+            stream.end()
+          })
           session.on('sftp', (acceptSftp) => {
             // The subsystem request is simply dropped: the client must still end at its
             // own deadline, before any SFTP session exists.
@@ -4313,6 +4355,7 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
               }))
             })
             sftp.on('MKDIR', (reqid, path) => {
+              if (denyMkdir.includes(path)) return sftp.status(reqid, SFTP_STATUS.PERMISSION_DENIED)
               try {
                 fs.mkdirSync(localOf(path))
                 sftp.status(reqid, SFTP_STATUS.OK)
@@ -4598,6 +4641,107 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
         assert.equal(fs.statSync(join(target, 'sub', 'empty-deep')).isDirectory(), true, 'and the nested one too')
         assert.equal(readFileSync(join(target, 'b.txt'), 'utf8'), 'bb')
       } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('a command and a transfer share ONE pooled TCP connection', async () => {
+      const fixture = await startServer()
+      const { SshShellExecutor } = await import(libUrl('ssh-shell', 'index.js'))
+      const pool = new SshPool({ knownHostsPath: knownHostsFor(fixture.port) })
+      const config = SshShellExecutor.Config({ hosts: [hostEntry(fixture.port)], timeoutMs: 5000, maxTimeoutMs: 60000 })
+      const executor = Object.assign(Object.create(SshShellExecutor.prototype), {
+        config, poolInstance: pool, internals: {}, processFacts: new Map(), warnedAbout: new Set(),
+        ctx: { sandboxPolicy: { defaultMode: 'workspace-write', resolve: () => ({ mode: 'workspace-write', workspaceRoot: localRoot }) }, logger: { warn: () => {}, debug: () => {} } },
+      })
+      try {
+        const spec = executor.resolve({ command: 'true', timeoutMs: 5000 })
+        const shellResult = await (await executor.execute(spec)).result()
+        assert.equal(shellResult.exitCode, 0, 'the command path ran on the same client')
+        const local = join(localRoot, 'shared.txt')
+        writeFileSync(local, 'shared')
+        const transfer = await executor.transferRunner().upload({ host: hostEntry(fixture.port), localPath: local, remotePath: '/shared.txt', timeoutMs: 5000 })
+        assert.deepEqual(transfer, { ok: true, bytes: 6, files: 1 })
+        assert.equal(fixture.state.connections, 1, 'the shell tool and ssh_scp used ONE TCP connection')
+        assert.equal(executor.transferRunner(), executor.transferRunner(), 'the runner itself is built once')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('a failure to create an EMPTY remote directory is not swallowed', async () => {
+      const fixture = await startServer({ denyMkdir: ['/locked'] })
+      const { pool, runner } = runnerFor(fixture)
+      try {
+        const tree = join(localRoot, 'locked-tree')
+        fs.mkdirSync(join(tree, 'empty'), { recursive: true })
+        writeFileSync(join(tree, 'a.txt'), 'a')
+        const result = await runner.upload({ host: hostEntry(fixture.port), localPath: tree, remotePath: '/locked', recursive: true, timeoutMs: 5000 })
+        assert.equal(result.ok, false, 'a denied mkdir must fail the transfer, not report success')
+        assert.equal(result.error.phase, 'sftp')
+        assert.equal(result.error.alias, 'scp-fixture')
+        assert.match(result.error.message, /Permission denied/i, 'the ssh2 reason is kept: ' + result.error.message)
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+    await testAsync('a session that arrives AFTER a cancellation is closed, never leaked', async () => {
+      // A stub pool whose client (and SFTP session) only appears after the deadline:
+      // the late session must be closed by the operation's own finally, exactly once.
+      let opens = 0
+      let closes = 0
+      const fakeSftp = {
+        end() { closes += 1 },
+      }
+      // The subsystem REQUEST is in flight when the deadline fires; the server accepts
+      // it afterwards, so the session exists only after the caller already has its
+      // answer — the operation must still close it.
+      const latePool = {
+        async get() {
+          return {
+            sftp(callback) {
+              setTimeout(() => { opens += 1; callback(null, fakeSftp) }, 300)
+            },
+          }
+        },
+        drop() { return true },
+      }
+      const lateRunner = new ScpRunner({ pool: latePool })
+      const local = join(localRoot, 'late.txt')
+      writeFileSync(local, 'x')
+      const result = await lateRunner.upload({ host: { alias: 'late-fixture', host: 'late.invalid' }, localPath: local, remotePath: '/late.txt', timeoutMs: 50 })
+      assert.equal(result.ok, false)
+      assert.equal(result.error.phase, 'connect', 'the deadline hit before the session existed')
+      await new Promise((resolve) => setTimeout(resolve, 500))
+      assert.equal(opens, 1, 'the late session was opened')
+      assert.equal(closes, 1, 'and closed exactly once')
+    })
+
+    await testAsync('a stalled SSH handshake times out in the connect phase and drops the client', async () => {
+      const net = await import('node:net')
+      const sockets = []
+      const silent = net.createServer((socket) => {
+        sockets.push(socket)
+        socket.on('error', () => {})
+        // Never speak SSH: the pool's dial waits, and the transfer deadline must win.
+      })
+      await new Promise((resolve) => silent.listen(0, '127.0.0.1', resolve))
+      const port = silent.address().port
+      const knownHostsPath = join(root, 'kh-stalled')
+      writeFileSync(knownHostsPath, '[127.0.0.1]:' + port + ' ssh-ed25519 ' + hostPublic.getPublicSSH().toString('base64') + '\n')
+      const pool = new SshPool({ knownHostsPath })
+      const runner = new ScpRunner({ pool })
+      try {
+        const local = join(localRoot, 'stalled.txt')
+        writeFileSync(local, 'x')
+        const started = Date.now()
+        const result = await runner.upload({ host: hostEntry(port), localPath: local, remotePath: '/stalled.txt', timeoutMs: 200 })
+        const elapsed = Date.now() - started
+        assert.equal(result.ok, false)
+        assert.equal(result.error.phase, 'connect')
+        assert.match(result.error.message, /timed out after 200 ms/)
+        assert.ok(elapsed < 3000, 'the deadline ended the call: ' + elapsed + ' ms')
+        assert.equal(pool.size(), 0, 'the wedged client was dropped so it cannot accumulate pending requests')
+      } finally {
+        pool.dispose()
+        for (const socket of sockets) socket.destroy()
+        await new Promise((resolve) => silent.close(resolve))
+      }
     })
 
     await testAsync('the runner never logs a file content, a key or a passphrase', async () => {
