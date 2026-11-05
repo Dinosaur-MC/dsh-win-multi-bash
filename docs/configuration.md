@@ -53,7 +53,7 @@ Only `git_bash` and `terminal` are enabled by default; three dialects ship switc
 | `startupCommand` | no | A POSIX shell snippet run before every command on that host; see [Startup command and shell templates](#startup-command-and-shell-templates). |
 | `shellTemplate` | no | The remote command line that reads a base64 script from its stdin. Default `bash -c 'eval "$(base64 -d)"'`. |
 | `connectTimeoutMs` | no | Whole handshake and authentication ceiling for one connection, default `30000`. |
-| `approval` | no | `trusted` or `session` (default). Recorded on the host for the session-authorization gate, which is not part of this change: today neither value changes a call for `ssh_shell` or `ssh_scp` — no prompt is made, and `trusted` is not required to use a host. Neither the model nor a call argument can set it. |
+| `approval` | no | `trusted` or `session` (default). `session` asks the human once per session before the host is used; `trusted` pre-authorizes it and never asks — the only form usable headless. Neither the model nor a call argument can set it; see [Host authorization](#host-authorization). |
 | `acceptNewHostKeys` | no | `false` by default. `true` accepts an unknown host key for that connection with a one-time warning; it never writes `known_hosts`. |
 | `default` | no | At most one host may carry it; a call may then omit `alias`. |
 | `description` | no | Free text for the human (the Configure page and the composition file); it never reaches a call's result. |
@@ -78,6 +78,21 @@ Two stated limits fall on the strict side — the call is refused, never accepte
 Add each entry deliberately before the first call — connect once with the OpenSSH client, or run `ssh-keyscan` — because the switch only covers a host with **no** entry, never a changed or revoked one.
 
 Authentication is key-only and the passphrase stays out of the file: an encrypted key needs `passphraseEnv` to name an environment variable that holds its passphrase, and a missing or wrong passphrase fails the call with a message naming that variable. No passphrase or key material is written to config, logs or a tool result.
+
+## Host authorization
+
+`ssh_shell` and `ssh_scp` do not use a host the human has not authorized **for this session**. The host's `approval` field decides how that happens:
+
+- **`trusted`** — the host is pre-authorized and never asks. This is the deployment's headless escape hatch; neither the model nor a call argument can set it.
+- **`session`** (the default) — the first use in a session asks through the platform's approval service, once per session and host, and remembers the answer in memory only.
+
+Grants live in a `WeakMap` keyed by the Session object and a host fingerprint: never written to disk, never shared between sessions, and lost when the plugin reloads — a new session is asked again. The fingerprint is `alias + host + port + user + keyPath + passphraseEnv`; editing **any** of those fields invalidates the grant and the next use asks again. Only the passphrase environment variable's *name* is part of it, never the passphrase.
+
+The gate runs **before any connection or channel**: a broken registry or unknown alias fails first, then the grant is checked, then the pool dials — a refusal therefore never dials. Concurrent first uses of the same host in one session share one in-flight request instead of prompting twice.
+
+Outcomes are fail-closed: `rejected` and `cancelled` refuse without connecting; `unavailable` fails closed with a sentence naming the missing answerer and the `trusted` escape hatch; a session approval policy of `never` rejects deterministically without asking, and a request that cannot be answered fails closed rather than granting.
+
+A refusal is reported with phase `approval`: `ssh_shell` throws the named error and `ssh_scp` returns it as its structured `{ ok: false, error: { phase: "approval", alias, message } }` value — the same sentence either way. The prompt uses this bundle's dedicated card (see [Conversation rows](conversation-rows.md#host-authorization-card)). `terminal` sessions stay out of scope in 0.8.0: a session still uses its own single-host pin and is not gated by this table.
 
 ## Startup command and shell templates
 
@@ -117,7 +132,7 @@ Every call returns `{ ok, bytes, files?, error?, sandbox, outsideWorkspace? }`. 
 
 **Capacity refusals are retried; nothing else is.** When the server refuses a new channel for capacity — `MaxSessions`, `administratively prohibited`, `channel open failure`, `open failed`, `resource shortage` — `ssh_shell` retries the OPEN (never the command) at 100/200/400 ms, capped at 1 s: a foreground call until its deadline, a background or job-owned call for at most four attempts. `ssh_scp` retries a refused SFTP subsystem under the same four-attempt budget. Authentication, host-key, handshake, socket and passphrase failures — and every SFTP operation error — are never retried. When retrying stops the error is the server's **last refusal verbatim** plus a note saying why: the call deadline expired for a foreground call, while the bounded budget (including a refused SFTP subsystem) says `gave up after N attempts`. It is never a synthetic timeout; an abort is the platform abort, and the alias is in `error.alias`.
 
-`ssh_scp` shares the row's `approval` field with `ssh_shell`; until the session-authorization gate ships, that field is recorded and **not enforced** for either tool.
+`ssh_scp` shares the row's `approval` field with `ssh_shell`, and [Host authorization](#host-authorization) applies to both: a gate refusal is the structured `approval` phase and never reaches a dial.
 
 ## Text and numeric fields
 
@@ -202,4 +217,4 @@ Then update the calls — `ssh_shell` with `alias: "ubuntu"` and its `command`, 
 
 Authentication is key-only: a password prompt or a live ssh-agent is not available to `ssh_shell`, and an encrypted key needs `passphraseEnv`. Host keys are strict — add each host to `known_hosts` first, or set `acceptNewHostKeys: true` on that host to accept an unknown key once with a warning. Neither a missing `known_hosts` entry nor a changed key is bypassed by that switch, and `@cert-authority` entries are not honoured in 0.8.0.
 
-The row also gains a second tool, `ssh_scp` (see [File transfer](#file-transfer-ssh_scp)). It is not a rename: there is no old name to migrate, it reads the same `sshShell.hosts` and reuses the same connection, its local side is sandboxed as described there, its remote paths use the POSIX form (`/C:/...` on a Windows OpenSSH host), and its `approval` semantics are recorded-only for now, like `ssh_shell`'s.
+The row also gains a second tool, `ssh_scp` (see [File transfer](#file-transfer-ssh_scp)). It is not a rename: there is no old name to migrate, it reads the same `sshShell.hosts` and reuses the same connection, its local side is sandboxed as described there, its remote paths use the POSIX form (`/C:/...` on a Windows OpenSSH host), and its `approval` semantics are `ssh_shell`'s (session-memory grants, see [Host authorization](#host-authorization)).

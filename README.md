@@ -27,14 +27,14 @@ Every dialect owns its own executor, and **no tool registers as `ctx.shell`** �
 | `terminal` | any of the above | Persistent PTY sessions: `open` / `send` / `read` / `signal` / `close` / `list` |
 | `pwsh` | dsh's own | Untouched; served by the base bundle's `pwsh-sandbox` row |
 
-Only `git_bash` and `terminal` are enabled by default; the other three rows are opt-in. On many hosts `git_bash` runs unconfined — see [Sandbox behavior](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/sandbox.md).
+Only `git_bash` and `terminal` ship on; the other three rows are opt-in. `git_bash` often runs unconfined — see [Sandbox behavior](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/sandbox.md).
 
 ## Requirements
 
 - dsh `0.1.7-rc.2` through `0.2.x` — the window `package.json`'s `engines.dsh` declares. A newer dsh refuses this plugin.
 - Windows, and a dsh deployment that provides the published `@deepseek-ai` base packages.
 - Git Bash and/or WSL and/or MSYS2 only for the backends you enable; a missing backend never affects pwsh.
-- For `ssh_shell` / `ssh_scp`: key-only access to hosts under `sshShell.hosts`, with host keys already in `known_hosts`.
+- For `ssh_shell` / `ssh_scp`: key-only access under `sshShell.hosts`, host keys in `known_hosts`.
 - Node `^22.19.0 || >=24.0.0` (the range this package declares), and `pnpm` for installation.
 
 ## Install
@@ -53,7 +53,7 @@ Requires `pnpm`. The bundle layer is assembled at boot, so **restart `dsh web`**
 
 - **`git_bash`** is ready after install. It runs a fresh MSYS bash per call; `workdir` accepts native, MSYS (`/c/...`) and WSL automount (`/mnt/c/...`) forms.
 - **`wsl_bash` / `msys2_bash`**: enable `win-mb-tool-wsl` / `win-mb-tool-msys2` on the Plugins page. Pin `wslBash.wslDistro` or `msys2Bash.bashPath` only when discovery is not enough.
-- **`ssh_shell`**: enable `win-mb-tool-ssh` and add hosts under `sshShell.hosts` (`alias`, `host`, `user`, `keyPath`; `port` / `startupCommand` / `default` as needed). A call names an alias, or omits it when one host is `default`; a row with no hosts refuses every call. Authentication and host keys are strict and key-only — see the [migration notes](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/configuration.md).
+- **`ssh_shell`**: enable `win-mb-tool-ssh` and add hosts under `sshShell.hosts` (`alias`, `host`, `user`, `keyPath`; `port` / `startupCommand` / `default` as needed). A call names an alias (or omits it when one host is `default`); no hosts refuses every call. Key-only auth, strict host keys — see the [migration notes](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/configuration.md). Hosts default to `approval: session`: one prompt per session through a dedicated card; `trusted` never asks.
 - **`ssh_scp`**: the same row does transfers — `action: "upload" | "download"`, `localPath` (inside the workspace unless `danger-full-access`; checked lexically, symlinks are not resolved), `remotePath` (absolute POSIX; `/C:/...` on Windows OpenSSH), `recursive` for trees, `timeoutMs` (default 5 min). Foreground only; the result is `{ ok, bytes, files?, error? }` plus `sandbox` facts (and `outsideWorkspace` when an outside path was allowed), and failures are values naming the phase and the alias.
 - **`terminal`**: `open` a session, `send` commands with `submit: true`, `read` the reply, then `close`. The working directory, exported variables and aliases survive between calls. Sessions are process-local, capped, idle-reclaimed and **not** jobs; the Session header lists and stops them.
 - Every row has a **Configure** page on the Plugins page: paths, timeouts, sandbox stance, session limits and the deployment-wide self-heal switch. Changes are live unless a knob shapes the tool schema.
@@ -61,8 +61,8 @@ Requires `pnpm`. The bundle layer is assembled at boot, so **restart `dsh web`**
 ## Design at a glance
 
 - **Honest facts, not guesses.** A successful confined run says `denied: false`; a failed one matching the backend's denial dialect says `denied: true`; a failed one matching nothing says no `denied` at all. An unwrapped run says `unconfined: true`. A remote SSH run reports `sandbox: { mode, remote: true }`.
-- **Platform-native calls.** Our shell tools render as the platform's own shell card; `ssh_scp` transfers use the platform's generic row. See [Conversation rows](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/conversation-rows.md).
-- **One connection per host, one channel per call.** `ssh_shell` reuses a pooled ssh2 client and gives every call its own exec channel — isolated, parallel-safe, cancellable; a timeout signals the remote process. `ssh_scp` transfers share that pooled client, one SFTP session per transfer.
+- **Platform-native calls.** Our shell tools use the platform's shell card; `ssh_scp` uses the generic row. See [Conversation rows](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/conversation-rows.md).
+- **One connection per host, one channel per call.** `ssh_shell` reuses a pooled ssh2 client and gives every call its own exec channel — isolated, parallel-safe, cancellable. `ssh_scp` transfers share that pooled client, one SFTP session per transfer.
 - **One declaration per dialect.** A dialect is one executor file plus one registry declaration; the tool modules, prompt membership, patch rows, config partition, package exports and client rows are derived from it. A declaration that does not hold together throws at load. See [Architecture](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/architecture.md).
 - **One shared prompt section.** The core row owns a single `tool:win-mb-bash` section whose text follows the mounted tools; each tool description keeps only its own dialect facts.
 - **Live configuration, user input wins.** Knobs are `.volatile()` where they can be live; the page never rewrites a value, and a save is revision-fenced.

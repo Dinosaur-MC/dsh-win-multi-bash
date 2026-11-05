@@ -10,6 +10,17 @@ One row is registered per **dialect tool** this bundle mounts — the dialects t
 
 The ssh row's second tool, `ssh_scp`, deliberately has **no row of its own**: every transfer renders through the platform's generic `Tool call · ssh_scp` card (a dedicated transfer card is future work). It has three render shapes, and none of them is a shell card: a **success** renders `transferred <bytes> byte(s) in <files> file(s)` with the local/remote notes and no phase or abort text; a **structured failure** renders `transfer failed (<phase>, host "<alias>")` with the ssh2 message and the local/remote notes, and carries no bytes/files sentence; a **caller abort** never renders a transfer sentence at all — the tool throws the platform's `TOOL_ABORTED` and the platform draws its own error.
 
+## Host authorization card
+
+A pending approval for `ssh_shell` or `ssh_scp` does not use the platform's shared card: `lib/client.js` registers this bundle's own card as a `conversation.composer` **chain** entry at **priority 0**, and the platform's shared approval composer runs after it at priority 1. The matcher is deliberately strict — a pending interaction must be `kind: "approval"`, still answerable (`answerable !== false`), and its `toolName` must be one of the two gated tools; anything else returns null and falls through, so every other tool's approvals keep the standard card.
+
+The card shows the title "Authorize this SSH host for the session", the request's own reason (the alias plus `user@host:port`), and the session-scope sentence ("Allowing grants THIS session only: …"), with exactly two answers:
+
+- **Allow for this session** answers `allowed-once`; the gate records the session grant and the call proceeds.
+- **Reject** answers `rejected`; the call fails closed without dialing.
+
+It answers through the pending interaction's own `answer()` — no new RPC, and the approval audit events are unchanged. No page navigation; the fixed labels are plain strings in this plugin's dictionary. A request that settles elsewhere shows "This request is no longer pending."; an answer that could not be delivered says so and points at the standard approval card, which remains a working fallback.
+
 ## All or nothing
 
 The row is built from four client primitives (`DisclosureRow`, `TextShimmer`, `IconApiOutlineRegular`, `IconInspectOutlineRegular`). A deployment missing any of them registers **no row at all** and keeps the platform's generic card: plainer, never broken. `TerminalBlock` is optional rather than required: without it the rows still register and every body falls back to the platform's INPUT/OUTPUT card.
