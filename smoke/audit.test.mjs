@@ -3109,6 +3109,15 @@ console.log('\n[A] unit: the ssh_shell host registry (validation, aliases, defau
     assert.match(validateHosts([42]).error, /each host must be an object/)
     assert.equal(validateHosts([]).ok, true, 'no hosts is a VALID (if useless) inventory; the call path says what it means')
     assert.deepEqual(validateHosts([]).hosts, [])
+    // approvalTimeoutMs: default 120000, custom preserved, 0 = wait forever, range enforced.
+    assert.equal(validateHosts([{ alias: 't', host: 'h', user: 'u', keyPath: 'k' }]).hosts[0].approvalTimeoutMs, 120000)
+    assert.equal(validateHosts([{ alias: 't', host: 'h', user: 'u', keyPath: 'k', approvalTimeoutMs: 5000 }]).hosts[0].approvalTimeoutMs, 5000)
+    assert.equal(validateHosts([{ alias: 't', host: 'h', user: 'u', keyPath: 'k', approvalTimeoutMs: 0 }]).hosts[0].approvalTimeoutMs, 0)
+    for (const value of [999, 3_600_001, 1.5, '5000']) {
+      const bad = validateHosts([{ alias: 't', host: 'h', user: 'u', keyPath: 'k', approvalTimeoutMs: value }])
+      assert.equal(bad.ok, false, 'approvalTimeoutMs ' + JSON.stringify(value) + ' is refused')
+      assert.match(bad.error, /approvalTimeoutMs/)
+    }
   })
 }
 
@@ -5479,6 +5488,37 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
       } finally { pool.dispose(); await fixture.close() }
     })
 
+    await testAsync('the ssh_scp gate: a timed-out approval is a structured approval failure, never dials', async () => {
+      const approval = { calls: [], request: () => { approval.calls.push(1); return new Promise(() => {}) }, effectivePolicy: () => 'ask' }
+      const fixture = await startServer()
+      const { SshShellExecutor } = await import(libUrl('ssh-shell', 'index.js'))
+      const { createScpTool } = await import(libUrl('ssh-shell', 'scp-tool.js'))
+      const pool = new SshPool({ knownHostsPath: knownHostsFor(fixture.port) })
+      const config = SshShellExecutor.Config({ hosts: [hostEntry(fixture.port, { approval: 'session', approvalTimeoutMs: 1000 })], timeoutMs: 5000, maxTimeoutMs: 60000 })
+      const executor = Object.assign(Object.create(SshShellExecutor.prototype), {
+        config, poolInstance: pool, internals: {}, processFacts: new Map(), warnedAbout: new Set(),
+        ctx: { sandboxPolicy: { defaultMode: 'workspace-write', resolve: () => ({ mode: 'workspace-write', workspaceRoot: localRoot }) }, approval, logger: { warn: () => {}, debug: () => {} } },
+      })
+      const tools = []
+      const toolCtx = { tools: { register: (definition) => tools.push(definition) }, sandboxPolicy: { resolve: () => ({ mode: 'workspace-write', workspaceRoot: localRoot }) }, get: () => undefined, logger: { warn: () => {} } }
+      await createScpTool().register(toolCtx, { executor })
+      try {
+        const session = fakeSession()
+        const agent = fakeAgent(session)
+        const local = join(localRoot, 'gate-timeout.txt')
+        writeFileSync(local, 'x')
+        const value = await tools[0].execute(
+          { action: 'upload', localPath: local, remotePath: '/gate-timeout.txt', timeoutMs: 5000 },
+          { agent, callId: 'call-timeout', signal: new AbortController().signal },
+        )
+        assert.equal(value.ok, false)
+        assert.equal(value.bytes, 0)
+        assert.equal(value.error.phase, 'approval')
+        assert.match(value.error.message, /approval timed out after 1000 ms/)
+        assert.equal(approval.calls.length, 1, 'one prompt was issued and then withdrawn')
+        assert.equal(fixture.state.connections, 0, 'a timed-out host is never dialled')
+      } finally { pool.dispose(); await fixture.close() }
+    })
     await testAsync('a concurrent ssh_shell + ssh_scp first miss does NOT over-grant a one-shot', async () => {
       const fixture = await startServer()
       const { SshShellExecutor } = await import(libUrl('ssh-shell', 'index.js'))
@@ -5586,7 +5626,7 @@ console.log('\n[A] unit: the ssh session authorization gate (S12)')
   // The gate is pure: fake sessions/agents and a fake request cover every path with no
   // boot and no network. Grants are per Session object and per host fingerprint, in
   // memory only, and a request is only ever made under a REAL agent.
-  const { ApprovalError, createApprovalGate, fingerprintOf, markApprovalScope, consumeApprovalScope, ONE_SHOT_TTL_MS, ONE_SHOT_MAX } = await import(libUrl('ssh-shell', 'approval.js'))
+  const { ApprovalError, createApprovalGate, fingerprintOf, markApprovalScope, consumeApprovalScope, clearApprovalScope, ONE_SHOT_TTL_MS, ONE_SHOT_MAX } = await import(libUrl('ssh-shell', 'approval.js'))
 
   const hostEntry = (over = {}) => ({
     alias: 'prod', host: '10.0.0.9', port: 22, user: 'deploy',
@@ -5717,6 +5757,102 @@ console.log('\n[A] unit: the ssh session authorization gate (S12)')
     await gate.authorize({ session, agent, host: hostEntry(), toolName: 'ssh_shell', callId: 'call-later' })
     assert.equal(calls.length, 2, 'the session retry was cached')
   })
+  await testAsync('an approval prompt times out: exact sentence, abort, no cache, no re-ask waiter', async () => {
+    const scheduled = []
+    const cleared = []
+    let fire
+    const calls = []
+    const signals = []
+    const gate = createApprovalGate({
+      request: (request) => { calls.push(request); signals.push(request.signal); return new Promise(() => {}) },
+      logger: { info: () => {}, warn: () => {} },
+      setTimeout: (callback, ms) => { scheduled.push(ms); fire = callback; return 'timer-' + scheduled.length },
+      clearTimeout: (id) => cleared.push(id),
+    })
+    const session = fakeSession()
+    const agent = fakeAgent(session)
+    const host = hostEntry({ approvalTimeoutMs: 2500 })
+    const first = gate.authorize({ session, agent, host, toolName: 'ssh_shell', callId: 'timeout-1' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(calls.length, 1)
+    assert.deepEqual(scheduled, [2500], 'the host approvalTimeoutMs is the timer')
+    fire()
+    await assert.rejects(first, (error) => {
+      assert.equal(error.name, 'ApprovalError')
+      assert.equal(error.phase, 'approval')
+      assert.equal(error.outcome, 'timeout')
+      assert.equal(error.message, 'ssh: host "prod" (deploy@10.0.0.9:22) is not authorized for this session: approval timed out after 2500 ms')
+      return true
+    })
+    assert.equal(signals[0].aborted, true, 'the pending request was aborted so the card is withdrawn')
+    assert.deepEqual(cleared, ['timer-1'], 'the timer is cleared on settle')
+    // No cache: the next call asks again (and can time out again).
+    const second = gate.authorize({ session, agent, host, toolName: 'ssh_shell', callId: 'timeout-2' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(calls.length, 2, 'a timed-out approval is never cached')
+    fire()
+    await assert.rejects(second, /approval timed out after 2500 ms/)
+  })
+
+  await testAsync('a concurrent waiter behind a timed-out owner gets the same timeout, not a new prompt', async () => {
+    let fire
+    let timers = 0
+    const calls = []
+    const gate = createApprovalGate({
+      request: (request) => { calls.push(request); return new Promise(() => {}) },
+      logger: { info: () => {}, warn: () => {} },
+      setTimeout: (callback) => { timers += 1; fire = callback; return timers },
+      clearTimeout: () => {},
+    })
+    const session = fakeSession()
+    const agent = fakeAgent(session)
+    const host = hostEntry({ approvalTimeoutMs: 3000 })
+    const first = gate.authorize({ session, agent, host, toolName: 'ssh_shell', callId: 'wait-a' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const second = gate.authorize({ session, agent, host, toolName: 'ssh_scp', callId: 'wait-b' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(calls.length, 1, 'the waiter joins the same in-flight prompt')
+    fire()
+    const settled = await Promise.allSettled([first, second])
+    for (const result of settled) {
+      assert.equal(result.status, 'rejected')
+      assert.equal(result.reason.outcome, 'timeout')
+      assert.match(result.reason.message, /approval timed out after 3000 ms/)
+    }
+    assert.equal(calls.length, 1, 'a timeout does NOT loop the waiter into a second prompt')
+    assert.equal(timers, 1, 'only the owner scheduled a timer')
+  })
+
+  await testAsync('approvalTimeoutMs 0 waits forever: no timer is scheduled and the grant settles', async () => {
+    let timers = 0
+    const gate = createApprovalGate({
+      request: async () => 'allowed-once',
+      logger: { info: () => {}, warn: () => {} },
+      setTimeout: () => { timers += 1; return 1 },
+      clearTimeout: () => {},
+    })
+    const session = fakeSession()
+    const result = await gate.authorize({ session, agent: fakeAgent(session), host: hostEntry({ approvalTimeoutMs: 0 }), toolName: 'ssh_shell', callId: 'forever-1' })
+    assert.deepEqual(result, { granted: true })
+    assert.equal(timers, 0, '0 disables the approval timer')
+  })
+
+  await testAsync('clearing a stale session mark stops a later standard-card answer from caching', async () => {
+    const { gate, calls } = makeGate(['rejected', 'allowed-once', 'allowed-once'])
+    const session = fakeSession()
+    const agent = fakeAgent(session)
+    markApprovalScope('call-stale-session', 'session')
+    const failure = await refusalOf(() => gate.authorize({ session, agent, host: hostEntry(), toolName: 'ssh_shell', callId: 'call-stale-session' }))
+    assert.equal(failure.outcome, 'rejected')
+    assert.equal(calls.length, 1)
+    // The card clears the mark when its answer failed; without the clear the session mark
+    // would survive and the next UNMARKED standard-card answer would be cached.
+    assert.equal(clearApprovalScope('call-stale-session'), true)
+    await gate.authorize({ session, agent, host: hostEntry(), toolName: 'ssh_shell', callId: 'call-standard' })
+    assert.equal(calls.length, 2)
+    await gate.authorize({ session, agent, host: hostEntry(), toolName: 'ssh_shell', callId: 'call-standard-2' })
+    assert.equal(calls.length, 3, 'an unmarked standard-card answer is one-shot and cannot grant a session')
+  })
   await testAsync('a first miss asks ONCE under the caller agent, then remembers for the session', async () => {
     const { gate, calls } = makeGate([])
     const session = fakeSession()
@@ -5837,7 +5973,7 @@ console.log('\n[A] unit: the ssh session authorization gate (S12)')
     assert.equal(calls.length, 4, 'a changed passphrase variable asks again')
   })
 
-  await testAsync('concurrent misses for the SAME host share ONE request', async () => {
+  await testAsync('concurrent waiters behind a SESSION scope share ONE request and both proceed', async () => {
     const session = fakeSession()
     const agent = fakeAgent(session)
     let resolveRequest
@@ -5857,7 +5993,7 @@ console.log('\n[A] unit: the ssh session authorization gate (S12)')
     await new Promise((resolve) => setTimeout(resolve, 20))
     resolveRequest('allowed-once')
     assert.deepEqual(await both, [{ granted: true }, { granted: true }])
-    assert.equal(calls.length, 1, 'one flight, two waiters')
+    assert.equal(calls.length, 1, 'one flight, two waiters: a session scope is shared, no extra prompt')
   })
 
   await testAsync('a call with no session fails closed with the SESSION sentence', async () => {
@@ -7918,16 +8054,20 @@ console.log('\n[A] unit: the terminal session route\'s hosts.test endpoint and t
 
   await testAsync('hosts.approvalScope validates and marks the scope through the injected marker', async () => {
     const marked = []
-    const dispatch = createSessionDispatch(fakeSessions, { markApprovalScope: (callId, scope) => { marked.push([callId, scope]); return true } })
+    const cleared = []
+    const dispatch = createSessionDispatch(fakeSessions, { markApprovalScope: (callId, scope) => { marked.push([callId, scope]); return true }, clearApprovalScope: (callId) => { cleared.push(callId); return true } })
     assert.deepEqual(await dispatch('hosts.approvalScope', { callId: 'call-1', scope: 'once' }), { ok: true })
     assert.deepEqual(await dispatch('hosts.approvalScope', { callId: 'call-2', scope: 'session' }), { ok: true })
     assert.deepEqual(marked, [['call-1', 'once'], ['call-2', 'session']])
-    for (const payload of [{}, { callId: 'x' }, { callId: 'x', scope: 'always' }, { callId: 'x'.repeat(257), scope: 'once' }]) {
+    assert.deepEqual(await dispatch('hosts.approvalScope', { callId: 'call-clear', scope: 'clear' }), { ok: true })
+    assert.deepEqual(cleared, ['call-clear'], 'clear reaches the clearer and records no scope')
+    for (const payload of [{}, { callId: 'x' }, { callId: 'x', scope: 'always' }, { callId: 'x'.repeat(257), scope: 'once' }, { callId: 'x'.repeat(257), scope: 'clear' }]) {
       const bad = await dispatch('hosts.approvalScope', payload)
       assert.equal(bad.ok, false, 'bad payload ' + JSON.stringify(payload))
       assert.equal(bad.error.code, 'hosts/bad-request')
     }
     assert.equal(marked.length, 2, 'an invalid payload never marks')
+    assert.equal(cleared.length, 1, 'an invalid payload never clears')
     const refused = createSessionDispatch(fakeSessions, { markApprovalScope: () => false })
     const rejected = await refused('hosts.approvalScope', { callId: 'call-3', scope: 'once' })
     assert.equal(rejected.ok, false)
@@ -9451,6 +9591,27 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.equal(toggleOf(nodes).props['aria-expanded'], true, 'a blank row starts open')
     assert.ok(nodes.some((node) => node.type === 'input'))
   })
+  test('the approval timeout is a numeric hosts field with blank/custom/range rules', () => {
+    const field = HOST_FIELDS.find((entry) => entry.leaf === 'approvalTimeoutMs')
+    assert.ok(field !== undefined, 'the field is in the hosts table')
+    assert.equal(field.numeric, true)
+    const row = blankHostRow()
+    row.alias = 'prod'; row.host = 'h.example'; row.user = 'u'; row.keyPath = 'k'
+    assert.equal(Object.hasOwn(hostObjectFromRow(row), 'approvalTimeoutMs'), false, 'blank is omitted (the Host defaults it)')
+    row.approvalTimeoutMs = '5000'
+    assert.equal(hostObjectFromRow(row).approvalTimeoutMs, 5000, 'a number is staged as a number')
+    row.approvalTimeoutMs = '0'
+    assert.equal(hostRowErrors([row])[0].approvalTimeoutMs, undefined, '0 is valid (wait forever)')
+    row.approvalTimeoutMs = '3600000'
+    assert.equal(hostRowErrors([row])[0].approvalTimeoutMs, undefined, 'the upper bound is inclusive')
+    for (const bad of ['999', '3600001', '1.5', 'x']) {
+      const invalid = { ...row, approvalTimeoutMs: bad }
+      assert.equal(hostRowErrors([invalid])[0].approvalTimeoutMs, 'approvalTimeoutRange', 'refused: ' + bad)
+    }
+    assert.equal(en['hosts.field.approvalTimeoutMs'], 'Approval timeout (ms)')
+    assert.equal(zh['hosts.field.approvalTimeoutMs'], '审批超时（毫秒）')
+    assert.match(en['hosts.approvalTimeoutInvalid'], /120000/)
+  })
   test('the default radio is EXCLUSIVE: marking a row clears every other row', () => {
     const staged = []
     const rows = [blankHostRow(), blankHostRow()]
@@ -9686,17 +9847,23 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.equal(buttons[0].props.disabled, false, 'reject needs no scope')
     assert.equal(buttons[1].props.disabled, true, 'a one-shot cannot be keyed without a call id')
     assert.equal(buttons[2].props.disabled, true, 'the session scope cannot be keyed either')
-    assert.match(buttons[1].props.title, /no call id/)
-    assert.match(buttons[2].props.title, /no call id/)
+    assert.match(buttons[1].props.title, /no usable call id/)
+    assert.match(buttons[2].props.title, /no usable call id/)
+    // The route bound is mirrored: 257 chars is not a usable call id.
+    const tooLong = { ...pending, callId: 'x'.repeat(257) }
+    const longButtons = flattenTree(SshApprovalCard({ matched: tooLong, markApprovalScope: async () => {}, t: (key) => en[key] ?? key })).filter((node) => node.type === 'Button')
+    assert.equal(longButtons[1].props.disabled, true, 'an over-long call id disables Allow once')
+    assert.equal(longButtons[2].props.disabled, true, 'an over-long call id disables the session action too')
   })
 
   await testAsync('a failed one-shot mark leaves the approval unanswered and shows the failure', async () => {
     const react = makeStatefulReact()
     const seam = makeClientInstance(react, { Button: 'Button', StateDot: 'StateDot' })
     const answered = []
+    const clears = []
     let markCalls = 0
     const pending = { kind: 'approval', toolName: 'ssh_shell', answerable: true, callId: 'call-x', answer: (outcome) => { answered.push(outcome); return Promise.resolve() } }
-    const props = { matched: pending, t: (key) => seam.en[key] ?? key, markApprovalScope: async () => { markCalls += 1; throw new Error('route down') } }
+    const props = { matched: pending, t: (key) => seam.en[key] ?? key, markApprovalScope: async () => { markCalls += 1; throw new Error('route down') }, clearApprovalScope: async (callId) => { clears.push(callId) } }
     react.begin(() => seam.SshApprovalCard(props))
     let tree = react.mount()
     flattenTree(tree).filter((node) => node.type === 'Button')[1].props.onClick()
@@ -9708,6 +9875,43 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.ok(buttons.every((node) => node.props.disabled === false), 'every action comes back')
     const text = flattenTree(tree).filter((node) => typeof node.text === 'string').map((node) => node.text).join(' ')
     assert.match(text, /could not be delivered/, 'the failure is visible')
+    assert.deepEqual(clears, [], 'a mark that never landed is not cleared')
+  })
+
+  await testAsync('a failed allow answer clears its scope mark and leaves the approval pending', async () => {
+    const react = makeStatefulReact()
+    const seam = makeClientInstance(react, { Button: 'Button', StateDot: 'StateDot' })
+    const answered = []
+    const clears = []
+    const pending = { kind: 'approval', toolName: 'ssh_shell', answerable: true, callId: 'call-clear', answer: (outcome) => { answered.push(outcome); return Promise.reject(new Error('transport died')) } }
+    const props = { matched: pending, t: (key) => seam.en[key] ?? key, markApprovalScope: async () => {}, clearApprovalScope: async (callId) => { clears.push(callId) } }
+    react.begin(() => seam.SshApprovalCard(props))
+    let tree = react.mount()
+    flattenTree(tree).filter((node) => node.type === 'Button')[1].props.onClick()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    tree = react.mount()
+    const buttons = flattenTree(tree).filter((node) => node.type === 'Button')
+    assert.ok(buttons.every((node) => node.props.disabled === false), 'the buttons come back')
+    assert.deepEqual(answered, ['allowed-once'], 'the answer WAS attempted (and failed)')
+    assert.deepEqual(clears, ['call-clear'], 'the failed attempt cleared its scope mark')
+    const text = flattenTree(tree).filter((node) => typeof node.text === 'string').map((node) => node.text).join(' ')
+    assert.match(text, /could not be delivered/)
+  })
+
+  await testAsync('a synchronous allow throw also clears the mark it just wrote', async () => {
+    const react = makeStatefulReact()
+    const seam = makeClientInstance(react, { Button: 'Button', StateDot: 'StateDot' })
+    const clears = []
+    const pending = { kind: 'approval', toolName: 'ssh_shell', answerable: true, callId: 'call-sync-clear', answer: () => { throw new Error('sync boom') } }
+    const props = { matched: pending, t: (key) => seam.en[key] ?? key, markApprovalScope: async () => {}, clearApprovalScope: async (callId) => { clears.push(callId) } }
+    react.begin(() => seam.SshApprovalCard(props))
+    let tree = react.mount()
+    flattenTree(tree).filter((node) => node.type === 'Button')[2].props.onClick()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    tree = react.mount()
+    assert.deepEqual(clears, ['call-sync-clear'], 'a synchronous throw clears the session mark as well')
+    const buttons = flattenTree(tree).filter((node) => node.type === 'Button')
+    assert.ok(buttons.every((node) => node.props.disabled === false))
   })
 
   await testAsync('the waiting latch makes a rapid double click answer once', async () => {

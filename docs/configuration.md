@@ -53,6 +53,7 @@ Only `git_bash` and `terminal` are enabled by default; three dialects ship switc
 | `startupCommand` | no | A POSIX shell snippet run before every command on that host; see [Startup command and shell templates](#startup-command-and-shell-templates). |
 | `shellTemplate` | no | The remote command line that reads a base64 script from its stdin. Default `bash -c 'eval "$(base64 -d)"'`. |
 | `connectTimeoutMs` | no | Whole handshake and authentication ceiling for one connection, default `30000`. |
+| `approvalTimeoutMs` | no | How long a session-authorization prompt may stay open, default `120000` (2 minutes). `0` waits forever; any other value must be `1000`–`3600000`. On timeout the pending card is withdrawn and the call fails closed with the timeout sentence; nothing is cached, so a later call asks again. |
 | `approval` | no | `trusted` or `session` (default). `session` asks the human once per session before the host is used; `trusted` pre-authorizes it and never asks — the only form usable headless. Neither the model nor a call argument can set it; see [Host authorization](#host-authorization). |
 | `acceptNewHostKeys` | no | `false` by default. `true` accepts an unknown host key for that connection with a one-time warning; it never writes `known_hosts`. |
 | `default` | no | At most one host may carry it; a call may then omit `alias`. |
