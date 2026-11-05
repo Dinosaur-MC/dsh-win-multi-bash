@@ -1948,6 +1948,21 @@ console.log('\n[A] unit: the dialect registry is the single source (S1)')
     assert.ok(SHELL_DIALECTS.length >= 2, 'the plugin ships at least the two bash dialects')
   })
 
+  test('the local-only sandbox block is hidden on a remote-effects row, by declaration not row name', () => {
+    const remote = CLIENT_ROWS.find((row) => row.rowId === 'win-mb-tool-ssh')
+    const remoteKeys = remote.fields.map((knob) => knob.path.join('.'))
+    assert.ok(remoteKeys.includes('sshShell.requireSandbox'), 'requireSandbox stays: it fails closed for remote effects')
+    for (const hidden of ['sshShell.sandbox', 'sshShell.probeTimeoutMs', 'sshShell.sandboxNotice'])
+      assert.ok(!remoteKeys.includes(hidden), hidden + ' must be hidden on ssh')
+    for (const dialect of SHELL_DIALECTS.filter((entry) => entry.effects === 'local')) {
+      const row = CLIENT_ROWS.find((entry) => entry.rowId === dialect.rowId)
+      const keys = row.fields.map((knob) => knob.path.join('.'))
+      for (const leaf of ['sandbox', 'probeTimeoutMs', 'requireSandbox', 'sandboxNotice'])
+        assert.ok(keys.includes(dialect.configKey + '.' + leaf), dialect.id + ' keeps ' + leaf)
+    }
+    // The row's Config keeps the hidden knobs for backward compatibility; the schema
+    // invariant is pinned separately (the ssh Config key list test).
+  })
   test('every dialect appears in every derived surface', () => {
     for (const dialect of SHELL_DIALECTS) {
       if (dialect.family.shared === true) assert.equal(DIALECT_FACTS[dialect.family.facts], dialect.facts)
@@ -1962,7 +1977,21 @@ console.log('\n[A] unit: the dialect registry is the single source (S1)')
         assert.equal(knob.kind, own.kind)
         if (own.rule !== undefined) assert.equal(LEAF_RULES[own.leaf], own.rule)
       }
-      assert.deepEqual(row.fields.find((entry) => entry.key === `${dialect.configKey}.sandbox`).options, dialect.sandboxStances)
+      if (dialect.effects === 'remote') {
+        // Remote effects are never locally sandboxed: only the fail-closed refusal is
+        // offered, and the local-only knobs are absent from the form (the schema keeps
+        // them for backward compatibility).
+        assert.equal(row.fields.some((entry) => entry.key === `${dialect.configKey}.sandbox`), false, `${dialect.id}: local sandbox stance must not be offered`)
+        assert.equal(row.fields.some((entry) => entry.key === `${dialect.configKey}.probeTimeoutMs`), false, `${dialect.id}: probe timeout must not be offered`)
+        assert.equal(row.fields.some((entry) => entry.key === `${dialect.configKey}.sandboxNotice`), false, `${dialect.id}: sandbox notice must not be offered`)
+        const require = row.fields.find((entry) => entry.key === `${dialect.configKey}.requireSandbox`)
+        assert.equal(require?.kind, 'boolean', `${dialect.id}: requireSandbox stays`)
+      }
+      else {
+        assert.deepEqual(row.fields.find((entry) => entry.key === `${dialect.configKey}.sandbox`).options, dialect.sandboxStances)
+        for (const leaf of ['sandbox', 'probeTimeoutMs', 'requireSandbox', 'sandboxNotice'])
+          assert.ok(row.fields.some((entry) => entry.key === `${dialect.configKey}.${leaf}`), `${dialect.id}: ${leaf} stays on a local-effects row`)
+      }
       const patchRow = PATCH_ROWS.find((entry) => entry.id === dialect.rowId)
       assert.equal(patchRow?.name, `${PACKAGE_NAME}/${dialect.specifier}`, `${dialect.id}: patch row name`)
       assert.equal(patchRow?.win32Only, dialect.win32Only)
@@ -8884,16 +8913,20 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     const { SHELL_DIALECTS, TERMINAL_ROW } = await import(libUrl('tool-bash', 'types', 'registry.js'))
     const packageRow = await import(libUrl('index.js'))
     const rows = [
-      ...SHELL_DIALECTS.map((dialect) => ({ rowId: dialect.rowId, entry: dialect.entry })),
+      ...SHELL_DIALECTS.map((dialect) => ({ rowId: dialect.rowId, entry: dialect.entry, effects: dialect.effects, configKey: dialect.configKey })),
       { rowId: TERMINAL_ROW.rowId, entry: TERMINAL_ROW.entry },
     ]
     assert.equal(rows.length, ROWS.length, 'every carried row is checked')
-    for (const { rowId, entry } of rows) {
+    const hiddenOnRemote = new Set(['sandbox', 'probeTimeoutMs', 'sandboxNotice'])
+    for (const { rowId, entry, effects, configKey } of rows) {
       const row = ROWS.find((candidate) => candidate.rowId === rowId)
       assert.ok(row !== undefined, `no page for ${rowId}`)
       const schema = (await import(libUrl('tool-bash', 'types', entry + '.js'))).Config
-      assert.deepEqual(row.fields.map((knob) => knob.path.join('.')), volatilePaths(schema),
-        rowId + ': the page must list exactly the knobs the Host serves, in schema order')
+      // A remote-effects row deliberately omits the local-only sandbox knobs from its
+      // form; every other served path must match exactly, in schema order.
+      const expected = volatilePaths(schema).filter((path) => effects !== 'remote' || !hiddenOnRemote.has(path.slice(configKey.length + 1)))
+      assert.deepEqual(row.fields.map((knob) => knob.path.join('.')), expected,
+        rowId + ': the page must list exactly the knobs the Host serves (minus local-only ones on a remote row), in schema order')
     }
     // The core row's two switches are the same contract — they are what the bundle card edits.
     const { CORE_ROW } = internals
