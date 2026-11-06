@@ -3052,16 +3052,16 @@ console.log('\n[A] unit: the ssh_shell host registry (validation, aliases, defau
     assert.equal(good.hosts[0].port, 22)
     assert.equal(good.hosts[0].approval, 'session', 'asking once per session is the default, not trust')
     assert.equal(good.hosts[0].connectTimeoutMs, 30000)
-    assert.equal(good.hosts[0].shellTemplate, DEFAULT_SHELL_TEMPLATE)
+    assert.equal(good.hosts[0].shellTemplate, undefined, 'blank means precise passthrough')
     assert.equal(good.hosts[0].acceptNewHostKeys, false, 'known_hosts is strict unless the host says otherwise')
     assert.equal(good.hosts[0].default, false)
     assert.equal(findHost(good.hosts, 'prod').host, '10.0.0.5')
     assert.equal(findHost(good.hosts, 'nope'), undefined)
     assert.equal(DEFAULT_PORT, 22)
     assert.equal(DEFAULT_CONNECT_TIMEOUT_MS, 30000)
-    // The default launcher reads the base64 script from stdin; no command text is
-    // ever interpolated into it.
-    assert.equal(DEFAULT_SHELL_TEMPLATE, 'bash -c \'eval "$(base64 -d)"\'')
+    // No default launcher: blank is the precise passthrough documented in
+    // channelInvocation, not a hidden bash hop.
+    assert.equal(DEFAULT_SHELL_TEMPLATE, undefined)
   })
 
   test('a declared host keeps its own values, and optional fields normalize away', () => {
@@ -3085,7 +3085,7 @@ console.log('\n[A] unit: the ssh_shell host registry (validation, aliases, defau
     const blanks = validateHosts([{ alias: 'a', host: 'h', user: 'u', keyPath: 'k', passphraseEnv: '', startupCommand: '', shellTemplate: '' }])
     assert.equal(blanks.hosts[0].passphraseEnv, undefined)
     assert.equal(blanks.hosts[0].startupCommand, undefined)
-    assert.equal(blanks.hosts[0].shellTemplate, DEFAULT_SHELL_TEMPLATE)
+    assert.equal(blanks.hosts[0].shellTemplate, undefined)
     // Every alias the grammar advertises really validates; a leading separator does not.
     assert.ok(HOST_ALIAS.test('a'))
     assert.ok(HOST_ALIAS.test('a.b-c_1'))
@@ -3481,7 +3481,7 @@ console.log('\n[A] unit: the ssh_shell remote script builder (POSIX, base64 payl
   // place that decides the script's shape, which is why its exact bytes are pinned:
   // a missing trailing newline silently changes the last command, and a workdir
   // that is not single-quote escaped is a shell injection.
-  const { buildScript, quoteShell, explainFailure, STARTUP_FAILED_MARKER } = await import(libUrl('ssh-shell', 'script.js'))
+  const { buildScript, quoteShell, explainFailure, channelInvocation, STARTUP_FAILED_MARKER } = await import(libUrl('ssh-shell', 'script.js'))
 
   test('a plain command becomes the script itself, newline-terminated', () => {
     const built = buildScript({ command: 'uname -a' })
@@ -3584,6 +3584,29 @@ console.log('\n[A] unit: the ssh_shell remote script builder (POSIX, base64 payl
     assert.equal(named.field, 'shellTemplate')
     assert.match(named.text, /could not start its shell template \(D:\\Program\)/)
     assert.match(named.text, /D:Program: command not found/)
+  })
+  test('a blank shellTemplate is precise passthrough: the script text is the channel command, no base64 or bash', () => {
+    const built = buildScript({ command: 'echo hi' })
+    const direct = channelInvocation({ shellTemplate: undefined, built })
+    assert.equal(direct.passthrough, true)
+    assert.equal(direct.command, built.script, 'the built script is the command line')
+    assert.equal(direct.stdin, undefined, 'nothing is written to stdin')
+    assert.doesNotMatch(direct.command, /base64|eval|\bbash\b/, 'no hidden wrapper in passthrough')
+    // A Windows cmd-style command is passed through as text; cmd would print it.
+    const win = buildScript({ command: 'echo %COMSPEC%' })
+    const winDirect = channelInvocation({ shellTemplate: '', built: win })
+    assert.equal(winDirect.command, 'echo %COMSPEC%\n')
+    // Workdir keeps the quoted cd line before the command.
+    const withDir = buildScript({ command: 'ls', workdir: '/srv/it is here' })
+    const dirDirect = channelInvocation({ shellTemplate: '   ', built: withDir })
+    assert.equal(dirDirect.command, "cd -- '/srv/it is here' || exit $?\nls\n")
+    assert.equal(dirDirect.stdin, undefined)
+    // An explicit template is an opt-in wrapper: unchanged base64/stdin behaviour.
+    const wrapped = channelInvocation({ shellTemplate: `bash -c 'eval "$(base64 -d)"'`, built })
+    assert.equal(wrapped.passthrough, false)
+    assert.equal(wrapped.command, `bash -c 'eval "$(base64 -d)"'`)
+    assert.equal(wrapped.stdin, built.payload)
+    assert.equal(Buffer.from(wrapped.stdin, 'base64').toString('utf8'), built.script)
   })
   test('the payload is base64 of the script, UTF-8 safe and round-tripping', () => {
     const command = "printf '%s\\n' 'héllo wörld'; echo \"quoted\";\nls -l"
@@ -4009,9 +4032,9 @@ console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (
         assert.equal(typeof result.timeoutMs, 'number')
         assert.ok(result.durationMs >= 0, 'a duration is reported')
         assert.deepEqual(Object.keys(result.stdout).sort(), ['text', 'truncated'])
-        // The remote command line is the host's STATIC shellTemplate, and the script
-        // travels on stdin — no command text is ever interpolated into it.
-        assert.deepEqual(fixture.commands, [DEFAULT_SHELL_TEMPLATE])
+        // The host's template is blank, so the built script IS the channel command
+        // line: no wrapper, no base64, no hidden shell hop.
+        assert.deepEqual(fixture.commands, ['exit 7\n'])
       } finally { pool.dispose(); await fixture.close() }
     })
 
@@ -4218,7 +4241,9 @@ console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (
           stream.end()
         })
       })
-      const { executor, pool } = await executorFor(fixture)
+      // This case pins the wrapped (stdin payload) path; the passthrough cd placement
+      // is covered by channelInvocation above.
+      const { executor, pool } = await executorFor(fixture, { host: { shellTemplate: `bash -c 'eval "$(base64 -d)"'` } })
       try {
         const withDir = executor.resolve({ command: 'pwd', remoteWorkdir: '/srv/app', timeoutMs: 5000 })
         await (await executor.execute(withDir)).result()
@@ -9911,12 +9936,14 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.equal(control('startupCommand').props.rows, 3, 'the snippet grows with its lines')
     assert.equal(control('startupCommand').props.spellCheck, false)
     assert.match(control('startupCommand').props.className, /dshwmb-host-code/)
-    assert.equal(control('shellTemplate').props.placeholder, internals.DEFAULT_SHELL_TEMPLATE, 'the empty template box shows the real default')
-    assert.equal(control('shellTemplate').props.placeholder, `bash -c 'eval "$(base64 -d)"'`)
+    assert.match(control('shellTemplate').props.placeholder, /run directly|直接执行/, 'the blank box explains passthrough')
+    assert.match(control('shellTemplate').props.placeholder, /explicit wrapper|显式包装/)
+    assert.doesNotMatch(control('shellTemplate').props.placeholder, /^bash -c 'eval/, 'the bare default is no longer presented as the default')
     assert.match(en['hosts.field.startupCommand.hint'], /spaces\/newlines kept verbatim/)
     assert.match(zh['hosts.field.startupCommand.hint'], /原样保留/)
-    assert.match(en['hosts.field.shellTemplate.hint'], /spaces and newlines are kept verbatim/)
+    assert.match(en['hosts.field.shellTemplate.hint'], /directly in the remote login shell/)
     assert.match(en['hosts.field.shellTemplate.hint'], /base64/)
+    assert.match(en['hosts.field.shellTemplate.hint'], /WSL/)
   })
   test('the ssh page puts the host table first, then the remote-only sandbox knob', () => {
     const row = ROWS.find((entry) => entry.rowId === 'win-mb-tool-ssh')
