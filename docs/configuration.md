@@ -34,7 +34,7 @@ The list is exactly the volatile projection of each row's `Config` schema; the a
 
 Only `git_bash` and `terminal` are enabled by default; three dialects ship switched off:
 
-- `wsl_bash` is opt-in because a WSL deployment is a second toolchain a machine may not have, and the row's first load probes the distro. Enable `win-mb-tool-wsl`; pin `wslBash.wslDistro` when the default distribution is not the one you want.
+- `wsl_bash` is opt-in because a WSL deployment is a second toolchain a machine may not have, and the row's first load probes the distro. Enable `win-mb-tool-wsl`; pin `wslBash.wslDistro` to name the one you want: a blank value uses the FIRST distribution `wsl -l -q` lists, which is not necessarily the default distribution.
 - `msys2_bash` is opt-in: enable `win-mb-tool-msys2`, and pin `msys2Bash.bashPath` when MSYS2 is installed outside its usual location. It inherits the MSYS mechanism rather than copying it and reports its own facts — `$MSYSTEM`, `pacman` — instead of Git Bash's.
 - `ssh_shell` is opt-in for a reason of its own: a deployment has to name its hosts. Enable `win-mb-tool-ssh` and list them under `sshShell.hosts`; a row with no hosts registers the tool and refuses every call with `no hosts are configured`. Authentication is key-only — `keyPath` names a private key file and `passphraseEnv` names an environment variable that holds its passphrase, never the passphrase itself — and host keys are checked against `known_hosts` instead of being trusted on first use. Every foreground result reports `sandbox: { mode, remote: true }`; `requireSandbox: true` makes the row refuse every remote command rather than pretend a local fence (its card says so; the local-only stance, probe timeout and notice are not shown on this row), and the documented way through is a per-call `danger-full-access` escalation (the only case where the row advertises `sandbox_permissions`). The same row also serves `ssh_scp`, a foreground-only SFTP transfer tool with no knobs of its own — same hosts, same pool, same host-key check.
 
@@ -139,7 +139,7 @@ Every call returns `{ ok, bytes, files?, error?, sandbox, outsideWorkspace? }`. 
 
 A text field (a path, a distribution name) is saved trimmed and the trimmed value is shown back, so what you see is what is stored; blanking a field clears it. A value that fails the *syntax* check the page can make — a path that is not absolute, a distribution name containing spaces or quotes, a number that is not finite — shows a warning and is **still saved exactly as you typed it**: the plugin never rewrites or deletes your configuration.
 
-Whether a value actually works is decided **at runtime**: the executor warns once, falls back to its default (auto-discovery for a shell path; the first finished distribution for `wslDistro`), and leaves the stored value untouched until you save again. A **numeric** field is stored as the number its text names, so a spelling that names different text (`0x10`, `1e3`, `007`) is reported too — the mismatch is never silent.
+Whether a value actually works is decided **at runtime**: the executor warns once, falls back to its default (auto-discovery for a shell path; the first distribution listed by `wsl -l -q` for `wslDistro`, not necessarily the default one), and leaves the stored value untouched until you save again. A **numeric** field is stored as the number its text names, so a spelling that names different text (`0x10`, `1e3`, `007`) is reported too — the mismatch is never silent.
 
 ## Self-heal switch
 

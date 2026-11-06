@@ -9634,7 +9634,22 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.equal(en['msys2Bash.bashPath.label'], 'MSYS2 bash executable')
     assert.match(en['msys2Bash.bashPath.hint'], /MSYS2 UCRT64/)
     assert.equal(en['gitBash.bashPath.label'], 'Git Bash executable')
-    assert.match(en['gitBash.bashPath.hint'], /PATH entries shaped like a Git install/)
+    const gitHint = en['gitBash.bashPath.hint']
+    assert.match(gitHint, /Git roots inferred from PATH entries shaped like cmd\/bin/)
+    assert.ok(gitHint.indexOf('Git roots inferred') < gitHint.indexOf('Program Files then Program Files (x86)'))
+    assert.ok(gitHint.indexOf('Program Files then Program Files (x86)') < gitHint.indexOf("every fixed drive's Program Files"))
+    assert.ok(gitHint.indexOf("every fixed drive's Program Files") < gitHint.indexOf('then every PATH entry'))
+    assert.doesNotMatch(gitHint, /LocalAppData/)
+    assert.match(en['wslBash.wslDistro.hint'], /FIRST distribution WSL lists/)
+    assert.match(en['wslBash.wslDistro.hint'], /not necessarily the default/)
+    assert.match(zh['wslBash.wslDistro.hint'], /WSL 列出的第一个/)
+    assert.doesNotMatch(en['wslBash.wslDistro.hint'], /uses the WSL default distribution/)
+    assert.match(en['quietNoticeMs.hint'], /Sampling interval/)
+    assert.match(en['quietNoticeMs.hint'], /only a change/)
+    assert.match(en['quietNoticeMs.hint'], /0 disables/)
+    assert.doesNotMatch(en['quietNoticeMs.hint'], /assistant|turn|idle/i)
+    assert.match(zh['quietNoticeMs.hint'], /采样间隔/)
+    assert.doesNotMatch(zh['quietNoticeMs.hint'], /助手|轮次|空闲/)
     // wslPath is the wsl.exe LAUNCHER, never a bash binary.
     assert.match(en['wslBash.wslPath.label'], /wsl|launcher/i)
     assert.doesNotMatch(en['wslBash.wslPath.label'], /bash/i)
@@ -9684,16 +9699,25 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     form.dispose()
   })
 
-  test('numeric hints state the Host-backed default', () => {
-    const scope = fakeScope()
-    const form = new RowConfigForm(scope, ROWS[0])
-    const state = form.project()
-    const tree = RowConfigCard({ view: 'page', t: (key) => en[key] ?? key, useRowForm: (select) => select(state), edit: () => {}, resetField: () => {}, save: () => {}, discard: () => {} })
-    const fieldHints = new Map(flattenTree(tree).filter((node) => node.type === 'SettingsValueField').map((node) => [node.props.id, node.props.hint]))
-    assert.ok([...fieldHints.values()].some((hint) => hint.includes('Blank = 120000.')))
-    assert.ok([...fieldHints.values()].some((hint) => hint.includes('Blank = 67108864.')))
-    assert.ok([...fieldHints.values()].some((hint) => hint.includes('Blank = 64000.')))
-    form.dispose()
+  test('numeric hints state the Host-backed default exactly once', () => {
+    for (const row of [...ROWS, internals.CORE_ROW]) {
+      const scope = fakeScope()
+      const form = new RowConfigForm(scope, row)
+      const state = form.project()
+      const tree = RowConfigCard({ view: 'page', t: (key) => en[key] ?? key, useRowForm: (select) => select(state), edit: () => {}, resetField: () => {}, save: () => {}, discard: () => {} })
+      const fields = flattenTree(tree).filter((node) => node.type === 'SettingsValueField')
+      for (const field of fields) {
+        const hints = String(field.props.hint ?? '')
+        const blankCount = (hints.match(/Blank =/g) ?? []).length
+        assert.ok(blankCount <= 1, row.rowId + ' ' + field.props.id + ' repeats the default: ' + hints)
+        const knob = row.fields.find((entry) => 'win-mb-' + entry.key.replace(/\./g, '-') === field.props.id)
+        if (knob?.kind === 'number' && knob.defaultValue !== undefined)
+          assert.equal(blankCount, 1, row.rowId + ' ' + knob.key + ' must state its default once')
+      }
+      form.dispose()
+    }
+    assert.ok((en['maxOutputBytes.hint'].match(/Blank =/g) ?? []).length === 0)
+    assert.ok((zh['maxSpillBytes.hint'].match(/留空 =/g) ?? []).length === 0)
   })
 
   test('the required-field template has no stray space in Chinese', () => {
