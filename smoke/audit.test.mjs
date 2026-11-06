@@ -9724,6 +9724,40 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.equal(zh['hosts.required'], '{value}为必填。')
     assert.equal(en['hosts.required'], '{value} is required.')
   })
+  test('the collapsed host summary is the connection target, never alias@host; alias and default are separate tokens', () => {
+    const row = (over = {}) => {
+      const value = blankHostRow()
+      Object.assign(value, { alias: 'prod', host: '203.0.113.10', user: 'ubuntu', keyPath: 'k' }, over)
+      return value
+    }
+    const render = (value, extra = {}) => {
+      const rows = [value]
+      return flattenTree(HostsEditor({ knob: { key: 'sshShell.hosts', rows, rowErrors: hostRowErrors(rows) }, disabled: false, t: (key) => en[key] ?? key, edit: () => {}, resetField: () => {}, ...extra }))
+    }
+    const role = (nodes, name) => nodes.find((node) => node.props?.['data-role'] === name)
+    const textOf = (node) => String(node?.children?.[0] ?? '')
+    let nodes = render(row({ default: true }))
+    assert.equal(textOf(role(nodes, 'target')), 'ubuntu@203.0.113.10:22')
+    assert.equal(textOf(role(nodes, 'alias')), 'prod', 'the alias is its own chip')
+    assert.equal(textOf(role(nodes, 'default')), 'Default', 'the default row carries the badge')
+    assert.doesNotMatch(textOf(role(nodes, 'target')), /prod@/, 'alias must never read as the login user')
+    // Explicit port wins over 22.
+    nodes = render(row({ port: '2222' }))
+    assert.equal(textOf(role(nodes, 'target')), 'ubuntu@203.0.113.10:2222')
+    assert.equal(role(nodes, 'default'), undefined, 'a non-default row has no badge')
+    // Blank user: host:port.
+    nodes = render(row({ user: '' }))
+    assert.equal(textOf(role(nodes, 'target')), '203.0.113.10:22')
+    // Blank host: fall back to the alias.
+    nodes = render(row({ host: '', port: '' }))
+    assert.equal(textOf(role(nodes, 'target')), 'prod')
+    assert.equal(textOf(role(nodes, 'alias')), 'prod')
+    // Both blank: the untitled token (forced collapsed so the summary renders).
+    const empty = blankHostRow()
+    nodes = render(empty, { expandedRows: { [empty.__rowId]: false } })
+    assert.equal(textOf(role(nodes, 'target')), en['hosts.untitled'])
+    assert.equal(textOf(role(nodes, 'alias')), en['hosts.untitled'])
+  })
   test('the host table explains the flow, and every field carries a short hint', () => {
     const stored = [{ alias: 'prod', host: 'h.example', user: 'u', keyPath: 'k' }]
     const knob = { key: 'sshShell.hosts', rows: hostRowsFrom(stored), rowErrors: hostRowErrors(hostRowsFrom(stored)), overridden: true }
@@ -10006,7 +10040,8 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     let nodes = flattenTree(statefulHost.mount())
     assert.equal(toggleOf(nodes).props['aria-expanded'], false, 'a named row starts collapsed')
     assert.equal(nodes.filter((node) => node.type === 'input').length, 0, 'a collapsed row renders no fields')
-    assert.match(nodes.filter((node) => typeof node.text === 'string').map((node) => node.text).join(' '), /prod@h\.example/, 'the collapsed header summarises alias@host')
+    assert.match(nodes.filter((node) => typeof node.text === 'string').map((node) => node.text).join(' '), /u@h\.example:22/, 'the collapsed header summarises the connection target')
+    assert.equal(nodes.find((node) => node.props?.['data-role'] === 'alias').children[0], 'prod', 'the alias is a separate chip')
     toggleOf(nodes).props.onClick()
     nodes = flattenTree(statefulHost.mount())
     assert.equal(toggleOf(nodes).props['aria-expanded'], true, 'the toggle flips aria-expanded')
