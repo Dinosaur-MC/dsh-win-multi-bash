@@ -9770,12 +9770,59 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
       assert.equal(typeof hint, 'string', field.leaf + ' has a hint')
       assert.ok(hint.length > 0 && hint.length < 200, field.leaf + ' hint stays short')
     }
-    assert.equal(nodes.filter((node) => node.props?.className === 'dshwmb-host-hint').length, HOST_FIELDS.length, 'each field renders its hint')
+    const core = HOST_FIELDS.filter((field) => field.advanced !== true)
+    const hints = nodes.filter((node) => node.props?.className === 'dshwmb-host-hint')
+    assert.equal(hints.length, core.length, 'the visible fields render their hints')
+    for (const hint of hints) assert.equal(hint.props.title, hint.children[0], 'the full hint is in the title attribute')
+    assert.equal(nodes.some((node) => node.props?.['data-field'] === 'passphraseEnv'), false, 'advanced fields are collapsed by default')
     assert.doesNotMatch(en['hosts.hint'], /\{ alias/, 'the registry hint is prose, not a schema dump')
     assert.match(en['hosts.hint'], /ENVIRONMENT VARIABLE NAME/, 'the passphrase warning is explicit')
     assert.match(zh['hosts.hint'], /环境变量名/)
   })
 
+  test('the hosts card is a two-column form with full-width flags and collapsed advanced fields', () => {
+    const source = readFileSync(join(lib, 'client.js'), 'utf8')
+    assert.match(source, /\.dshwmb-host-grid\{[^}]*grid-template-columns:repeat\(2,minmax\(0,1fr\)\)/, 'the card is two columns')
+    assert.match(source, /\.dshwmb-host-flag\{[^}]*grid-column:1\/-1/, 'flags span both columns')
+    assert.match(source, /\.dshwmb-host-flag\{[^}]*display:flex/, 'a flag keeps its label on one line')
+    assert.match(source, /@media \(max-width:640px\)\{\.dshwmb-host-grid\{grid-template-columns:minmax\(0,1fr\)\}\}/, 'one column on a narrow page')
+    const row = () => {
+      const value = blankHostRow()
+      Object.assign(value, { alias: 'prod', host: 'h.example', user: 'u', keyPath: 'k' })
+      return value
+    }
+    const stateful = makeStatefulHostClient()
+    const host = row()
+    const props = { knob: { key: 'sshShell.hosts', rows: [host], rowErrors: hostRowErrors([host]) }, disabled: false, t: (key) => en[key] ?? key, edit: () => {}, resetField: () => {} }
+    stateful.begin(() => stateful.internals.HostsEditor(props))
+    let nodes = flattenTree(stateful.mount())
+    assert.equal(nodes.some((node) => node.props?.className === 'dshwmb-host-grid'), false, 'a named row starts collapsed')
+    nodes.find((node) => node.props?.['data-action'] === 'toggle').props.onClick()
+    nodes = flattenTree(stateful.mount())
+    assert.ok(nodes.some((node) => node.props?.className === 'dshwmb-host-grid'), 'expanding the row shows the grid')
+    const advancedButton = nodes.find((node) => node.props?.['data-action'] === 'advanced')
+    assert.equal(advancedButton.props['aria-expanded'], false, 'advanced is collapsed by default')
+    assert.equal(nodes.some((node) => node.props?.['data-field'] === 'passphraseEnv'), false, 'advanced fields are not rendered yet')
+    assert.ok(nodes.filter((node) => node.props?.className === 'dshwmb-host-flag').length === 1, 'the default radio flag is rendered')
+    advancedButton.props.onClick()
+    nodes = flattenTree(stateful.mount())
+    assert.equal(nodes.find((node) => node.props?.['data-action'] === 'advanced').props['aria-expanded'], true, 'the toggle expands')
+    assert.ok(nodes.some((node) => node.props?.['data-field'] === 'passphraseEnv'), 'advanced fields appear')
+    assert.equal(nodes.filter((node) => node.props?.className === 'dshwmb-host-flag').length, 2, 'both flags are full-width rows')
+    assert.ok(nodes.some((node) => node.props?.className === 'dshwmb-host-divider'), 'one divider marks the description')
+    const hint = nodes.find((node) => node.props?.className === 'dshwmb-host-hint')
+    assert.equal(hint.props.title, hint.children[0], 'the hint carries its full text in title')
+    // A hidden advanced field with an error forces the section open.
+    const broken = row()
+    broken.approvalTimeoutMs = '999'
+    const brokenState = makeStatefulHostClient()
+    const brokenProps = { knob: { key: 'sshShell.hosts', rows: [broken], rowErrors: hostRowErrors([broken]) }, disabled: false, t: (key) => en[key] ?? key, edit: () => {}, resetField: () => {}, expandedRows: { [broken.__rowId]: true } }
+    brokenState.begin(() => brokenState.internals.HostsEditor(brokenProps))
+    const errorNodes = flattenTree(brokenState.mount())
+    assert.equal(errorNodes.find((node) => node.props?.['data-action'] === 'advanced').props['aria-expanded'], true, 'an error auto-expands the advanced section')
+    assert.ok(errorNodes.some((node) => node.props?.['data-field'] === 'approvalTimeoutMs'), 'the invalid advanced field is visible')
+    assert.ok(errorNodes.some((node) => node.props?.className === 'dshwmb-host-error'), 'its inline error line is visible')
+  })
   test('the ssh page puts the host table first, then the remote-only sandbox knob', () => {
     const row = ROWS.find((entry) => entry.rowId === 'win-mb-tool-ssh')
     const keys = row.fields.map((knob) => knob.key)
@@ -9795,7 +9842,8 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     const editor = flattenTree(tree).find((node) => node.type === HostsEditor)
     assert.ok(editor !== undefined, 'the ssh page renders the table, not a text box')
     assert.equal(editor.props.knob.kind, 'hosts')
-    const nodes = flattenTree(HostsEditor({ ...editor.props, expandedRows: { 'stored-0': true } }))
+    const rowId = editor.props.knob.rows[0].__rowId
+    const nodes = flattenTree(HostsEditor({ ...editor.props, expandedRows: { [rowId]: true }, advancedRows: { [rowId]: true } }))
     assert.equal(nodes.filter((node) => node.type === 'fieldset').length, 1, 'one card per host')
     assert.equal(nodes.filter((node) => node.type === 'input' && node.props.type === 'radio').length, 1, 'one default radio')
     assert.equal(nodes.filter((node) => node.type === 'input' && node.props.type === 'checkbox').length, 1, 'acceptNewHostKeys is a checkbox')
@@ -9921,7 +9969,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
   })
 
   /** A client instance whose React stub stores state, so transitions are observable. */
-  const makeStatefulHostClient = () => {
+  function makeStatefulHostClient() {
     const hooks = []
     const refs = []
     let cursor = 0
@@ -10096,7 +10144,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     const staged = []
     const rows = [blankHostRow()]
     rows[0].alias = 'prod'
-    const props = { ...expandRows(rows), knob: { key: 'sshShell.hosts', rows, rowErrors: hostRowErrors(rows) }, disabled: false, t: (key) => en[key] ?? key, edit: (_key, value) => staged.push(value), resetField: () => {} }
+    const props = { ...expandRows(rows), advancedRows: { [rows[0].__rowId]: true }, knob: { key: 'sshShell.hosts', rows, rowErrors: hostRowErrors(rows) }, disabled: false, t: (key) => en[key] ?? key, edit: (_key, value) => staged.push(value), resetField: () => {} }
     const select = flattenTree(HostsEditor(props)).find((node) => node.type === 'select')
     assert.equal(select.props.value, 'session', 'session is the default')
     select.props.onChange({ target: { value: 'trusted' } })
@@ -10110,7 +10158,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     rows[0].passphraseEnv = 'SSH_PASS'
     rows[0].startupCommand = 'source ~/.profile'
     assert.deepEqual(Object.keys(hostObjectFromRow(rows[0])).sort(), ['alias', 'approval', 'passphraseEnv', 'startupCommand'])
-    const props = { ...expandRows(rows), knob: { key: 'sshShell.hosts', rows, rowErrors: hostRowErrors(rows) }, disabled: false, t: (key) => en[key] ?? key, edit: (_key, value) => staged.push(value), resetField: () => {} }
+    const props = { ...expandRows(rows), advancedRows: { [rows[0].__rowId]: true }, knob: { key: 'sshShell.hosts', rows, rowErrors: hostRowErrors(rows) }, disabled: false, t: (key) => en[key] ?? key, edit: (_key, value) => staged.push(value), resetField: () => {} }
     const input = flattenTree(HostsEditor(props)).find((node) => node.props?.['data-field'] === 'passphraseEnv')
     input.props.onChange({ target: { value: '' } })
     assert.equal(Object.hasOwn(staged.at(-1)[0], 'passphraseEnv'), false, 'a blank optional field is cleared')
@@ -10127,7 +10175,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.equal(errors[0].alias, 'aliasFormat')
     assert.equal(errors[0].port, 'portRange')
     const nodes = flattenTree(HostsEditor({ ...expandRows(rows), knob: { key: 'sshShell.hosts', rows, rowErrors: errors, invalid: true }, disabled: false, t: (key) => en[key] ?? key, edit: () => {}, resetField: () => {} }))
-    const warnings = nodes.filter((node) => node.type === 'span' && node.props.role === 'alert').map((node) => node.children[0])
+    const warnings = nodes.filter((node) => node.type === 'span' && node.props.className === 'dshwmb-host-error').map((node) => node.children[0])
     assert.ok(warnings.some((text) => /An alias starts with a letter or digit/.test(text)), 'alias error is shown')
     assert.ok(warnings.some((text) => /1 to 65535/.test(text)), 'port error is shown')
     assert.equal(warnings.length, 2, 'only the invalid fields are flagged')
