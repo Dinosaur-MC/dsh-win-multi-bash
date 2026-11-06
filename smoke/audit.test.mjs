@@ -9658,9 +9658,9 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.doesNotMatch(zh['wslBash.wslPath.label'], /bash/i)
     // startupCommand runs per call, not once after login.
     assert.match(en['hosts.field.startupCommand.hint'], /every call's script/)
-    assert.match(en['hosts.field.startupCommand.hint'], /does not carry over/)
+    assert.match(en['hosts.field.startupCommand.hint'], /kept verbatim/)
     assert.match(zh['hosts.field.startupCommand.hint'], /每次调用/)
-    assert.match(zh['hosts.field.startupCommand.hint'], /不会跨调用保持/)
+    assert.match(zh['hosts.field.startupCommand.hint'], /原样保留/)
     assert.equal(en['hosts.clearConfirm'], 'Confirm clear')
     assert.equal(zh['hosts.clearConfirm'], '确认清空')
     // The remote sandbox copy is its own key, not the local wording.
@@ -9822,6 +9822,72 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.equal(errorNodes.find((node) => node.props?.['data-action'] === 'advanced').props['aria-expanded'], true, 'an error auto-expands the advanced section')
     assert.ok(errorNodes.some((node) => node.props?.['data-field'] === 'approvalTimeoutMs'), 'the invalid advanced field is visible')
     assert.ok(errorNodes.some((node) => node.props?.className === 'dshwmb-host-error'), 'its inline error line is visible')
+  })
+  test('hosts keep shell-snippet and description whitespace verbatim across the stage round trip', () => {
+    const complete = () => {
+      const value = blankHostRow()
+      Object.assign(value, { alias: 'prod', host: 'h.example', user: 'u', keyPath: 'k' })
+      return value
+    }
+    const roundTrip = (value) => {
+      const draft = internals.hostDraftFrom([value])
+      return internals.hostRowsFrom(draft)[0]
+    }
+    const row = complete()
+    row.startupCommand = 'cd /a b'
+    row.shellTemplate = `bash -lc 'x y'`
+    row.description = 'a b c'
+    let object = internals.hostObjectFromRow(row)
+    assert.equal(object.startupCommand, 'cd /a b', 'an internal space survives staging')
+    assert.equal(object.shellTemplate, `bash -lc 'x y'`)
+    assert.equal(object.description, 'a b c', 'three words stay three words')
+    let rebuilt = roundTrip(row)
+    assert.equal(rebuilt.startupCommand, 'cd /a b', 'a stage + rerender does not collapse the value')
+    // A trailing space survives the round trip; the next keystroke appends to it.
+    rebuilt.startupCommand = 'cd '
+    rebuilt = roundTrip(rebuilt)
+    assert.equal(rebuilt.startupCommand, 'cd ', 'the last character is not trimmed while typing')
+    rebuilt.startupCommand += 'x'
+    assert.equal(rebuilt.startupCommand, 'cd x', 'the next character lands after the space')
+    // Whitespace-only values still clear the field.
+    const blanks = complete()
+    blanks.startupCommand = '  '
+    blanks.shellTemplate = '\n\t'
+    blanks.description = '   '
+    object = internals.hostObjectFromRow(blanks)
+    assert.equal('startupCommand' in object, false)
+    assert.equal('shellTemplate' in object, false)
+    assert.equal('description' in object, false)
+    // Identifier leaves are still trimmed, and validation reads the trimmed form.
+    const padded = blankHostRow()
+    Object.assign(padded, { alias: ' prod ', host: ' h.example ', user: ' u ', keyPath: ' k ' })
+    object = internals.hostObjectFromRow(padded)
+    assert.equal(object.alias, 'prod')
+    assert.equal(object.host, 'h.example')
+    assert.equal(internals.hostRowErrors([padded])[0].alias, undefined, 'validation sees the trimmed alias')
+    // Blank template is absent (the Host substitutes its default); a set one is verbatim.
+    const blankTemplate = complete()
+    assert.equal('shellTemplate' in internals.hostObjectFromRow(blankTemplate), false)
+    const pinned = complete()
+    pinned.shellTemplate = `bash -lc 'x y'`
+    assert.equal(internals.hostObjectFromRow(pinned).shellTemplate, `bash -lc 'x y'`)
+    // Both snippets are code textareas; the template shows the real default placeholder.
+    const multi = complete()
+    multi.startupCommand = 'line one\nline two\nline three'
+    const nodes = flattenTree(HostsEditor({ knob: { key: 'sshShell.hosts', rows: [multi], rowErrors: hostRowErrors([multi]) }, disabled: false, t: (key) => en[key] ?? key, edit: () => {}, resetField: () => {}, expandedRows: { [multi.__rowId]: true }, advancedRows: { [multi.__rowId]: true } }))
+    const control = (leaf) => nodes.find((node) => node.props?.['data-field'] === leaf)
+    assert.equal(control('startupCommand').type, 'textarea', 'startupCommand is a textarea')
+    assert.equal(control('shellTemplate').type, 'textarea', 'shellTemplate is a textarea')
+    assert.equal(control('description').type, 'textarea')
+    assert.equal(control('startupCommand').props.rows, 3, 'the snippet grows with its lines')
+    assert.equal(control('startupCommand').props.spellCheck, false)
+    assert.match(control('startupCommand').props.className, /dshwmb-host-code/)
+    assert.equal(control('shellTemplate').props.placeholder, internals.DEFAULT_SHELL_TEMPLATE, 'the empty template box shows the real default')
+    assert.equal(control('shellTemplate').props.placeholder, `bash -c 'eval "$(base64 -d)"'`)
+    assert.match(en['hosts.field.startupCommand.hint'], /spaces and newlines are kept verbatim/)
+    assert.match(zh['hosts.field.startupCommand.hint'], /原样保留/)
+    assert.match(en['hosts.field.shellTemplate.hint'], /spaces and newlines are kept verbatim/)
+    assert.match(en['hosts.field.shellTemplate.hint'], /base64/)
   })
   test('the ssh page puts the host table first, then the remote-only sandbox knob', () => {
     const row = ROWS.find((entry) => entry.rowId === 'win-mb-tool-ssh')
