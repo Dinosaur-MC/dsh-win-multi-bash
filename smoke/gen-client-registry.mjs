@@ -43,7 +43,15 @@ function renderRow(row) {
         const options = knob.options === undefined
             ? ''
             : `, [${knob.options.map((option) => JSON.stringify(option)).join(', ')}]`;
-        lines.push(`\t\t\t\t\tfield(${path}, ${JSON.stringify(knob.kind)}${options}),`);
+        const extra = {};
+        for (const key of ['group', 'defaultValue', 'copyKey', 'hintKey'])
+            if (knob[key] !== undefined) extra[key] = knob[key];
+        const extraArg = Object.keys(extra).length === 0
+            ? ''
+            : knob.options === undefined
+                ? `, undefined, ${JSON.stringify(extra)}`
+                : `, ${JSON.stringify(extra)}`;
+        lines.push(`\t\t\t\t\tfield(${path}, ${JSON.stringify(knob.kind)}${options}${extraArg}),`);
     }
     lines.push('\t\t\t\t],');
     lines.push('\t\t\t},');

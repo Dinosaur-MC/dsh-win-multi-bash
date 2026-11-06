@@ -9004,7 +9004,14 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
       const schema = (await import(libUrl('tool-bash', 'types', entry + '.js'))).Config
       // A remote-effects row deliberately omits the local-only sandbox knobs from its
       // form; every other served path must match exactly, in schema order.
-      const expected = volatilePaths(schema).filter((path) => effects !== 'remote' || !hiddenOnRemote.has(path.slice(configKey.length + 1)))
+      let expected = volatilePaths(schema).filter((path) => effects !== 'remote' || !hiddenOnRemote.has(path.slice(configKey.length + 1)))
+      if (effects === 'remote') {
+        // The registry is the primary setting on this row: it is moved to the top,
+        // followed by the only sandbox knob the row shows, then the generic limits.
+        const primary = configKey + '.hosts'
+        const require = configKey + '.requireSandbox'
+        expected = [primary, require, ...expected.filter((path) => path !== primary && path !== require)]
+      }
       assert.deepEqual(row.fields.map((knob) => knob.path.join('.')), expected,
         rowId + ': the page must list exactly the knobs the Host serves (minus local-only ones on a remote row), in schema order')
     }
@@ -9613,6 +9620,99 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
   }
   /** Expansion overrides for editor rows whose alias makes them start collapsed. */
   const expandRows = (rows) => ({ expandedRows: Object.fromEntries(rows.map((row) => [row.__rowId, true])) })
+  test('every knob resolves a partition-correct label (no leaf-only collision)', () => {
+    for (const row of ROWS) {
+      for (const knob of row.fields) {
+        const leaf = knob.key.split('.').pop()
+        const fullLabel = en[knob.key + '.label']
+        const label = typeof fullLabel === 'string' ? fullLabel : en[leaf + '.label']
+        assert.equal(typeof label, 'string', knob.key + ' has no label')
+        assert.ok(label.length > 0, knob.key + ' label is empty')
+      }
+    }
+    // The historical collision: both bashPath leaves used to resolve one key.
+    assert.equal(en['msys2Bash.bashPath.label'], 'MSYS2 bash executable')
+    assert.match(en['msys2Bash.bashPath.hint'], /MSYS2 UCRT64/)
+    assert.equal(en['gitBash.bashPath.label'], 'Git Bash executable')
+    // The remote sandbox copy is its own key, not the local wording.
+    assert.equal(en['sshShell.requireSandbox'], undefined)
+    assert.equal(en['requireSandboxRemote.label'], 'Allow only danger-full-access runs')
+    assert.doesNotMatch(en['requireSandboxRemote.hint'], /Local:/)
+  })
+
+  test('the terminal row groups its four partitions under headings, in order', () => {
+    const row = ROWS.find((entry) => entry.rowId === 'win-mb-tool-terminal')
+    const groups = row.fields.map((knob) => knob.group)
+    assert.deepEqual([...new Set(groups)], ['session', 'output', 'backends', 'ssh'])
+    const firstOf = (group) => row.fields.find((knob) => knob.group === group).path.join('.')
+    assert.equal(firstOf('session'), 'terminal.defaultShell')
+    assert.equal(firstOf('output'), 'terminal.rows')
+    assert.match(firstOf('backends'), /^(gitBash|wslBash|msys2Bash)\./)
+    assert.equal(firstOf('ssh'), 'sshShell.sshPath')
+    assert.equal(en['group.session'], 'Session')
+    assert.equal(en['group.output'], 'Output and waiting')
+    assert.equal(en['group.backends'], 'Backend executables')
+    assert.equal(en['group.ssh'], 'SSH session')
+    // The session-row pins carry session wording, not the command-row wording.
+    assert.match(en['sshShell.sshHost.hint'], /session opens/)
+    assert.doesNotMatch(en['sshShell.sshHost.hint'], /refuses every call/)
+    assert.match(en['sshShell.acceptNewHostKeys.hint'], /known_hosts/)
+  })
+
+  test('the terminal row renders one heading before each group', () => {
+    const terminalRow = ROWS.find((entry) => entry.rowId === 'win-mb-tool-terminal')
+    const scope = fakeScope()
+    const form = new RowConfigForm(scope, terminalRow)
+    const state = form.project()
+    const tree = RowConfigCard({ view: 'page', t: (key) => en[key] ?? key, useRowForm: (select) => select(state), edit: () => {}, resetField: () => {}, save: () => {}, discard: () => {} })
+    const headings = flattenTree(tree).filter((node) => node.type === 'h3' && node.props?.className === 'dshwmb-group')
+    assert.deepEqual(headings.map((node) => node.children[0]), ['Session', 'Output and waiting', 'Backend executables', 'SSH session'])
+    form.dispose()
+  })
+
+  test('numeric hints state the Host-backed default', () => {
+    const scope = fakeScope()
+    const form = new RowConfigForm(scope, ROWS[0])
+    const state = form.project()
+    const tree = RowConfigCard({ view: 'page', t: (key) => en[key] ?? key, useRowForm: (select) => select(state), edit: () => {}, resetField: () => {}, save: () => {}, discard: () => {} })
+    const fieldHints = new Map(flattenTree(tree).filter((node) => node.type === 'SettingsValueField').map((node) => [node.props.id, node.props.hint]))
+    assert.ok([...fieldHints.values()].some((hint) => hint.includes('Blank = 120000.')))
+    assert.ok([...fieldHints.values()].some((hint) => hint.includes('Blank = 67108864.')))
+    assert.ok([...fieldHints.values()].some((hint) => hint.includes('Blank = 64000.')))
+    form.dispose()
+  })
+
+  test('the required-field template has no stray space in Chinese', () => {
+    assert.equal(zh['hosts.required'], '{value}为必填。')
+    assert.equal(en['hosts.required'], '{value} is required.')
+  })
+  test('the host table explains the flow, and every field carries a short hint', () => {
+    const stored = [{ alias: 'prod', host: 'h.example', user: 'u', keyPath: 'k' }]
+    const knob = { key: 'sshShell.hosts', rows: hostRowsFrom(stored), rowErrors: hostRowErrors(hostRowsFrom(stored)), overridden: true }
+    const nodes = flattenTree(HostsEditor({ knob, disabled: false, t: (key) => en[key] ?? key, edit: () => {}, resetField: () => {}, expandedRows: { [knob.rows[0].__rowId]: true } }))
+    const text = nodes.filter((node) => typeof node.text === 'string').map((node) => node.text).join(' ')
+    assert.match(text, /Test uses the current unsaved values/, 'the flow guidance is shown')
+    assert.match(text, /edits are written only after Save/)
+    for (const field of HOST_FIELDS) {
+      const hint = en['hosts.field.' + field.leaf + '.hint']
+      assert.equal(typeof hint, 'string', field.leaf + ' has a hint')
+      assert.ok(hint.length > 0 && hint.length < 200, field.leaf + ' hint stays short')
+    }
+    assert.equal(nodes.filter((node) => node.props?.className === 'dshwmb-host-hint').length, HOST_FIELDS.length, 'each field renders its hint')
+    assert.doesNotMatch(en['hosts.hint'], /\{ alias/, 'the registry hint is prose, not a schema dump')
+    assert.match(en['hosts.hint'], /ENVIRONMENT VARIABLE NAME/, 'the passphrase warning is explicit')
+    assert.match(zh['hosts.hint'], /环境变量名/)
+  })
+
+  test('the ssh page puts the host table first, then the remote-only sandbox knob', () => {
+    const row = ROWS.find((entry) => entry.rowId === 'win-mb-tool-ssh')
+    const keys = row.fields.map((knob) => knob.key)
+    assert.equal(keys[0], 'sshShell.hosts', 'the registry is the primary setting')
+    assert.equal(keys[1], 'sshShell.requireSandbox', 'the only sandbox knob follows it')
+    assert.equal(keys.some((key) => key === 'sshShell.sandbox' || key === 'sshShell.probeTimeoutMs' || key === 'sshShell.sandboxNotice'), false)
+    assert.equal(en['requireSandboxRemote.label'], 'Allow only danger-full-access runs')
+    assert.doesNotMatch(en['requireSandboxRemote.hint'], /^Local:/)
+  })
   test('the hosts card renders the TABLE: one fieldset per host, no JSON text, no navigation', () => {
     const sshRow = ROWS.find((row) => row.rowId === 'win-mb-tool-ssh')
     const stored = [{ alias: 'prod', host: 'h.example', user: 'u', keyPath: 'k', default: true }]
@@ -9837,10 +9937,14 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     let nodes = flattenTree(stateful.mount())
     nodes.find((node) => node.props?.['data-action'] === 'toggle').props.onClick()
     flattenTree(stateful.mount()).find((node) => node.props?.['data-action'] === 'test').props.onClick()
-    const resetButton = flattenTree(stateful.mount()).find((node) => node.type === 'Button' && String(node.children?.[0] ?? '').includes('Reset'))
-    assert.ok(resetButton !== undefined, 'the host head carries Reset')
-    resetButton.props.onClick()
-    assert.deepEqual(resets, ['sshShell.hosts'])
+    const clearButton = flattenTree(stateful.mount()).find((node) => node.type === 'Button' && String(node.children?.[0] ?? '').includes('Clear host table'))
+    assert.ok(clearButton !== undefined, 'the host head carries the renamed clear action')
+    clearButton.props.onClick()
+    assert.deepEqual(resets, [], 'the first click only arms the confirmation')
+    const confirmButton = flattenTree(stateful.mount()).find((node) => node.type === 'Button' && String(node.children?.[0] ?? '').includes('Clear all hosts'))
+    assert.ok(confirmButton !== undefined, 'the confirmation action is rendered')
+    confirmButton.props.onClick()
+    assert.deepEqual(resets, ['sshShell.hosts'], 'the second click clears the staged registry')
     resolveProbe({ ok: true, fingerprint: 'SHA256:stale' })
     await Promise.resolve()
     await Promise.resolve()
