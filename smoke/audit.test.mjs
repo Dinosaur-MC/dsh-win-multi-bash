@@ -3481,7 +3481,7 @@ console.log('\n[A] unit: the ssh_shell remote script builder (POSIX, base64 payl
   // place that decides the script's shape, which is why its exact bytes are pinned:
   // a missing trailing newline silently changes the last command, and a workdir
   // that is not single-quote escaped is a shell injection.
-  const { buildScript, quoteShell } = await import(libUrl('ssh-shell', 'script.js'))
+  const { buildScript, quoteShell, explainFailure, STARTUP_FAILED_MARKER } = await import(libUrl('ssh-shell', 'script.js'))
 
   test('a plain command becomes the script itself, newline-terminated', () => {
     const built = buildScript({ command: 'uname -a' })
@@ -3503,29 +3503,29 @@ console.log('\n[A] unit: the ssh_shell remote script builder (POSIX, base64 payl
     // its terminator alone on a line, and an empty body leaves '{ ; }'. The pinned
     // bytes below are the shape that survives all of them.
     assert.equal(buildScript({ command: 'echo hi', startupCommand: 'export A=1' }).script,
-      '{ export A=1\n} || exit $?\necho hi\n')
+      '{ export A=1\n} || { __dsh_startup_rc=$?; printf "\\036DSH-STARTUP-FAILED\\036\\n" >&2; exit $__dsh_startup_rc; }\necho hi\n')
     // A comment at the end of the snippet runs; the command MUST still execute.
     assert.equal(buildScript({ command: 'echo $PROBE', startupCommand: 'export PROBE=42 # setup' }).script,
-      '{ export PROBE=42 # setup\n} || exit $?\necho $PROBE\n')
+      '{ export PROBE=42 # setup\n} || { __dsh_startup_rc=$?; printf "\\036DSH-STARTUP-FAILED\\036\\n" >&2; exit $__dsh_startup_rc; }\necho $PROBE\n')
     // A here-document keeps its terminator line intact.
     assert.equal(buildScript({ command: 'echo hi', startupCommand: 'cat <<EOF\nheredoc-body\nEOF' }).script,
-      '{ cat <<EOF\nheredoc-body\nEOF\n} || exit $?\necho hi\n')
+      '{ cat <<EOF\nheredoc-body\nEOF\n} || { __dsh_startup_rc=$?; printf "\\036DSH-STARTUP-FAILED\\036\\n" >&2; exit $__dsh_startup_rc; }\necho hi\n')
     // A backgrounded snippet is still one group statement.
     assert.equal(buildScript({ command: 'echo hi', startupCommand: 'sleep 0 &' }).script,
-      '{ sleep 0 &\n} || exit $?\necho hi\n')
+      '{ sleep 0 &\n} || { __dsh_startup_rc=$?; printf "\\036DSH-STARTUP-FAILED\\036\\n" >&2; exit $__dsh_startup_rc; }\necho hi\n')
     // A configured trailing semicolon is normalised away (a doubled one is a
     // syntax error), and a snippet with NO body after normalisation omits the guard.
     assert.equal(buildScript({ command: 'x', startupCommand: 'export A=1;' }).script,
-      '{ export A=1\n} || exit $?\nx\n')
+      '{ export A=1\n} || { __dsh_startup_rc=$?; printf "\\036DSH-STARTUP-FAILED\\036\\n" >&2; exit $__dsh_startup_rc; }\nx\n')
     assert.equal(buildScript({ command: 'x', startupCommand: 'export A=1 ;' }).script,
-      '{ export A=1\n} || exit $?\nx\n')
+      '{ export A=1\n} || { __dsh_startup_rc=$?; printf "\\036DSH-STARTUP-FAILED\\036\\n" >&2; exit $__dsh_startup_rc; }\nx\n')
     // A body that is ONLY comments leaves an EMPTY brace group, which bash rejects
     // (measured: rc=2), so it is "no startup" like any blank snippet.
     for (const startupCommand of [undefined, '', '   ', '\t', ';', ';;', ' ; ', '# disabled', '#   disabled  ', '# one\n# two'])
       assert.equal(buildScript({ command: 'x', startupCommand }).script, 'x\n', JSON.stringify(startupCommand))
     // A comment NEXT TO a real command still runs that command inside the group.
     assert.equal(buildScript({ command: 'x', startupCommand: '# note\nexport A=1' }).script,
-      '{ # note\nexport A=1\n} || exit $?\nx\n')
+      '{ # note\nexport A=1\n} || { __dsh_startup_rc=$?; printf "\\036DSH-STARTUP-FAILED\\036\\n" >&2; exit $__dsh_startup_rc; }\nx\n')
   })
 
   test('a workdir is cd -- single-quote escaped, and only when one is given', () => {
@@ -3543,7 +3543,7 @@ console.log('\n[A] unit: the ssh_shell remote script builder (POSIX, base64 payl
     assert.equal(quoteShell(undefined), "''")
     // Both guard lines, in spec order: startup (two-line group), then the directory.
     assert.equal(buildScript({ command: 'x', startupCommand: 'export A=1', workdir: '/w' }).script,
-      "{ export A=1\n} || exit $?\ncd -- '/w' || exit $?\nx\n")
+      `{ export A=1\n} || { __dsh_startup_rc=$?; printf "\\036DSH-STARTUP-FAILED\\036\\n" >&2; exit $__dsh_startup_rc; }\ncd -- '/w' || exit $?\nx\n`)
     // The value is quoted EXACTLY: a trailing space is part of the directory name,
     // so trimming it would cd somewhere else without saying so.
     assert.equal(buildScript({ command: 'ls', workdir: '/tmp/trim ' }).script,
@@ -3556,6 +3556,35 @@ console.log('\n[A] unit: the ssh_shell remote script builder (POSIX, base64 payl
       "cd -- '   ' || exit $?\nls\n")
   })
 
+  test('a startup failure is identified by field and alias without leaking the marker; exit code is preserved', () => {
+    const build = buildScript
+    const explain = explainFailure
+    const marker = STARTUP_FAILED_MARKER
+    // A real shell: the startup group fails with its own status and emits the marker.
+    if (HAS_GIT_BASH) {
+      const built = build({ command: 'echo NEVER', startupCommand: "printf 'boom\\n' >&2; (exit 42)" })
+      const failed = spawnSync(GIT_BASH, ['-s'], { input: built.script, encoding: 'utf8', timeout: 30000 })
+      assert.equal(failed.status, 42, 'the startup status is preserved')
+      assert.match(failed.stderr, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+      assert.doesNotMatch(failed.stdout, /NEVER/, 'the command never ran after the guard failed')
+      const explained = explain({ alias: 'prod', stderr: failed.stderr, exitCode: failed.status, shellTemplate: "bash -c 'eval \"$(base64 -d)\"'" })
+      assert.equal(explained.field, 'startupCommand')
+      assert.match(explained.text, /host "prod" started, but its 启动命令 \(startupCommand\) failed: boom/)
+      assert.equal(explained.text.includes(marker), false, 'the sentinel is consumed')
+    }
+    // An ordinary command failure keeps its own stderr unchanged.
+    const normal = 'probe: command not found\n'
+    const plain = explain({ alias: 'h', stderr: normal, exitCode: 127, shellTemplate: "bash -c 'eval \"$(base64 -d)\"'" })
+    assert.equal(plain.field, null)
+    assert.equal(plain.text, normal)
+    // The channel command line itself cannot run: name the template's first word.
+    const template = "D:\\Program Files\\Git\\bin\\bash.exe -c 'eval \"$(base64 -d)\"'"
+    const templateErr = '/bin/bash: line 1: D:Program: command not found\n'
+    const named = explain({ alias: 'prod', stderr: templateErr, exitCode: 127, shellTemplate: template })
+    assert.equal(named.field, 'shellTemplate')
+    assert.match(named.text, /could not start its shell template \(D:\\Program\)/)
+    assert.match(named.text, /D:Program: command not found/)
+  })
   test('the payload is base64 of the script, UTF-8 safe and round-tripping', () => {
     const command = "printf '%s\\n' 'héllo wörld'; echo \"quoted\";\nls -l"
     const built = buildScript({ command, startupCommand: 'export LANG=C.UTF-8', workdir: '/tmp/ünïcode' })
@@ -9657,7 +9686,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.match(zh['wslBash.wslPath.label'], /wsl|启动器/i)
     assert.doesNotMatch(zh['wslBash.wslPath.label'], /bash/i)
     // startupCommand runs per call, not once after login.
-    assert.match(en['hosts.field.startupCommand.hint'], /every call's script/)
+    assert.match(en['hosts.field.startupCommand.hint'], /login shell before each call/)
     assert.match(en['hosts.field.startupCommand.hint'], /kept verbatim/)
     assert.match(zh['hosts.field.startupCommand.hint'], /每次调用/)
     assert.match(zh['hosts.field.startupCommand.hint'], /原样保留/)
@@ -9884,7 +9913,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.match(control('startupCommand').props.className, /dshwmb-host-code/)
     assert.equal(control('shellTemplate').props.placeholder, internals.DEFAULT_SHELL_TEMPLATE, 'the empty template box shows the real default')
     assert.equal(control('shellTemplate').props.placeholder, `bash -c 'eval "$(base64 -d)"'`)
-    assert.match(en['hosts.field.startupCommand.hint'], /spaces and newlines are kept verbatim/)
+    assert.match(en['hosts.field.startupCommand.hint'], /spaces\/newlines kept verbatim/)
     assert.match(zh['hosts.field.startupCommand.hint'], /原样保留/)
     assert.match(en['hosts.field.shellTemplate.hint'], /spaces and newlines are kept verbatim/)
     assert.match(en['hosts.field.shellTemplate.hint'], /base64/)
