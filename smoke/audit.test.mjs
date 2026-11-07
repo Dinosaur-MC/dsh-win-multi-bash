@@ -13031,6 +13031,35 @@ console.log('\n[A] unit: repository records (bilingual pair, LF discipline, publ
   })
 }
 
+// ── desensitisation guard ───────────────────────────────────────────────────
+// Everything committed to this repository must be reproducible by a stranger: no
+// real host, account, device alias, non-default port or key file. The literals are
+// assembled at run time so this block cannot match its own source, and the scan
+// covers every tracked file (the release body, docs and fixtures included).
+console.log('\n[X] unit: the tracked tree carries no real host or credential identifiers')
+test('no tracked file carries a real host, account, device alias or port', () => {
+  const ip = ['114', '132', '166', '31'].join('.')
+  const account = ['id', 'wk'].join('')
+  const alias = ['5070', 'ti'].join('')
+  const port = ['252', '00'].join('')
+  const binary = /\.(png|jpe?g|gif|ico|webp|woff2?|zip|gz|tgz)$/i
+  const tracked = spawnSync('git', ['ls-files'], { cwd: PLUGIN, encoding: 'utf8' })
+  assert.equal(tracked.status, 0, 'git ls-files must work inside the checkout')
+  const offenders = []
+  for (const rel of tracked.stdout.split('\n').filter(Boolean)) {
+    // A lockfile is a hash soup: whole-word numeric checks are meaningless there,
+    // and it is generated, not written by us.
+    if (binary.test(rel) || rel === 'package-lock.json') continue
+    const text = readFileSync(join(PLUGIN, rel), 'utf8')
+    const lower = text.toLowerCase()
+    if (lower.includes(ip)) offenders.push(rel + ': host address')
+    if (lower.includes(account)) offenders.push(rel + ': account name')
+    if (lower.includes(alias)) offenders.push(rel + ': device alias')
+    if (new RegExp('(?<![0-9a-z])' + port + '(?![0-9a-z])').test(text)) offenders.push(rel + ': port')
+  }
+  assert.deepEqual(offenders, [], 'desensitise before committing: ' + offenders.join(', '))
+})
+
 if (TIMING) {
   const total = Date.now() - STARTED_AT
   console.log(`[timing] boots ${timing.boots} = ${(timing.bootMs / 1000).toFixed(1)} s, tool calls ${timing.calls} = ${(timing.callMs / 1000).toFixed(1)} s, suite total ${(total / 1000).toFixed(1)} s`)
