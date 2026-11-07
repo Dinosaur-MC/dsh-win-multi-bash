@@ -25,7 +25,7 @@ Every dialect owns its own executor, and **no tool registers as `ctx.shell`** â€
 | `ssh_shell` | Remote (SSH) | **Opt-in**; owns a `SshShellExecutor`; one pooled connection per host, one channel per call |
 | `ssh_scp` | Remote (SSH) | **Opt-in with `ssh_shell`**; SFTP file/tree transfer on the same executor and pooled connection; foreground only |
 | `ssh_hosts` | Remote (SSH) | **Opt-in with `ssh_shell`**; read-only sanitized host inventory; no connection or approval |
-| `terminal` | any of the above | Persistent PTY sessions: `open` / `send` / `read` / `signal` / `close` / `list` |
+| `terminal` | `git_bash` / `wsl_bash` / `msys2_bash` | Local PTY sessions: `open` / `send` / `read` / `signal` / `close` / `list` |
 | `pwsh` | dsh's own | Untouched; served by the base bundle's `pwsh-sandbox` row |
 
 Only `git_bash` and `terminal` ship on; the rest are opt-in. `git_bash` often runs unconfined â€” see [Sandbox behavior](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/sandbox.md).
@@ -76,7 +76,7 @@ Requires `pnpm`. The bundle layer is assembled at boot, so **restart `dsh web`**
 | [Architecture](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/architecture.md) | Rows, executors, the registry, the SSH pool and transfers, the client half |
 | [Design principles](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/principles.md) | The rules the implementation is held to: honest facts, derived surfaces, parity, live vs schema knobs |
 | [Sandbox behavior](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/sandbox.md) | Per-backend capabilities, Windows caveats, bwrap, self-heal, SSH's remote scope |
-| [Terminal sessions](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/terminal.md) | PTY lifecycle, signals, limits, SSH sessions, measured defaults |
+| [Terminal sessions](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/terminal.md) | PTY lifecycle, signals, limits, measured defaults |
 | [Conversation rows](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/conversation-rows.md) | How a call becomes the platform shell card |
 | [Configuration](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/configuration.md) | The Plugins page, the SSH hosts and transfers, live semantics, staged saves |
 | [Verification](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/verification.md) | Dev runtime, both test entries, the live SSH round trip |

@@ -28,7 +28,7 @@ Per-tool descriptions keep only dialect facts. If the core row is absent, the sh
 
 ## 4. Fail loud at load, degrade honestly at runtime
 
-Configuration mistakes that can be caught statically throw at load. A missing external toolchain (Git Bash, WSL, `bwrap`, and an SSH client for a session) is a runtime fact: the row loads, discovery/probing happens lazily, and a failed sandbox probe degrades to an honest unconfined run rather than pretending.
+Configuration mistakes that can be caught statically throw at load. A missing external toolchain (Git Bash, WSL, `bwrap`) is a runtime fact: the row loads, discovery/probing happens lazily, and a failed sandbox probe degrades to an honest unconfined run rather than pretending.
 
 `requireSandbox: true` flips that default for deployments that prefer fail-closed: `read-only` / `workspace-write` calls are refused when the probe fails, while `danger-full-access` still runs (it is equivalent to an explicit full-access grant). `sandbox: none` is a deliberate opt-out and stays allowed.
 

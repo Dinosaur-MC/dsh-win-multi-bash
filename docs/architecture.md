@@ -8,7 +8,7 @@ This is the map of the plugin: what is a row, what is a dialect, how a tool call
 - **Executor** — the object that turns one call's `command` / `workdir` / limits into a process, and decorates the result with sandbox facts. It extends `ShellExecutorBase`, which extends dsh's `LocalBashExecutor`.
 - **Tool row** — one `cordis.patch.yml` row that mounts one tool (a subpath export such as `./tool-git-bash`).
 - **Core row** — `win-mb-plugin`, named by the bare package specifier. It serves the browser half, owns the shared prompt section, and carries the deployment-wide self-heal switch.
-- **Terminal row** — `win-mb-tool-terminal`; owns the PTY session tool and the session-backend definitions.
+- **Terminal row** — `win-mb-tool-terminal`; owns the PTY session tool and the local session-backend definitions.
 
 ## Composition
 
@@ -37,7 +37,7 @@ The derived surfaces are:
 - the `README`-visible fact that the row exists;
 - `package.json`'s `exports` and `files`;
 - the browser half's generated row list and terminal literals (`smoke/gen-client-registry.mjs` renders the block; the audit byte-compares it);
-- the terminal row's `defaultShell` options, which in turn drive the conversation rows' wire-name list.
+- the terminal row's `defaultShell` options (the local session backends) and the shell dialects' wire names, which drive the conversation rows' list.
 
 Adding a dialect is therefore **one executor file + one declaration**, not a checklist of six files. A declaration that does not hold together refuses to load: unique id / tool name / row id / config key, a `configKey` matching the browser partition, no tool name collision with the family section, a stance list containing `auto`, and non-empty family facts all throw at load time.
 
@@ -122,7 +122,7 @@ The SSH dialect keeps the family's tool contract but replaces the local spawn wi
 - **Jobs are the factory's, not a second implementation.** The channel handle exposes the same `result()` / `kill()` / output-source contract as the local executors, so `run_in_background` (register immediately, stream into the job ring, settle on exit), timeout promotion (register before starting, return a job id, leave it running), `job_kill` (TERM, 2 s, KILL, close) and the admission-refusal fallback all reuse the existing factory path. A channel that closes with no exit status is an infrastructure failure: the handle is `failed`, the job settles **failed** with a sentence naming the host, never completed with exit 0.
 - **Cancellation is a remote signal.** On timeout or caller abort the runner sends `SIGTERM`, waits up to 2 s, sends `SIGKILL` and closes the channel; a lost connection tears the remote session down with it. Commands that detach themselves (`nohup`, `setsid`) survive by design, and are documented that way. The transport is `ssh2 ~1.17.0`: the version is pinned because the cancellation path uses the protocol-level signal request after stdin is half-closed (the public `signal()` becomes a no-op there). If a future build lacks that path, the result's stderr carries a loud marker that the remote command may still be running.
 - **Remote effects are stated, not sandboxed.** The result carries `sandbox: { mode, remote: true }` and no local verdict; the local file sandbox is not applied to a command that runs on another host. `cwd` is the remote `workdir` when one was given and the empty string otherwise.
-- **The PTY path is unchanged.** `terminal` still runs a real PTY over the OpenSSH client (`ssh.exe -t`), configured by its own `sshShell` single-host pin; it does not read the `hosts` table in 0.8.0, so interactive host-key questions and terminal semantics stay exactly as they were. `terminal` is also outside the host-authorization gate: a session uses its own single-host pin. Sharing the registry with `terminal` is future work.
+- **Remote PTY sessions are gone.** `terminal` serves local shells only (`git_bash`, `wsl_bash`, `msys2_bash`): a session backend comes from a dialect that declares a local interactive argv, and the ssh dialect declares none. The old six-pin `sshShell` block on the terminal row is accepted, ignored and warned about once, so a pre-0.8.0 profile still loads. Remote work is one approval-gated channel per call through `ssh_shell` (and `ssh_scp` for transfers); there is no persistent remote TTY, and therefore no prompt path for a first-connect question — host keys and key authentication are configuration, not a session dialog.
 
 ### Transfers (`ssh_scp`)
 

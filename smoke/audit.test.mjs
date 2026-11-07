@@ -2393,17 +2393,15 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     stdout: { text: 'ok', truncated: false }, stderr: { text: '', truncated: false },
   })
 
-  test('the command row edits the host registry; the session row keeps the single-host pins', () => {
-    // One dialect, TWO field sets: a command call resolves an alias from the array,
-    // while a persistent session still runs the OpenSSH client against one pinned
-    // host. Keeping them in one list would either put a hosts table on the session
-    // row (which cannot use it) or hide the pins from the row that does.
+  test('the ssh row edits ONLY the host registry and declares no terminal backend', () => {
     assert.deepEqual(declaration.fields, [{ leaf: 'hosts', kind: 'hosts' }])
-    assert.deepEqual(declaration.terminalFields.map((own) => own.leaf),
-      ['sshPath', 'sshHost', 'sshUser', 'sshPort', 'acceptNewHostKeys', 'connectTimeoutMs'])
-    assert.deepEqual(registryTerminalFields(declaration), declaration.terminalFields)
-    // A dialect that ships one list for both still works through the fallback.
-    assert.deepEqual(registryTerminalFields({ fields: declaration.terminalFields }), declaration.terminalFields)
+    // The ssh dialect used to keep a second, session-only pin set. A persistent
+    // remote PTY would bypass the host-authorization gate, so the declaration is
+    // gone and the fallback simply returns its one field list.
+    assert.equal(declaration.terminal, undefined)
+    assert.equal(declaration.terminalFields, undefined)
+    assert.deepEqual(registryTerminalFields(declaration), declaration.fields)
+    assert.deepEqual(registryTerminalFields({ fields: declaration.fields }), declaration.fields)
     assert.deepEqual(registryTerminalFields(undefined), [])
   })
 
@@ -2419,8 +2417,9 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     // Appended LAST: ROWS[0]/ROWS[1] stay the git and wsl rows, and the session row
     // stays last of all — nothing a reader already depends on got renumbered.
     assert.deepEqual(SSH_CLIENT_ROWS.slice(3).map((row) => row.rowId), ['win-mb-tool-ssh', 'win-mb-tool-terminal'])
-    // The persistent form is the SESSION row offering this dialect (decision 1).
-    assert.ok(SSH_TERMINAL_BACKENDS.some((backend) => backend.toolName === 'ssh_shell'))
+    // It is NOT a terminal backend any more: remote work is one approval-gated
+    // channel per call, never a persistent PTY that skips the gate.
+    assert.ok(!SSH_TERMINAL_BACKENDS.some((backend) => backend.toolName === 'ssh_shell'))
     // Its facts are what tells the model this is not a local shell.
     const description = shellDescription('ssh')
     assert.match(description, /remote SSH/)
@@ -2458,7 +2457,7 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
   test('the one-shot argv is non-interactive by construction, with the command as ONE element', () => {
     const argv = buildSshArgv({
       sshPath: 'ssh.exe', target: 'u@h', port: undefined, connectTimeoutMs: 15000,
-      acceptNewHostKeys: false, command: 'echo \"$HOME\"; ls -l', interactive: false,
+      acceptNewHostKeys: false, command: 'echo \"$HOME\"; ls -l',
     })
     assert.deepEqual(argv, [
       'ssh.exe', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', '-o', 'StrictHostKeyChecking=yes', '--', 'u@h', 'echo \"$HOME\"; ls -l',
@@ -2472,7 +2471,7 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     // inject an argv element; the pins only ever become their own elements.
     assert.deepEqual(buildSshArgv({
       sshPath: 'ssh.exe', target: 'h', port: 2222, connectTimeoutMs: 1500,
-      acceptNewHostKeys: true, command: 'id', interactive: false,
+      acceptNewHostKeys: true, command: 'id',
     }), [
       'ssh.exe', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=1',
       '-o', 'StrictHostKeyChecking=accept-new', '-p', '2222', '--', 'h', 'id',
@@ -2481,19 +2480,13 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     // out would let a user or system ssh_config answer instead (a `Host *` line saying
     // `no` would then silently accept a changed key for a one-shot call).
     const oneShot = (acceptNewHostKeys) => buildSshArgv({
-      sshPath: 's', target: 'h', connectTimeoutMs: 1000, acceptNewHostKeys, command: 'x', interactive: false,
-    })
-    const sessionArgv = (acceptNewHostKeys) => buildSshArgv({
-      sshPath: 's', target: 'h', connectTimeoutMs: 1000, acceptNewHostKeys, interactive: true,
+      sshPath: 's', target: 'h', connectTimeoutMs: 1000, acceptNewHostKeys, command: 'x',
     })
     assert.ok(oneShot(false).includes('StrictHostKeyChecking=yes'), 'a one-shot call refuses an unknown host even where the config would ask')
     assert.ok(!oneShot(false).includes('StrictHostKeyChecking=accept-new'))
     assert.ok(oneShot(true).includes('StrictHostKeyChecking=accept-new'))
     assert.ok(!oneShot(true).includes('StrictHostKeyChecking=yes'))
-    // The SESSION keeps the inherited `ask` when the knob is off: a first-connect
-    // question is the reason the persistent form exists at all.
-    assert.ok(!sessionArgv(false).some((entry) => entry.startsWith('StrictHostKeyChecking')), 'a session must still be able to ask')
-    assert.ok(sessionArgv(true).includes('StrictHostKeyChecking=accept-new'))
+    assert.ok(!oneShot(false).includes('-t'), 'there is no interactive argv form left')
     // The connection bound is whole seconds, rounded DOWN so the ssh-side bound stays
     // inside the configured one; a pin under one second is refused at route time
     // instead of being rounded UP into a bound nobody asked for.
@@ -2506,15 +2499,11 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
       assert.throws(() => assertConnectTimeoutMs(bad), /at least 1000 ms/, JSON.stringify(bad))
   })
 
-  test('the session argv asks for a remote tty and passes no command', () => {
-    const argv = bareSsh({ sshHost: 'u@h' }).terminalArgv({ workdir: winPath('C:', 'ws') })
-    assert.deepEqual(argv, ['ssh.exe', '-t', '-o', 'ConnectTimeout=15', '--', 'u@h'])
-    // No BatchMode: a session exists so that a fingerprint, a password or a key
-    // passphrase CAN be asked, and the PTY is what makes ssh ask at all.
-    assert.ok(!argv.includes('BatchMode=yes'))
-    // The local cwd is where ssh.exe runs; the remote shell starts where its own
-    // login lands. Translating one into the other would be an invented fact.
-    assert.ok(!argv.includes('--cd'))
+  test('the ssh executor has no interactive-terminal surface at all', () => {
+    const executor = bareSsh({ sshHost: 'u@h' })
+    assert.equal(Object.prototype.hasOwnProperty.call(executor, 'terminalArgv'), false,
+      'the executor must not own a terminalArgv method')
+    assert.ok(!SSH_TERMINAL_BACKENDS.some((backend) => backend.toolName === 'ssh_shell'))
   })
 
   test('a target can never be read as an option, and a port is bounded', () => {
@@ -2527,7 +2516,7 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     assert.throws(() => assertSshTarget('h' + String.fromCharCode(0), 'sshShell.sshHost'), /whitespace or a control character/)
     assert.throws(() => assertSshTarget('', 'sshShell.sshHost'), /is not configured/)
     assert.throws(() => assertSshTarget(undefined, 'sshShell.sshHost'),
-      /ssh_shell row OR on the terminal row/, 'the refusal must name BOTH rows: a session reads the terminal row')
+      /set it on the ssh_shell row/, 'the refusal names the one row that still owns the pin')
     assert.throws(() => assertSshTarget(undefined, 'sshShell.sshHost'), /is not configured/)
     assert.equal(assertSshPort(22), 22)
     assert.equal(assertSshPort(65535), 65535)
@@ -2624,20 +2613,18 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     assert.deepEqual(unionOptions(sshTool.Config.dict.sshShell.dict.sandbox), [...declaration.sandboxStances])
   })
 
-  test('the session row types a dialect pin by the kind the declaration states', () => {
-    // A numeric or boolean leaf declared as a STRING pin would make the dialect's own
-    // Config reject the seeded value at open time — a broken session for a perfectly
-    // well declared dialect. The type is the invariant; what schemastery PRINTS for a
-    // number is its own business, so only the string type is asserted by name.
-    const pins = terminalTool.Config.dict.sshShell.dict
-    assert.equal(String(pins.sshHost), 'string', 'a text leaf stays a text pin')
-    assert.notEqual(String(pins.sshPort), 'string', 'a number leaf is NOT a string pin')
-    assert.notEqual(String(pins.acceptNewHostKeys), 'string', 'a boolean leaf is NOT a string pin')
-    assert.notEqual(String(pins.connectTimeoutMs), 'string')
-    // And the seeded round trip really resolves through the backend schema.
-    const pinned = terminalTool.Config({ sshShell: { sshPort: 2222, acceptNewHostKeys: true, sshHost: 'h' } })
-    assert.equal(pinned.sshShell.sshPort.get(), 2222, 'a numeric pin survives the session row')
-    assert.equal(pinned.sshShell.acceptNewHostKeys.get(), true, 'a boolean pin survives too')
+  test('an old terminal row carrying sshShell session pins still parses, and the pins are ignored', () => {
+    // OUR OWN PROFILE is an existing install: before 0.8.0 the terminal row held
+    // sshPath/sshHost/sshUser/sshPort/acceptNewHostKeys/connectTimeoutMs. A strict
+    // schema that dropped the partition would fail that profile at apply time, so the
+    // partition stays accepted (deprecated) and `apply` warns with the migration.
+    const parsed = terminalTool.Config({
+      sshShell: { sshPath: 'ssh.exe', sshHost: 'win-host.example.com', sshUser: 'me', sshPort: 2222, acceptNewHostKeys: false, connectTimeoutMs: 15000 },
+    })
+    assert.ok(parsed.sshShell !== undefined, 'the deprecated partition is accepted, not rejected')
+    assert.equal(terminalTool.Config.dict.sshShell !== undefined, true)
+    // It is NOT used to build a backend: only the three local shells remain.
+    assert.deepEqual(SSH_TERMINAL_BACKENDS.map((backend) => backend.toolName), ['git_bash', 'wsl_bash', 'msys2_bash'])
   })
 
   testAsync('a remote run reports remote, and NONE of the borrowed verdicts', async () => {
@@ -8911,43 +8898,29 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
   // with no shell pin: what the tool says it offers, and what an `open` reports
   // about whose host the session is on. Booted separately from the round trip so
   // it runs on a machine with no Git Bash too — nothing here touches a PTY.
-  await testAsync('the terminal row offers every session backend it declares, and says which host a session is on', async () => {
-    const { TERMINAL_BACKENDS: SESSION_BACKENDS } = await import(libUrl('tool-bash', 'types', 'registry.js'))
+  await testAsync('the terminal row offers exactly the three local shells and has no remote session form', async () => {
+    const { TERMINAL_BACKENDS: LOCAL_BACKENDS } = await import(libUrl('tool-bash', 'types', 'registry.js'))
     const ctx = await bootFixture(TERMINAL_FIXTURE_ROWS([]), 'terminal-surface.yml')
     try {
       const definition = ctx.tools.get('terminal')
       assert.ok(definition !== undefined, 'the terminal row must register')
-      // REVIEW N2: the description named "Git Bash, WSL or MSYS2" by hand while the
-      // `shell` enum declared beside it was derived — so the SSH backend was offered
-      // by the parameter list and denied by the prose the model reads first.
-      assert.ok(SESSION_BACKENDS.length >= 2, 'this build must declare session backends')
-      for (const backend of SESSION_BACKENDS) {
-        assert.ok(definition.parameters.properties.shell.enum.includes(backend.toolName),
-          'the shell enum must offer ' + backend.toolName)
+      const shells = definition.parameters.properties.shell.enum
+      assert.deepEqual(shells, ['git_bash', 'wsl_bash', 'msys2_bash'], 'only the THREE local shells are session backends')
+      assert.ok(!shells.includes('ssh_shell'), 'a persistent remote PTY would bypass the host-authorization gate')
+      for (const backend of LOCAL_BACKENDS) {
+        assert.ok(shells.includes(backend.toolName), 'the shell enum must offer ' + backend.toolName)
         assert.ok(definition.description.includes(backend.label.en),
           'the description must name "' + backend.label.en + '": ' + definition.description.slice(0, 160))
       }
-      assert.ok(!definition.description.includes('in Git Bash, WSL or MSYS2'),
-        'and it must not hand-list a subset of what the enum offers')
-      // REVIEW N1: a session in a remote backend used to read a LOCAL sandbox
-      // sentence and carry no remote token at all — the one fact that says whether
-      // the shell the model is typing into is on this host.
-      const renderOpen = (value) => definition.output.render({ action: 'open' }, value).map((block) => block.text).join('')
-      const openValue = (remote) => ({
-        kind: 'open', sessionId: 's1', shell: remote ? 'ssh_shell' : 'git_bash', pid: 7, cwd: 'C:/ws',
-        sandboxMode: 'none', unconfined: true, remote, output: 'ready', truncated: false, lossy: false, nextOffset: 5,
-      })
       const openSchema = definition.output.schema.oneOf.find((branch) => branch.properties?.kind?.const === 'open')
       assert.ok(openSchema !== undefined, 'the open value shape must exist')
-      assert.ok('remote' in openSchema.properties,
-        'the open schema must carry the remote fact, or the value is rejected')
-      const remote = renderOpen(openValue(true))
-      assert.ok(remote.includes('— remote: this session runs on the host its backend connects to'), remote)
-      assert.ok(!remote.includes('unconfined: the file sandbox does not wrap'),
-        'a remote session must not be described by a LOCAL sandbox sentence: ' + remote)
-      const local = renderOpen(openValue(false))
-      assert.ok(local.includes('— unconfined: the file sandbox does not wrap a PTY session'), local)
-      assert.ok(!local.includes('— remote: '), local)
+      assert.ok(!('remote' in openSchema.properties), 'no session result may carry a remote fact any more')
+      const rendered = definition.output.render({ action: 'open' }, {
+        kind: 'open', sessionId: 's1', shell: 'git_bash', pid: 7, cwd: 'C:/ws',
+        sandboxMode: 'none', unconfined: true, output: 'ready', truncated: false, lossy: false, nextOffset: 5,
+      }).map((block) => block.text).join('')
+      assert.ok(rendered.includes('— unconfined: the file sandbox does not wrap a PTY session'), rendered)
+      assert.ok(!rendered.includes('remote:'), rendered)
     } finally { await ctx.fiber.dispose() }
   })
 
@@ -8979,6 +8952,7 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
           [{ action: 'send', sessionId: 'x', text: '' }, /"text" must be a non-empty string/],
           [{ action: 'signal', sessionId: 'x', signal: 'SIGWINCH' }, /invalid arguments|"signal" must be one of/],
           [{ action: 'open', shell: 'pwsh' }, /invalid arguments|unknown shell/],
+          [{ action: 'open', shell: 'ssh_shell' }, /invalid arguments|unknown shell/],
           [{ action: 'read', sessionId: 'no-such-session' }, /no session/],
         ]) {
           const refused = await runTerminal(ctx, args)
@@ -9027,11 +9001,10 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
           const drained = await runTerminal(ctx, { action: 'read', sessionId: id })
           assert.equal(drained.value.kind, 'session')
           assert.deepEqual(Object.keys(drained.value).filter((key) => key !== 'waitReason').sort(),
-            ['kind', 'lossy', 'nextOffset', 'output', 'remote', 'shell', 'truncated'],
+            ['kind', 'lossy', 'nextOffset', 'output', 'shell', 'truncated'],
             'read must return exactly the declared fields (waitReason included only when there is one)')
           if (drained.value.output === '') assert.equal(drained.value.waitReason, 'no_output', 'an empty read says why it is empty')
           assert.equal(drained.value.shell, 'git_bash', 'a session result names the shell it belongs to')
-          assert.equal(drained.value.remote, false, 'and whether that shell runs its effects on another host')
         } finally {
           // The shell's cwd is INSIDE this directory: close the session before deleting it.
           if (id !== undefined) await runTerminal(ctx, { action: 'close', sessionId: id }).catch(() => {})
@@ -9081,65 +9054,6 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
       })
     } finally {
       if (strict) await strict.fiber.dispose()
-    }
-    // OPT-IN, like the SSH row's own live round trip: a real session needs a reachable host
-    // and a credential, so it is NEVER part of the gate. Run it with
-    //   DSH_AUDIT_SSH_HOST=me node smoke/prepare.mjs audit
-    // This is the only coverage of the PERSISTENT remote form — the form that exists so a
-    // fingerprint, a password or a passphrase can be answered at all (a remote tty).
-    const liveSshHost = process.env.DSH_AUDIT_SSH_HOST
-    const liveSshPath = (await import(libUrl('ssh-shell', 'index.js'))).resolveSshPath(undefined)
-    if (liveSshHost === undefined || liveSshHost.length === 0) {
-      skip('  … skipping the live SSH terminal session: set DSH_AUDIT_SSH_HOST to run it')
-    } else if (liveSshPath === undefined) {
-      skip('  … skipping the live SSH terminal session: no ssh client was found')
-    } else {
-      const LIVE_SESSION_ROWS = CORE_ROW_ONLY + [
-        '- id: win-mb-tool-terminal',
-        "  name: 'dsh-win-multi-bash/tool-terminal'",
-        '  config:',
-        '    terminal:',
-        '      defaultShell: ssh_shell',
-        '      maxSessions: 1',
-        '      waitMs: 12000',
-        '      quietMs: 600',
-        '      idleMs: 120000',
-        '    sshShell:',
-        "      sshPath: '" + liveSshPath.replaceAll(String.fromCharCode(92), String.fromCharCode(92) + String.fromCharCode(92)) + "'",
-        "      sshHost: '" + liveSshHost + "'",
-        '      connectTimeoutMs: 15000',
-        '',
-      ].join('\n')
-      let live
-      try {
-        live = await bootFixture(LIVE_SESSION_ROWS, 'terminal-ssh-live.yml')
-        await testAsync('a real SSH session reaches ' + liveSshHost + ', keeps remote state, and is reaped on close', async () => {
-          const opened = await runTerminal(live, { action: 'open' })
-          assert.ok(!opened.isError, opened.text)
-          assert.equal(opened.value.kind, 'open')
-          assert.equal(opened.value.shell, 'ssh_shell')
-          assert.equal(opened.value.remote, true, 'a session on another host must say so, not carry a local sandbox sentence')
-          const id = opened.value.sessionId
-          const sent = async (text, waitMs) => (await runTerminal(live, { action: 'send', sessionId: id, text, waitMs })).value.output
-          assert.match(await sent('echo SSH-PTY-OK; uname -sr', 12000), /SSH-PTY-OK/, 'the remote login shell ran the command')
-          const probe = await runTerminal(live, { action: 'send', sessionId: id, text: 'uname -sr', waitMs: 12000 })
-          assert.match(probe.value.output, /Linux/, "the remote kernel is not this host's")
-          assert.equal(probe.value.remote, true, 'a later result repeats the remote fact, not just `open`')
-          assert.equal(probe.value.shell, 'ssh_shell')
-          // State across calls is the reason a session exists; the echoed command text
-          // cannot satisfy either match on its own.
-          await sent('export WMB_PTY_PROBE=42', 8000)
-          assert.match(await sent('echo "PROBE=$WMB_PTY_PROBE"', 8000), /PROBE=42/, 'an exported variable survived the next call')
-          await sent('cd /tmp', 8000)
-          assert.match(await sent('pwd', 8000), /^[^\n]*\/tmp/m, 'the remote working directory survived too')
-          const listed = await runTerminal(live, { action: 'list' })
-          assert.ok(listed.value.sessions.some((session) => session.sessionId === id && session.shell === 'ssh_shell'), 'list names the remote session')
-          const closed = await runTerminal(live, { action: 'close', sessionId: id })
-          assert.equal(closed.value.kind, 'closed')
-        })
-      } finally {
-        if (live) await live.fiber.dispose()
-      }
     }
   }
 }
@@ -10012,23 +9926,19 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.doesNotMatch(en['requireSandboxRemote.hint'], /Local:/)
   })
 
-  test('the terminal row groups its four partitions under headings, in order', () => {
+  test('the terminal row groups its three local partitions under headings, in order', () => {
     const row = ROWS.find((entry) => entry.rowId === 'win-mb-tool-terminal')
     const groups = row.fields.map((knob) => knob.group)
-    assert.deepEqual([...new Set(groups)], ['session', 'output', 'backends', 'ssh'])
+    assert.deepEqual([...new Set(groups)], ['session', 'output', 'backends'], 'the ssh session group is gone')
     const firstOf = (group) => row.fields.find((knob) => knob.group === group).path.join('.')
     assert.equal(firstOf('session'), 'terminal.defaultShell')
     assert.equal(firstOf('output'), 'terminal.rows')
     assert.match(firstOf('backends'), /^(gitBash|wslBash|msys2Bash)\./)
-    assert.equal(firstOf('ssh'), 'sshShell.sshPath')
     assert.equal(en['group.session'], 'Session')
     assert.equal(en['group.output'], 'Output and waiting')
     assert.equal(en['group.backends'], 'Backend executables')
-    assert.equal(en['group.ssh'], 'SSH session')
-    // The session-row pins carry session wording, not the command-row wording.
-    assert.match(en['sshShell.sshHost.hint'], /session opens/)
-    assert.doesNotMatch(en['sshShell.sshHost.hint'], /refuses every call/)
-    assert.match(en['sshShell.acceptNewHostKeys.hint'], /known_hosts/)
+    assert.equal(en['group.ssh'], undefined, 'no SSH-session heading survives')
+    assert.equal(en['sshShell.sshHost'], undefined, 'no terminal-row SSH pin strings survive')
   })
 
   test('the terminal row renders one heading before each group', () => {
@@ -10038,10 +9948,23 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     const state = form.project()
     const tree = RowConfigCard({ view: 'page', t: (key) => en[key] ?? key, useRowForm: (select) => select(state), edit: () => {}, resetField: () => {}, save: () => {}, discard: () => {} })
     const headings = flattenTree(tree).filter((node) => node.type === 'h3' && node.props?.className === 'dshwmb-group')
-    assert.deepEqual(headings.map((node) => node.children[0]), ['Session', 'Output and waiting', 'Backend executables', 'SSH session'])
+    assert.deepEqual(headings.map((node) => node.children[0]), ['Session', 'Output and waiting', 'Backend executables'])
     form.dispose()
   })
 
+  await testAsync('an old terminal row carrying sshShell pins still projects and renders', async () => {
+    const terminalRow = ROWS.find((entry) => entry.rowId === 'win-mb-tool-terminal')
+    const scope = fakeScope({ value: { terminal: { defaultShell: 'git_bash' }, sshShell: { sshPath: 'ssh.exe', sshHost: 'win-host.example.com', sshPort: 2222 } } })
+    const form = new RowConfigForm(scope, terminalRow)
+    try {
+      const state = form.project()
+      const tree = RowConfigCard({ view: 'page', t: (key) => en[key] ?? key, useRowForm: (select) => select(state), edit: () => {}, resetField: () => {}, save: () => {}, discard: () => {} })
+      const fields = flattenTree(tree).filter((node) => node.type === 'SettingsValueField')
+      assert.equal(fields.some((field) => String(field.props.id).includes('sshShell')), false, 'no SSH field is rendered')
+      const headings = flattenTree(tree).filter((node) => node.type === 'h3' && node.props?.className === 'dshwmb-group')
+      assert.deepEqual(headings.map((node) => node.children[0]), ['Session', 'Output and waiting', 'Backend executables'])
+    } finally { form.dispose() }
+  })
   test('numeric hints state the Host-backed default exactly once', () => {
     for (const row of [...ROWS, internals.CORE_ROW]) {
       const scope = fakeScope()

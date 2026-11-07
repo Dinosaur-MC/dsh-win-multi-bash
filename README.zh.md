@@ -25,7 +25,7 @@ DeepSeek Harness 的 Windows 多 bash 插件。**`git_bash`**（Git for Windows 
 | `ssh_shell` | 远端（SSH） | **按需开启**；持有 `SshShellExecutor`；每主机一条池化连接，每次调用一条通道 |
 | `ssh_scp` | 远端（SSH） | **随 `ssh_shell` 按需开启**；同一执行器与池化连接上的 SFTP 文件/目录传输；仅前台 |
 | `ssh_hosts` | 远端（SSH） | **随 `ssh_shell` 按需开启**；只读的净化主机清单；不连接、不审批 |
-| `terminal` | 以上任意后端 | 持久 PTY 会话：`open` / `send` / `read` / `signal` / `close` / `list` |
+| `terminal` | 本地后端：`git_bash`、`wsl_bash`、`msys2_bash` | 持久本地 PTY 会话：`open` / `send` / `read` / `signal` / `close` / `list` |
 | `pwsh` | dsh 自带 | 不受影响；由基座的 `pwsh-sandbox` 行提供 |
 
 只有 `git_bash` 与 `terminal` 默认开启；另外三行按需开启。`git_bash` 常以未包裹方式运行——详见[沙箱行为](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/sandbox.md)。
@@ -76,7 +76,7 @@ dsh plugin --profile web remove dsh-win-multi-bash                 # 卸载
 | [架构](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/architecture.md) | 行、执行器、注册表、SSH 池与传输、客户端半边 |
 | [设计原则](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/principles.md) | 实现必须遵守的规则：诚实事实、派生面、平台一致性、live 与 schema 旋钮 |
 | [沙箱行为](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/sandbox.md) | 各后端能力、Windows 限制、bwrap、自愈、SSH 的远端作用域 |
-| [终端会话](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/terminal.md) | PTY 生命周期、信号、上限、SSH 会话、实测默认值 |
+| [终端会话](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/terminal.md) | PTY 生命周期、信号、上限、实测默认值 |
 | [会话行](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/conversation-rows.md) | 一次调用如何变成平台的 shell 卡 |
 | [配置](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/configuration.md) | 插件页、SSH 主机与传输、live 语义、分阶段保存 |
 | [验证](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/verification.md) | 开发运行时、两个测试入口、可选的 live SSH 往返 |

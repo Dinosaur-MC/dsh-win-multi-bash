@@ -354,6 +354,13 @@ its own card for ssh approvals instead of modifying the shared one:
   documented as a known limitation; a later release can bridge the registry.
 - No startup command for terminal sessions in 0.8.0.
 
+**Later change (2026-11-08):** this terminal SSH backend was removed before
+release. `terminal` serves local shells only (`git_bash`, `wsl_bash`,
+`msys2_bash`); the ssh dialect declares no session backend, the old six-pin
+`sshShell` block on the terminal row is accepted, ignored and warned about once,
+and remote work is the approval-gated `ssh_shell` / `ssh_scp`. The terminal rows
+of the migration table above are superseded accordingly.
+
 ## 13. Errors and observability
 
 Every failure names the alias and the phase: config, connect, host-key, auth,

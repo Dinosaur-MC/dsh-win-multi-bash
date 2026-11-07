@@ -42,11 +42,12 @@
 | Config partition | `sshBash` | `sshShell` |
 | Patch row | `.../tool-ssh-bash` | `.../tool-ssh-shell` |
 | Export subpath | `./tool-ssh-bash` | `./tool-ssh-shell` |
-| Terminal shell value | `ssh_bash` | `ssh_shell` |
-| Terminal pin partition | `sshBash` | `sshShell` |
+| Terminal SSH session | `ssh_shell` session form | **removed** — remote work is `ssh_shell` / `ssh_scp` only |
 | Executor | `SshBashExecutor` | `SshShellExecutor` |
 
-The old names are not honoured at runtime. On the command row the single-host pins (`sshPath`, `sshHost`, `sshUser`, `sshPort`, `acceptNewHostKeys`, `connectTimeoutMs`) are **replaced** by `sshShell.hosts`, and the row has no `sshPath` any more (its client is ssh2, not `ssh.exe`). A profile that still lists `sshBash:` keeps that key unread and silently preserved: the row comes up with no hosts and every call fails with `no hosts are configured; add them to the sshShell.hosts array on this row` — there is no fallback to a single host. The `terminal` row keeps its own single-host pin under `sshShell` and does not read the registry, so sessions are unchanged apart from the partition rename.
+- **The `terminal` row no longer offers an SSH session backend.** A persistent remote PTY bypassed the host-authorization gate; remote work now goes through `ssh_shell` (approval-gated, one channel per call) and `ssh_scp`. A deployment that had the SSH pins on the terminal row simply loses them: configure the same host in `sshShell.hosts` and use `ssh_shell`.
+
+The old names are not honoured at runtime. On the command row the single-host pins (`sshPath`, `sshHost`, `sshUser`, `sshPort`, `acceptNewHostKeys`, `connectTimeoutMs`) are **replaced** by `sshShell.hosts`, and the row has no `sshPath` any more (its client is ssh2, not `ssh.exe`). A profile that still lists `sshBash:` keeps that key unread and silently preserved: the row comes up with no hosts and every call fails with `no hosts are configured; add them to the sshShell.hosts array on this row` — there is no fallback to a single host. The `terminal` row no longer reads `sshShell` at all: the partition is accepted for upgrade compatibility but ignored, and only the three local shells can open a session. Move any host those old pins named into `sshShell.hosts` and use `ssh_shell`.
 
 ## Known limitations
 
@@ -54,7 +55,6 @@ The old names are not honoured at runtime. On the command row the single-host pi
 - The local-path check for `ssh_scp` is layered but **not atomic**: it resolves lexically against the session and sandbox root, refuses a symlink/junction target via `lstat`, and re-checks the realpath of the deepest existing ancestor (including each recursive target after creation). A time-of-check/time-of-use window still exists between the check and the transfer, so it is a guardrail, not a containment boundary for a local attacker.
 - Channel retrying has a bounded attempt budget but no separate deadline for background calls: they stop after four attempts, while a foreground call is bounded by its own deadline.
 - **`ssh_hosts` is the read-only inventory; `ssh_list` is deferred.** 0.8.0's model-facing host list is `ssh_hosts` (query / approval / defaultOnly filters) which returns the registry without a credential, a connection or an approval prompt; the platform-style `ssh_list` registry tooling is still deferred.
-- `terminal` stays outside the registry and the gate: an SSH session still uses the session row's single-host pin and is not covered by `ssh_shell`'s authorization.
 - `@cert-authority` entries in `known_hosts` are not honoured.
 
 ## Security

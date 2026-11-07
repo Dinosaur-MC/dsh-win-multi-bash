@@ -21,7 +21,7 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { APPROVAL_GATED_TOOL_NAMES, CLIENT_ROWS, LEAF_RULES, TERMINAL_ROW } from '../lib/tool-bash/types/registry.js';
+import { APPROVAL_GATED_TOOL_NAMES, CLIENT_ROWS, LEAF_RULES, SHELL_FAMILY_TOOL_NAMES, TERMINAL_ROW } from '../lib/tool-bash/types/registry.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CLIENT_PATH = join(HERE, '..', 'lib', 'client.js');
@@ -74,6 +74,10 @@ export function renderClientRegistry() {
     lines.push('\t\tconst ROWS = [');
     for (const row of CLIENT_ROWS) lines.push(...renderRow(row));
     lines.push('\t\t];');
+    lines.push('\t\t/** The tool cards this bundle renders itself: every dialect tool in the shared');
+    lines.push('\t\t * family, INDEPENDENT of which dialects can host a terminal. A command-only');
+    lines.push('\t\t * dialect (ssh_shell) still needs its own card. */');
+    lines.push(`\t\tconst SHELL_TOOL_NAMES = [${SHELL_FAMILY_TOOL_NAMES.map((name) => JSON.stringify(name)).join(', ')}];`);
     lines.push('\t\t/**');
     lines.push('\t\t * The interactive session tool\'s three literals, from the registry: the wire');
     lines.push('\t\t * name its keyed row is registered under, the row that carries its config, and');

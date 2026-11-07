@@ -7,7 +7,7 @@ The [README](../README.md) is the entry point and release summary. These documen
 | [Architecture](architecture.md) | Rows, executors, the dialect registry, the tool factory, the remote SSH pool, its channels and SFTP transfers, the prompt section, the client half, the call flow, and path conversion |
 | [Design principles](principles.md) | The rules the implementation is held to — what the plugin may assert, how surfaces are derived, and where it deliberately diverges |
 | [Sandbox behavior](sandbox.md) | Per-backend capabilities, Windows caveats, bwrap setup, the self-heal switch, and SSH's remote scope |
-| [Terminal sessions](terminal.md) | PTY lifecycle, signals, output bounds, sessions vs jobs, SSH sessions, measured defaults |
+| [Terminal sessions](terminal.md) | PTY lifecycle, signals, output bounds, sessions vs jobs, measured defaults |
 | [Conversation rows](conversation-rows.md) | How a call becomes the platform's own shell card |
 | [Configuration](configuration.md) | The Plugins page, the SSH hosts table and its migration, the `ssh_hosts` inventory, the `ssh_scp` transfer rules, 0.8.0 limitations, live semantics, staged saves |
 | [Verification](verification.md) | Dev runtime, both test entries, the audit gate, the live SSH round trip |

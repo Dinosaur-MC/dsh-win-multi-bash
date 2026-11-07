@@ -1,29 +1,28 @@
 # Terminal sessions (`terminal`)
 
-`terminal` runs a **persistent PTY session** — a real interactive shell that stays alive between calls, so the current directory, exported variables, aliases, functions and background jobs survive. Use it for REPLs, debuggers, `ssh`, database clients, TUI programs, or any workflow that depends on shell state.
+`terminal` runs a **persistent PTY session** — a real interactive shell that stays alive between calls, so the current directory, exported variables, aliases, functions and background jobs survive. Use it for REPLs, debuggers, database clients, TUI programs, or any workflow that depends on shell state.
 
 | Action | What it does |
 | --- | --- |
-| `open` | Starts a session and returns its `sessionId`, `pid`, cwd, shell/remote fact and startup output |
+| `open` | Starts a session and returns its `sessionId`, `pid`, cwd, shell fact and startup output |
 | `send` | Writes `text` (with Enter unless `submit: false`) and returns the reply |
 | `read` | Reads new output without writing; `waitMs` blocks until the next output arrives, `all: true` dumps the retained scrollback, `offset` re-reads from a whole-stream byte offset |
 | `signal` | Delivers a signal to the foreground process group; on this platform only `SIGINT` reaches the shell |
 | `close` | Ends the session and waits for the outcome its own terminate produced |
 | `list` | The sessions you own |
 
-Every session result carries `shell` and `remote` (value and `output.schema`), so a context that only holds a later result still knows whether it is typing into another host.
+Every session result carries `shell` (value and `output.schema`), so a context that only holds a later result still knows which local shell it is typing into.
 
 ## Backends
 
-The backend is the dialect registry. `shell` names one of the dialects that declare interactive-session capability — `git_bash`, `wsl_bash`, `msys2_bash`, `ssh_shell` — and each executor supplies its own interactive argv:
+The backend is the dialect registry. `shell` names one of the local dialects that declare interactive-session capability — `git_bash`, `wsl_bash`, `msys2_bash` — and each executor supplies its own interactive argv:
 
 - `bash.exe -i`
 - `wsl.exe --cd <dir> [-d <distro>] -- bash -i`
-- `ssh.exe -t <options> -- <host>` (no `-T`, no `BatchMode`, so the PTY can answer a first-connect prompt)
 
 `terminal.defaultShell` picks the default; a dialect that declares no session is never offered.
 
-**An SSH session is configured on this row, not on the `ssh_shell` row.** The session keeps its own single-host pin under `sshShell` — `sshPath`, `sshHost`, `sshUser`, `sshPort`, `acceptNewHostKeys`, `connectTimeoutMs` — and does **not** read the command row's `sshShell.hosts` table in 0.8.0. A session therefore covers one host, while `ssh_shell` can reach many; sharing the registry is future work. The session's `acceptNewHostKeys` is the OpenSSH client's `accept-new`, so a first connect records the key into `known_hosts`, whereas the host registry's switch only accepts a key for one connection and never writes the file. There is no startup command for a session in this release.
+**No remote sessions.** 0.8.0 removed the terminal row's SSH backend: a persistent remote PTY would sit outside the host-authorization gate, so remote work goes through the approval-gated `ssh_shell` (one channel per call, no TTY) and `ssh_scp` (SFTP on the same registry). `terminal` therefore opens local shells only; `shell: "ssh_shell"` is not a valid value, and the old six `sshShell` pins on a terminal row (`sshPath`, `sshHost`, `sshUser`, `sshPort`, `acceptNewHostKeys`, `connectTimeoutMs`) are parsed-and-ignored with one warning so an existing profile still loads.
 
 **One shell per session, using the user's own startup files.** `-i` only — no `--noprofile --norc` — because the aliases and exported functions a session exists to preserve are exactly what those files set up.
 
@@ -42,14 +41,14 @@ The backend is the dialect registry. `shell` names one of the dialects that decl
 - **Sessions are not jobs.** They are not registered in `ctx.jobs`, so `job_kill` cannot reach one: `close` is the only way the **model** can end a session; the Session header's Stop (a human) and the idle reaper are the other two paths.
 - **`close` reports what its terminate caused.** It waits (bounded by a fixed 1 s grace) for the outcome the session tree produced instead of reading `exitCode` the instant `terminate()` resolves; a force-terminated session reports exit code 1 on Windows (no signal), a natural `exit 0` reports 0.
 
-## Sandbox and remote facts
+## Sandbox facts
 
 A PTY session runs **unconfined**, and says so:
 
 - a file sandbox wraps the argv of a spawned command; a terminal session is allocated by a different provider call, and on this host the windows-acl runner cannot start MSYS bash at all (`0xC0000142`);
 - every `open` carries `unconfined: true`;
 - `terminal.allowUnconfined: false` makes `open` refuse instead of running unprotected;
-- a session in a remote backend (SSH) also carries `remote: true` and says so in its first line — the one fact that matters there, since the files it touches are not on this host; `unconfined` stays true beside it.
+- a session has no remote branch: every backend is local, so `unconfined: true` is the only fact beside `sandboxMode`.
 
 ## Finished sessions
 
@@ -90,14 +89,6 @@ Only `SIGINT` reaches the shell on this platform; the other four are refused **b
 - `SIGINT` is delivered as a Ctrl+C byte and does interrupt the foreground command (verified: it stops a `sleep 30` while the session stays usable).
 
 Two provider facts: `pid` is `0` on Windows (ConPTY) and is display-only; `inspectActivity()` always answers `unknown`, so readiness falls back to output silence.
-
-## SSH sessions
-
-An SSH session is where a first-connect question can be answered — it is the only OpenSSH form left in 0.8.0, now that the command tool runs over ssh2:
-
-- `open` with `shell: "ssh_shell"` runs `ssh.exe -t … -- <host>` with no `BatchMode`, so the real PTY lets ssh ask for an unknown host's fingerprint, a password or a key passphrase — answer with `send`;
-- the same PTY makes sshd reap the remote process group when the session ends, while `ssh_shell` never starts an `ssh.exe` process at all (its own channel cancellation signals the remote command);
-- two honest limits: anything typed through `send` becomes part of the tool call, so authenticate with a key rather than typing a secret; and a session's `cwd` is where `ssh.exe` runs locally, never a remote directory.
 
 ## Measured defaults
 
