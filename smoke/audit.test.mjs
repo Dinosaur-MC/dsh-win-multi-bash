@@ -72,7 +72,7 @@ const { WslBashExecutor } = await import(libUrl('bash-wsl', 'index.js'))
 const { ownExecutor } = await import(libUrl('tool-bash', 'types', 'backend.js'))
 const { processJob, processOutcome, processSources, ringDelta } =
   await import(libUrl('tool-bash', 'types', 'background.js'))
-const { remoteSandboxMarker, renderJobRead, renderPromoted, renderResult, unconfinedDetailMarker, unconfinedMarker, unmatchedDialectMarker } =
+const { remoteSandboxMarker, remoteSandboxLatch, renderJobRead, renderPromoted, renderResult, unconfinedDetailMarker, unconfinedMarker, unmatchedDialectMarker } =
   await import(libUrl('tool-bash', 'types', 'render.js'))
 const gitBashTool = await import(libUrl('tool-bash', 'types', 'git-bash.js'))
 const wslBashTool = await import(libUrl('tool-bash', 'types', 'wsl-bash.js'))
@@ -2814,6 +2814,31 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     assert.ok(!promoted.includes('runner itself failed'))
   })
 
+  test('the remote marker is announced once per executor row/process but the structured fact stays on every result', () => {
+    const result = {
+      exitCode: 0, signal: null, timedOut: false,
+      stdout: { text: 'out\n', truncated: false },
+      stderr: { text: '', truncated: false },
+      sandbox: { mode: 'workspace-write', remote: true },
+    }
+    const rowLatch = remoteSandboxLatch()
+    const first = renderResult(result, [], rowLatch(result.sandbox))
+    assert.ok(first.includes(remoteSandboxMarker('workspace-write')), first)
+    const second = renderResult(result, [], rowLatch(result.sandbox))
+    assert.ok(!second.includes(remoteSandboxMarker('workspace-write')), 'the second run does not repeat the sentence: ' + second)
+    assert.deepEqual(result.sandbox, { mode: 'workspace-write', remote: true }, 'the structured fact is untouched on every result')
+    // The promoted/job-read path shares the same row latch.
+    assert.equal(renderJobRead('out', false, [], result.sandbox, [], rowLatch(result.sandbox)), 'out')
+    // A fresh executor row creates a fresh latch, so the first run explains again.
+    const freshRow = remoteSandboxLatch()
+    assert.ok(renderJobRead('out', false, [], result.sandbox, [], freshRow(result.sandbox)).includes(remoteSandboxMarker('workspace-write')))
+    // The background terminal detail follows the same once rule.
+    const backgroundLatch = remoteSandboxLatch()
+    const backgroundFirst = processOutcome({ status: 'completed', exitCode: 0, sandbox: result.sandbox }, [], backgroundLatch(result.sandbox))
+    assert.ok(backgroundFirst.detail.includes(remoteSandboxMarker('workspace-write')), backgroundFirst.detail)
+    const backgroundSecond = processOutcome({ status: 'completed', exitCode: 0, sandbox: result.sandbox }, [], backgroundLatch(result.sandbox))
+    assert.ok(!backgroundSecond.detail.includes(remoteSandboxMarker('workspace-write')), backgroundSecond.detail)
+  })
   test('the family section drops its sandbox sentence for an all-remote set and adds the remote clause', () => {
     const local = shellFamilySectionText({ background: false, escalation: false })
     assert.ok(local.includes(LOCAL_SANDBOX_PHRASE), 'the default keeps the sentence it always had')
