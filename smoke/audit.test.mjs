@@ -3122,14 +3122,43 @@ console.log('\n[A] unit: the ssh_shell host registry (validation, aliases, defau
     const ctx = { tools: { register: (definition) => { registered = definition } } }
     await createHostsTool().register(ctx, { executor: { hosts } })
     const value = await registered.execute({})
-    assert.deepEqual(Object.keys(value.hosts[0]).sort(), Object.keys(registered.output.schema.properties.hosts.items.properties).sort())
-    assert.deepEqual(Object.keys(value).sort(), Object.keys(registered.output.schema.properties).sort())
+    const topSchema = registered.output.schema.properties
+    const itemSchema = topSchema.hosts.items.properties
+    assert.deepEqual(Object.keys(value.hosts[0]).sort(), Object.keys(itemSchema).sort())
+    assert.deepEqual(Object.keys(value).sort(), Object.keys(topSchema).filter((key) => key !== 'invalid').sort(), 'invalid is the one optional top-level key')
+    for (const key of ['alias', 'user', 'host', 'port', 'approval', 'default', 'description', 'hasStartupCommand', 'hasShellTemplate']) {
+      assert.ok(registered.output.schema.properties.hosts.items.required.includes(key), key + ' is a required host fact')
+      assert.equal(itemSchema[key].type, ['alias', 'user', 'host', 'approval', 'description'].includes(key) ? 'string' : key === 'port' ? 'integer' : 'boolean', key + ' has its declared type')
+    }
+    for (const key of ['hosts', 'total', 'matched']) assert.ok(registered.output.schema.required.includes(key), key + ' is required')
+    assert.ok(!registered.output.schema.required.includes('invalid'), 'invalid is present only on a failed registry')
     const json = JSON.stringify(value)
     const text = registered.output.render({}, value).map((block) => block.text).join('\n')
     for (const secret of ['keyPath', 'passphraseEnv', 'C:/keys', 'A_PASS']) {
       assert.equal(json.includes(secret), false, 'JSON must not carry ' + secret)
       assert.equal(text.includes(secret), false, 'text must not carry ' + secret)
     }
+    // An INVALID registry is a structured failure, not a successful empty one.
+    const { validateHosts } = await import(libUrl('ssh-shell', 'hosts.js'))
+    const duplicateAlias = validateHosts([
+      { alias: 'dup', host: 'a.example', user: 'u', keyPath: 'C:/k' },
+      { alias: 'dup', host: 'b.example', user: 'u', keyPath: 'C:/k' },
+    ])
+    assert.equal(duplicateAlias.ok, false)
+    let invalidTool
+    await createHostsTool().register({ tools: { register: (definition) => { invalidTool = definition } } }, { executor: { hostRegistry: () => duplicateAlias } })
+    const invalid = await invalidTool.execute({})
+    assert.deepEqual(invalid, { hosts: [], total: 0, matched: 0, invalid: duplicateAlias.error })
+    assert.match(invalidTool.output.render({}, invalid)[0].text, /sshShell\.hosts is invalid/)
+    const twoDefaults = validateHosts([
+      { alias: 'a', host: 'a.example', user: 'u', keyPath: 'C:/k', default: true },
+      { alias: 'b', host: 'b.example', user: 'u', keyPath: 'C:/k', default: true },
+    ])
+    assert.equal(twoDefaults.ok, false)
+    const twoDefaultsInfo = { executor: { hostRegistry: () => twoDefaults } }
+    let twoDefaultsTool
+    await createHostsTool().register({ tools: { register: (definition) => { twoDefaultsTool = definition } } }, twoDefaultsInfo)
+    assert.match((await twoDefaultsTool.execute({})).invalid, /default/i)
     const emptyInfo = { executor: { hosts: [] } }
     let emptyTool
     await createHostsTool().register({ tools: { register: (definition) => { emptyTool = definition } } }, emptyInfo)
@@ -3720,6 +3749,11 @@ console.log('\n[A] unit: the ssh_shell remote script builder (POSIX, base64 payl
     const winBuilt = buildScript({ workdir: 'C:\\Users\\me', command: 'pwd' })
     assert.match(buildPassthroughCommand({ family: 'posix', workdir: 'C:\\Users\\me', command: 'pwd', built: winBuilt }), /cd -- 'C:\\Users\\me'/)
     assert.match(buildCmdPassthrough({ startupCommand: '', workdir: 'C:\\x', command: 'dir' }), /cd \/d "C:\\x" && dir$/)
+    // cmd cannot cd /d into UNC; the refusal names the way out (pushd in the command).
+    assert.throws(
+      () => buildCmdPassthrough({ startupCommand: '', workdir: '\\\\server\\share\\dir', command: 'dir' }),
+      /UNC path.*pushd/,
+    )
   })
 
   test('the cmd-family probe is cached per client, re-probes after replacement, and falls back to posix', async () => {
@@ -3751,8 +3785,28 @@ console.log('\n[A] unit: the ssh_shell remote script builder (POSIX, base64 payl
     const posixClient = probeClient('__DSH_SHELL__%COMSPEC%__\n')
     assert.equal(await executor.shellFamilyFor(posixClient, host), 'posix', 'a replacement connection re-probes')
     assert.equal(posixClient.calls, 1)
-    const broken = { exec(_command, callback) { callback(new Error('probe failed')) } }
-    assert.equal(await executor.shellFamilyFor(broken, { alias: 'broken' }), 'posix', 'a probe failure is posix, never an error')
+    // A FAILED probe is not a classification: it reports posix for THIS call only
+    // and is not cached, so the next call on the same connection re-probes.
+    let flakyCalls = 0
+    const flaky = {
+      exec(_command, callback) {
+        flakyCalls += 1
+        if (flakyCalls === 1) return callback(new Error('probe failed'))
+        const listeners = {}
+        const stream = {
+          on(event, handler) { (listeners[event] ??= []).push(handler) },
+          stderr: { on() {} },
+          end() { queueMicrotask(() => { for (const handler of listeners.data ?? []) handler('__DSH_SHELL__C:\\Windows\\system32\\cmd.exe\n'); for (const handler of listeners.close ?? []) handler() }) },
+          close() {},
+        }
+        callback(null, stream)
+      },
+    }
+    assert.equal(await executor.shellFamilyFor(flaky, { alias: 'flaky' }), 'posix', 'a probe failure is posix, never an error')
+    assert.equal(await executor.shellFamilyFor(flaky, { alias: 'flaky' }), 'cmd', 'the failure was not cached: the next call re-probes and classifies cmd')
+    assert.equal(flakyCalls, 2)
+    assert.equal(await executor.shellFamilyFor(flaky, { alias: 'flaky' }), 'cmd')
+    assert.equal(flakyCalls, 2, 'the successful classification IS cached')
   })
   test('the payload is base64 of the script, UTF-8 safe and round-tripping', () => {
     const command = "printf '%s\\n' 'héllo wörld'; echo \"quoted\";\nls -l"
@@ -4857,7 +4911,7 @@ if (process.platform !== 'win32') {
       assert.equal(assertRemotePath('C:/Users/x.txt'), '/C:/Users/x.txt')
       assert.equal(assertRemotePath('c:/users/x.txt'), '/C:/users/x.txt', 'the drive letter is upper-cased')
       const unc = BS + BS + 'server' + BS + 'share' + BS + 'x.txt'
-      assert.equal(assertRemotePath(unc), unc, 'UNC is passed through unchanged')
+      assert.equal(assertRemotePath(unc), '//server/share/x.txt', 'UNC is normalized for the POSIX-shaped SFTP protocol')
       assert.throws(() => assertRemotePath('relative/x.txt'), /must be absolute on the remote host/)
       assert.throws(() => assertRemotePath(''), /must be absolute on the remote host/)
       assert.throws(() => assertRemotePath('a' + BS + 'b'), /must be absolute on the remote host/)
@@ -5135,6 +5189,36 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
         const result = await runner.upload({ host: hostEntry(fixture.port), localPath: local, remotePath: '/in/hello.txt', timeoutMs: 5000 })
         assert.deepEqual(result, { ok: true, bytes: 14, files: 1 })
         assert.equal(readFileSync(join(remoteRoot, 'in', 'hello.txt'), 'utf8'), 'hello ssh_scp\n', 'content and parent directory arrived')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+
+
+    await testAsync('remote-controlled entry names that could escape a transfer are refused', async () => {
+      const { assertEntryName } = await import(libUrl('ssh-shell', 'scp.js'))
+      const backslash = String.fromCharCode(92)
+      for (const name of ['..', '.', '', 'a/b', 'a' + backslash + 'b'])
+        assert.throws(() => assertEntryName(name), /unsafe entry name/, JSON.stringify(name))
+      assert.doesNotThrow(() => assertEntryName('ordinary.txt'))
+    })
+
+    await testAsync('a local symlink/junction target is refused before its bytes are streamed', async () => {
+      const fixture = await startServer()
+      const { pool, runner } = runnerFor(fixture)
+      const outside = join(root, 'outside-local');
+      try {
+        fs.mkdirSync(outside, { recursive: true })
+        writeFileSync(join(outside, 'secret.txt'), 'must not travel')
+        const link = join(localRoot, 'escape-link')
+        try { fs.symlinkSync(outside, link, process.platform === 'win32' ? 'junction' : 'dir') }
+        catch (error) {
+          if (['EPERM', 'EACCES', 'ENOTSUP'].includes(error.code)) return // platform without symlink permission
+          throw error
+        }
+        const result = await runner.upload({ host: hostEntry(fixture.port), localPath: link, remotePath: '/escape', recursive: true, timeoutMs: 5000, workspaceRoot: localRoot })
+        assert.equal(result.ok, false, JSON.stringify(result))
+        assert.equal(result.error.phase, 'sandbox')
+        assert.match(result.error.message, /symbolic link or junction/)
+        assert.equal(fs.existsSync(join(remoteRoot, 'escape', 'secret.txt')), false, 'nothing escaped')
       } finally { pool.dispose(); await fixture.close() }
     })
 
@@ -5750,6 +5834,17 @@ console.log('\n[A] unit: ssh_scp transfers over SFTP (files, trees, timeout, err
         const agent = fakeAgent(session)
         const local = join(localRoot, 'gate-denied.txt')
         writeFileSync(local, 'x')
+        // A malformed remotePath is a pure-argument refusal: it must NOT spend the
+        // human's approval prompt before saying what is wrong.
+        const malformed = await tools[0].execute(
+          { action: 'upload', localPath: local, remotePath: 'relative/x.txt', timeoutMs: 5000 },
+          { agent, callId: 'call-scp-bad', signal: new AbortController().signal },
+        )
+        assert.equal(malformed.ok, false)
+        assert.equal(malformed.error.phase, 'config')
+        assert.match(malformed.error.message, /must be absolute on the remote host/)
+        assert.equal(approval.calls.length, 0, 'argument validation precedes the gate')
+        assert.equal(fixture.state.connections, 0)
         const value = await tools[0].execute(
           { action: 'upload', localPath: local, remotePath: '/gate-denied.txt', timeoutMs: 5000 },
           { agent, callId: 'call-scp', signal: new AbortController().signal },
@@ -9975,7 +10070,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
   test('the collapsed host summary is the connection target, never alias@host; alias and default are separate tokens', () => {
     const row = (over = {}) => {
       const value = blankHostRow()
-      Object.assign(value, { alias: 'prod', host: '203.0.113.10', user: 'ubuntu', keyPath: 'k' }, over)
+      Object.assign(value, { alias: 'prod', host: '203.0.113.10', user: 'me', keyPath: 'k' }, over)
       return value
     }
     const render = (value, extra = {}) => {
@@ -9985,13 +10080,13 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     const role = (nodes, name) => nodes.find((node) => node.props?.['data-role'] === name)
     const textOf = (node) => String(node?.children?.[0] ?? '')
     let nodes = render(row({ default: true }))
-    assert.equal(textOf(role(nodes, 'target')), 'ubuntu@203.0.113.10:22')
+    assert.equal(textOf(role(nodes, 'target')), 'me@203.0.113.10:22')
     assert.equal(textOf(role(nodes, 'alias')), 'prod', 'the alias is its own chip')
     assert.equal(textOf(role(nodes, 'default')), 'Default', 'the default row carries the badge')
     assert.doesNotMatch(textOf(role(nodes, 'target')), /prod@/, 'alias must never read as the login user')
     // Explicit port wins over 22.
     nodes = render(row({ port: '2222' }))
-    assert.equal(textOf(role(nodes, 'target')), 'ubuntu@203.0.113.10:2222')
+    assert.equal(textOf(role(nodes, 'target')), 'me@203.0.113.10:2222')
     assert.equal(role(nodes, 'default'), undefined, 'a non-default row has no badge')
     // Blank user: host:port.
     nodes = render(row({ user: '' }))
