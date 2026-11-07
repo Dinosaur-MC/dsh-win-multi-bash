@@ -24,6 +24,7 @@ DeepSeek Harness 的 Windows 多 bash 插件。**`git_bash`**（Git for Windows 
 | `msys2_bash` | MSYS2 UCRT64 | **按需开启**；持有 `Msys2BashExecutor`；MSYS2 自己的 `$MSYSTEM` 与 `pacman` |
 | `ssh_shell` | 远端（SSH） | **按需开启**；持有 `SshShellExecutor`；每主机一条池化连接，每次调用一条通道 |
 | `ssh_scp` | 远端（SSH） | **随 `ssh_shell` 按需开启**；同一执行器与池化连接上的 SFTP 文件/目录传输；仅前台 |
+| `ssh_hosts` | 远端（SSH） | **随 `ssh_shell` 按需开启**；只读的净化主机清单；不连接、不审批 |
 | `terminal` | 以上任意后端 | 持久 PTY 会话：`open` / `send` / `read` / `signal` / `close` / `list` |
 | `pwsh` | dsh 自带 | 不受影响；由基座的 `pwsh-sandbox` 行提供 |
 
@@ -31,7 +32,7 @@ DeepSeek Harness 的 Windows 多 bash 插件。**`git_bash`**（Git for Windows 
 
 ## 环境要求
 
-- dsh `0.1.7-rc.2` 到 `0.2.x` —— `package.json` 的 `engines.dsh` 声明的就是这个窗口。更新的 dsh 会拒绝本插件。
+- dsh `0.1.7-rc.2` 到 `0.2.x`（`engines.dsh` 窗口）。
 - Windows，以及一个提供已发布 `@deepseek-ai` 基础包的 dsh 部署。
 - Git Bash / WSL / MSYS2 只在启用对应后端时需要；缺后端不会影响 pwsh。
 - `ssh_shell` / `ssh_scp` 需要 `sshShell.hosts` 下主机的仅密钥访问，且主机密钥已在 `known_hosts` 中。
@@ -53,10 +54,11 @@ dsh plugin --profile web remove dsh-win-multi-bash                 # 卸载
 
 - **`git_bash`** 装好即可用。每次调用启动一个全新的 MSYS bash；`workdir` 接受原生、MSYS（`/c/...`）与 WSL automount（`/mnt/c/...`）三种写法。
 - **`wsl_bash` / `msys2_bash`**：在插件页启用 `win-mb-tool-wsl` / `win-mb-tool-msys2`。只有自动探测不够时才需要 pin `wslBash.wslDistro` 或 `msys2Bash.bashPath`。
-- **`ssh_shell`**：启用 `win-mb-tool-ssh`，在 `sshShell.hosts` 下添加主机（`alias`、`host`、`user`、`keyPath`；需要时再加 `port` / `startupCommand` / `default`）。调用时指定别名（只有一台主机标 `default` 时才可以省略）；没有主机的行会拒绝每一次调用。仅密钥认证、严格主机密钥——迁移说明见[配置](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/configuration.md)。主机默认 `approval: session`：每会话一次、经专用卡片提问；`trusted` 永不提问。主机在配置页的**主机表**中编辑——每台一张卡，最多一台默认。每行有**测试连接**：用该行当前（未保存）的值拨号，校验主机密钥并完成密钥认证（不执行远端命令），行内显示指纹或失败阶段；保存仍需显式点击。
-- **`ssh_scp`**：同一行也做传输——`action: "upload" | "download"`、`localPath`（除非 `danger-full-access`，否则必须在工作区内；校验是词法的，不会解引用工作区内的符号链接）、`remotePath`（绝对 POSIX；Windows OpenSSH 用 `/C:/...`）、`recursive` 传目录树、`timeoutMs`（默认 5 分钟）。仅前台；结果为 `{ ok, bytes, files?, error? }` 外加 `sandbox` 事实（允许外部路径时含 `outsideWorkspace`），失败是带 phase 与别名的结果值。
+- **`ssh_shell`**：启用 `win-mb-tool-ssh`，在 `sshShell.hosts` 添加主机（`alias`、`host`、`user`、`keyPath`；可选 `port` / `startupCommand` / `default`）。调用指定别名，只有一台 `default` 时可省略；仅密钥认证、严格主机密钥，主机默认 `approval: session`（每会话一次，`trusted` 永不提问），在配置页主机表中编辑——详见[配置](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/configuration.md)。
+- **`ssh_scp`**：同一行做传输——`action`（`upload`/`download`）、`localPath`（除非 `danger-full-access` 否则须在工作区内，词法校验）、`remotePath`（POSIX `/...`、Windows 盘符 `C:\...`/`C:/...` 归一为 `/C:/...`，或 UNC）、`recursive`、`timeoutMs`（默认 5 分钟）。仅前台；结果是带 `sandbox` 事实的值，失败带 phase 与别名。
+- **`ssh_hosts`**：只读主机清单——`query`、`approval`（`session`/`trusted`）、`defaultOnly`；返回 `hasStartupCommand`/`hasShellTemplate` 等净化事实，绝不返回凭据。不连接、不审批；空注册表是成功的空列表。
 - **`terminal`**：`open` 开会话，`send`（`submit: true`）发命令，`read` 读回复，`close` 结束。工作目录、导出的变量与别名会跨调用保留。会话是进程内的、有上限、空闲会被回收，且**不是**后台任务；Session 头部面板会列出并停止它们。
-- 每行在插件页都有**配置**入口：路径、超时、沙箱立场、会话上限，以及部署级的自愈开关。除非某个旋钮决定工具 schema，改动都是即时的。
+- 每行在插件页都有**配置**入口；除非旋钮决定工具 schema，改动即时生效。
 
 ## 设计概览
 
