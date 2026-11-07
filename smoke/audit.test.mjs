@@ -3481,7 +3481,7 @@ console.log('\n[A] unit: the ssh_shell remote script builder (POSIX, base64 payl
   // place that decides the script's shape, which is why its exact bytes are pinned:
   // a missing trailing newline silently changes the last command, and a workdir
   // that is not single-quote escaped is a shell injection.
-  const { buildScript, quoteShell, explainFailure, channelInvocation, STARTUP_FAILED_MARKER } = await import(libUrl('ssh-shell', 'script.js'))
+  const { buildScript, quoteShell, explainFailure, channelInvocation, classifyShellFamily, buildCmdPassthrough, buildPassthroughCommand, STARTUP_FAILED_MARKER } = await import(libUrl('ssh-shell', 'script.js'))
 
   test('a plain command becomes the script itself, newline-terminated', () => {
     const built = buildScript({ command: 'uname -a' })
@@ -3607,6 +3607,75 @@ console.log('\n[A] unit: the ssh_shell remote script builder (POSIX, base64 payl
     assert.equal(wrapped.command, `bash -c 'eval "$(base64 -d)"'`)
     assert.equal(wrapped.stdin, built.payload)
     assert.equal(Buffer.from(wrapped.stdin, 'base64').toString('utf8'), built.script)
+  })
+  test('shell-family classification and cmd passthrough join parts with &&, not LF', () => {
+    assert.equal(classifyShellFamily('__DSH_SHELL__C:\\Windows\\system32\\cmd.exe\n'), 'cmd')
+    assert.equal(classifyShellFamily('__DSH_SHELL__%COMSPEC%__\n'), 'posix')
+    assert.equal(classifyShellFamily('C:\\Windows\\cmd.exe\n'), 'posix', 'only the marker form counts')
+    const joined = buildCmdPassthrough({
+      startupCommand: 'echo A\necho B',
+      workdir: 'D:\\Program Files\\tool dir',
+      command: 'echo C\necho D',
+    })
+    assert.doesNotMatch(joined, /\n/, 'cmd gets one physical line')
+    assert.match(joined, /^chcp 65001>nul && /)
+    assert.match(joined, /echo A && echo B/)
+    assert.match(joined, /cd \/d "D:\\Program Files\\tool dir"/)
+    assert.match(joined, /echo C && echo D/)
+    // A cmd-like fixture: it stops at the first LF and honours &&. The LF script
+    // would only execute its first line; the joined line reaches every part.
+    const runCmdLike = (line) => {
+      const first = line.split('\n')[0]
+      const out = []
+      for (const part of first.split(' && ')) {
+        if (part.startsWith('echo ')) out.push(part.slice(5))
+        else if (part.startsWith('cd /d ')) out.push('CD ' + part.slice(6).replace(/"/g, ''))
+        else if (part !== 'chcp 65001>nul') out.push('CMD ' + part)
+      }
+      return out
+    }
+    assert.match(joined, /cd \/d "D:\\Program Files\\tool dir"/)
+    const simple = buildCmdPassthrough({ startupCommand: 'echo A\necho B', command: 'echo C\necho D' })
+    assert.deepEqual(runCmdLike(simple), ['A', 'B', 'C', 'D'], 'the joined line reaches every part')
+    const lfScript = buildScript({ startupCommand: 'echo A\necho B', workdir: 'D:\\Program Files\\tool dir', command: 'echo C\necho D' }).script
+    assert.deepEqual(runCmdLike(lfScript), ['CMD { echo A'], 'the LF form runs only its first line under cmd')
+    // Posix passthrough is byte-identical to buildScript; cmd replaces cd with /d.
+    const built = buildScript({ startupCommand: 'echo A', workdir: '/srv/app', command: 'echo C' })
+    assert.equal(buildPassthroughCommand({ family: 'posix', startupCommand: 'echo A', workdir: '/srv/app', command: 'echo C', built }), built.script)
+    assert.match(buildCmdPassthrough({ startupCommand: '', workdir: 'C:\\x', command: 'dir' }), /cd \/d "C:\\x" && dir$/)
+  })
+
+  test('the cmd-family probe is cached per client, re-probes after replacement, and falls back to posix', async () => {
+    const { SshShellExecutor } = await import(libUrl('ssh-shell', 'index.js'))
+    const executor = Object.create(SshShellExecutor.prototype)
+    const probeClient = (output) => {
+      let calls = 0
+      const client = {
+        get calls() { return calls },
+        exec(_command, callback) {
+          calls += 1
+          const listeners = {}
+          const stream = {
+            on(event, handler) { (listeners[event] ??= []).push(handler) },
+            stderr: { on() {} },
+            end() { queueMicrotask(() => { for (const handler of listeners.data ?? []) handler(output); for (const handler of listeners.close ?? []) handler() }) },
+            close() {},
+          }
+          callback(null, stream)
+        },
+      }
+      return client
+    }
+    const host = { alias: 'probe-host' }
+    const cmdClient = probeClient('__DSH_SHELL__C:\\Windows\\system32\\cmd.exe\n')
+    assert.equal(await executor.shellFamilyFor(cmdClient, host), 'cmd')
+    assert.equal(await executor.shellFamilyFor(cmdClient, host), 'cmd')
+    assert.equal(cmdClient.calls, 1, 'one probe per connection')
+    const posixClient = probeClient('__DSH_SHELL__%COMSPEC%__\n')
+    assert.equal(await executor.shellFamilyFor(posixClient, host), 'posix', 'a replacement connection re-probes')
+    assert.equal(posixClient.calls, 1)
+    const broken = { exec(_command, callback) { callback(new Error('probe failed')) } }
+    assert.equal(await executor.shellFamilyFor(broken, { alias: 'broken' }), 'posix', 'a probe failure is posix, never an error')
   })
   test('the payload is base64 of the script, UTF-8 safe and round-tripping', () => {
     const command = "printf '%s\\n' 'héllo wörld'; echo \"quoted\";\nls -l"
@@ -3892,7 +3961,9 @@ console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (
   }
   const entryFor = (port, over = {}) => ({
     alias: 'exec', host: '127.0.0.1', port, user: 'tester', keyPath,
-    shellTemplate: DEFAULT_SHELL_TEMPLATE, connectTimeoutMs: 5000,
+    // The fixture's default is the explicit wrapper, so existing channel cases do not
+    // pay the passthrough family probe; passthrough cases override this to undefined.
+    shellTemplate: `bash -c 'eval "$(base64 -d)"'`, connectTimeoutMs: 5000,
     acceptNewHostKeys: false, approval: 'trusted', default: true,
     ...over,
   })
@@ -3933,7 +4004,7 @@ console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (
             if (holdExec) return
             const stream = acceptExec()
             commands.push(info.command)
-            handler(stream)
+            handler(stream, info)
           })
         })
       })
@@ -4032,12 +4103,34 @@ console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (
         assert.equal(typeof result.timeoutMs, 'number')
         assert.ok(result.durationMs >= 0, 'a duration is reported')
         assert.deepEqual(Object.keys(result.stdout).sort(), ['text', 'truncated'])
-        // The host's template is blank, so the built script IS the channel command
-        // line: no wrapper, no base64, no hidden shell hop.
-        assert.deepEqual(fixture.commands, ['exit 7\n'])
+        // The fixture host carries the explicit wrapper, so the channel line is the
+        // template and the script travels on stdin.
+        assert.deepEqual(fixture.commands, [`bash -c 'eval "$(base64 -d)"'`])
       } finally { pool.dispose(); await fixture.close() }
     })
 
+    await testAsync('blank-template passthrough probes once per connection and sends the script text as the command', async () => {
+      const fixture = await startServer((stream, info) => {
+        if (info.command.includes('__DSH_SHELL__')) {
+          stream.write('__DSH_SHELL__%COMSPEC%__\n')
+          stream.exit(0)
+          stream.end()
+          return
+        }
+        stream.write('passthrough-out\n')
+        stream.exit(0)
+        stream.end()
+      })
+      const { executor, pool } = await executorFor(fixture, { host: { shellTemplate: undefined } })
+      try {
+        const first = await (await executor.execute({ command: 'echo hi', timeoutMs: 5000 })).result()
+        assert.equal(first.stdout.text, 'passthrough-out\n')
+        assert.equal(fixture.commands[0], 'echo __DSH_SHELL__%COMSPEC%__', 'one probe runs first')
+        assert.equal(fixture.commands[1], 'echo hi\n', 'the script text is the channel command')
+        await (await executor.execute({ command: 'echo hi', timeoutMs: 5000 })).result()
+        assert.deepEqual(fixture.commands, ['echo __DSH_SHELL__%COMSPEC%__', 'echo hi\n', 'echo hi\n'], 'the probe is cached per connection')
+      } finally { pool.dispose(); await fixture.close() }
+    })
     await testAsync('the result carries the sandbox remote fact through the real handle', async () => {
       const fixture = await startServer((stream) => {
         stream.write('ok\n')
@@ -9941,9 +10034,9 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.doesNotMatch(control('shellTemplate').props.placeholder, /^bash -c 'eval/, 'the bare default is no longer presented as the default')
     assert.match(en['hosts.field.startupCommand.hint'], /spaces\/newlines kept verbatim/)
     assert.match(zh['hosts.field.startupCommand.hint'], /原样保留/)
-    assert.match(en['hosts.field.shellTemplate.hint'], /directly in the remote login shell/)
+    assert.match(en['hosts.field.shellTemplate.hint'], /directly in the login shell/)
     assert.match(en['hosts.field.shellTemplate.hint'], /base64/)
-    assert.match(en['hosts.field.shellTemplate.hint'], /WSL/)
+    assert.match(en['hosts.field.shellTemplate.hint'], /cmd uses && and cd \/d/)
   })
   test('the ssh page puts the host table first, then the remote-only sandbox knob', () => {
     const row = ROWS.find((entry) => entry.rowId === 'win-mb-tool-ssh')
