@@ -122,14 +122,14 @@ The group closes on its **own line** on purpose: a one-line `{ …; }` cannot ho
 
 ## File transfer (`ssh_scp`)
 
-`ssh_scp` is the second tool on the same ssh row. It reads the same `sshShell.hosts` registry, verifies the same `known_hosts`, and reuses the row's pooled connection, so a command and a transfer cost one TCP connection per host. It is **foreground only** — no `run_in_background`, no promotion, no job — and its own deadline bounds one operation (default `300000` ms, five minutes).
+`ssh_scp` is the transfer tool on the same ssh row (one of its two extra tools). It reads the same `sshShell.hosts` registry, verifies the same `known_hosts`, and reuses the row's pooled connection, so a command and a transfer cost one TCP connection per host. It is **foreground only** — no `run_in_background`, no promotion, no job — and its own deadline bounds one operation (default `300000` ms, five minutes).
 
 | Parameter | Required | Meaning |
 | --- | --- | --- |
 | `action` | yes | `upload` sends `localPath` to `remotePath`; `download` brings `remotePath` to `localPath`. |
 | `alias` | per the registry | The host, by the same rule as `ssh_shell`: named, or omitted only when exactly one host is `default`. |
 | `localPath` | yes | The path on **this** machine. A relative path resolves against the session's working directory and the resolved path must stay inside the workspace root. The check is **lexical** — no `realpath`, no TOCTOU protection — so a symlink or junction inside the workspace that points outside it is followed by the file stream even though its path looked contained; treat the rule as a path check, not an OS confinement. `danger-full-access` is the only mode that allows an outside path, and the result then carries `outsideWorkspace: true`. A denied path is refused with the family's standard sandbox sentence — never silently clamped to the root. |
-| `remotePath` | yes | An absolute POSIX path on the host. On a Windows OpenSSH host use the `/C:/Users/...` drive form; a local `C:\...` path or a relative path is refused before anything is dialled. |
+| `remotePath` | yes | An absolute path on the remote host: POSIX `/...`, a Windows drive path (`C:\...` or `C:/...`, normalized to `/C:/...` with the drive letter upper-cased), or UNC `\\server\share` (passed through unchanged). A relative path is refused before anything is dialled. |
 | `recursive` | no | `false` by default. `true` walks a directory tree, preserves empty directories and creates the missing parents on the receiving side; a directory without it is a named error instead of an empty result. |
 | `timeoutMs` | no | Per-operation deadline in milliseconds; default `300000`. Expiry destroys the transfer streams, closes the SFTP session and reports a timeout — it never hangs. |
 
@@ -222,7 +222,7 @@ Then update the calls — `ssh_shell` with `alias: "ubuntu"` and its `command`, 
 
 Authentication is key-only: a password prompt or a live ssh-agent is not available to `ssh_shell`, and an encrypted key needs `passphraseEnv`. Host keys are strict — add each host to `known_hosts` first, or set `acceptNewHostKeys: true` on that host to accept an unknown key once with a warning. `acceptNewHostKeys` accepts an UNKNOWN key (no covering entry) once with a warning; it never bypasses a changed key, and a missing `known_hosts` file is reported as a host-key failure because there is nothing to verify against. `@cert-authority` entries are not honoured in 0.8.0.
 
-The row also gains a second tool, `ssh_scp` (see [File transfer](#file-transfer-ssh_scp)). It is not a rename: there is no old name to migrate, it reads the same `sshShell.hosts` and reuses the same connection, its local side is sandboxed as described there, its remote paths use the POSIX form (`/C:/...` on a Windows OpenSSH host), and its `approval` semantics are `ssh_shell`'s (session-memory grants, see [Host authorization](#host-authorization)).
+The row also gains a second tool, `ssh_scp` (see [File transfer](#file-transfer-ssh_scp)). It is not a rename: there is no old name to migrate, it reads the same `sshShell.hosts` and reuses the same connection, its local side is sandboxed as described there, its remote paths accept POSIX, a Windows drive form (normalized to `/C:/...`) or UNC, and its `approval` semantics are `ssh_shell`'s (session-memory grants, see [Host authorization](#host-authorization)).
 
 ## Known limitations (0.8.0)
 

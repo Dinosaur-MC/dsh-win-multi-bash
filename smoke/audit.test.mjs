@@ -2975,14 +2975,12 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
           assert.equal(typeof unknown.value?.sandbox?.mode, 'string', 'the remote fact rides on failures too')
           assert.equal(unknown.value?.sandbox?.remote, true)
 
-          // 2. A Windows drive path for remotePath is a config refusal, before any dial.
-          const drive = await scpCall(ctx, { action: 'upload', localPath: 'a.txt', remotePath: 'C:' + BS + 'Users' + BS + 'x.txt' })
-          assert.equal(drive.isError, false)
-          assert.equal(drive.value?.error?.phase, 'config')
-          assert.match(drive.value?.error?.message, /is a local Windows path/)
+          // 2. A relative remotePath is a config refusal, before any dial. Drive and
+          // UNC forms are accepted (and normalized by the executor's path helper).
           const relative = await scpCall(ctx, { action: 'upload', localPath: 'a.txt', remotePath: 'relative/x.txt' })
+          assert.equal(relative.isError, false)
           assert.equal(relative.value?.error?.phase, 'config')
-          assert.match(relative.value?.error?.message, /is relative/)
+          assert.match(relative.value?.error?.message, /must be absolute on the remote host/)
 
           // 3. A local path outside the session workspace is a sandbox refusal.
           const outside = await scpCall(ctx, { action: 'upload', localPath: winPath('C:', 'definitely-outside', 'x.txt'), remotePath: '/tmp/x.txt' })
@@ -4852,13 +4850,17 @@ if (process.platform !== 'win32') {
       assert.equal(stillInside.outsideWorkspace, false, 'inside stays inside under full access')
     })
 
-    test('a remote path must be an absolute POSIX path (the /C:/ form IS allowed)', () => {
+    test('a remote path accepts POSIX, Windows drive and UNC absolute forms and normalizes them', () => {
       assert.equal(assertRemotePath('/home/me/x.txt'), '/home/me/x.txt')
-      assert.equal(assertRemotePath('/C:/Users/me/x.txt'), '/C:/Users/me/x.txt', 'the Windows OpenSSH drive form is POSIX-absolute')
-      assert.throws(() => assertRemotePath('C:' + BS + 'Users' + BS + 'x.txt'), /is a local Windows path/)
-      assert.throws(() => assertRemotePath('relative/x.txt'), /is relative/)
-      assert.throws(() => assertRemotePath(''), /must be a non-empty absolute POSIX path/)
-      assert.throws(() => assertRemotePath('a' + BS + 'b'), /is a local Windows path/)
+      assert.equal(assertRemotePath('/C:/Users/me/x.txt'), '/C:/Users/me/x.txt', 'the /C:/ form is already normalized')
+      assert.equal(assertRemotePath('C:' + BS + 'Users' + BS + 'x.txt'), '/C:/Users/x.txt')
+      assert.equal(assertRemotePath('C:/Users/x.txt'), '/C:/Users/x.txt')
+      assert.equal(assertRemotePath('c:/users/x.txt'), '/C:/users/x.txt', 'the drive letter is upper-cased')
+      const unc = BS + BS + 'server' + BS + 'share' + BS + 'x.txt'
+      assert.equal(assertRemotePath(unc), unc, 'UNC is passed through unchanged')
+      assert.throws(() => assertRemotePath('relative/x.txt'), /must be absolute on the remote host/)
+      assert.throws(() => assertRemotePath(''), /must be absolute on the remote host/)
+      assert.throws(() => assertRemotePath('a' + BS + 'b'), /must be absolute on the remote host/)
     })
 
     test('a blank localPath is a named argument error, and a rootless session fails closed', () => {
