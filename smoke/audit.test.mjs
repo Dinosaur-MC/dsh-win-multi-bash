@@ -2428,7 +2428,7 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     // facts have to say so, or the model reads "ssh <host> <command>" as a subprocess.
     assert.match(description, /pooled SSH connection/)
     assert.doesNotMatch(description, /ssh <host> <command>/, 'this row no longer spawns ssh.exe')
-    assert.match(description, /remote host's own POSIX paths/)
+    assert.match(description, /remote host's own paths/)
     assert.match(description, /workdir` is a directory ON THAT HOST/)
     assert.match(description, /read on the remote host/)
     assert.match(description, /TERM, then KILL/, 'a cancelled call signals the remote process')
@@ -2679,8 +2679,11 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
     assert.equal(none.workdir, '', 'no workdir means the host login directory, reported as empty')
     assert.equal('remoteWorkdir' in none, false)
     assert.equal(none.alias, undefined)
-    assert.throws(() => executor.resolve({ command: 'pwd', remoteWorkdir: 'C:' + BS + 'ws' }), /local Windows path/)
-    assert.throws(() => executor.resolve({ command: 'pwd', remoteWorkdir: 'rel/x' }), /must be absolute/)
+    const win = executor.resolve({ command: 'pwd', remoteWorkdir: 'C:' + BS + 'ws' })
+    assert.equal(win.remoteWorkdir, 'C:' + BS + 'ws', 'a Windows absolute workdir is legal; the family chooses cd')
+    assert.equal(executor.resolve({ command: 'pwd', remoteWorkdir: 'C:/ws' }).workdir, 'C:/ws', 'forward-slash drive form is also absolute')
+    assert.equal(executor.resolve({ command: 'pwd', remoteWorkdir: '\\' + BS + 'server\\share' }).workdir, '\\' + BS + 'server\\share', 'UNC is absolute')
+    assert.throws(() => executor.resolve({ command: 'pwd', remoteWorkdir: 'rel/x' }), /must be an absolute path on the remote host \(POSIX \/\.\.\. or Windows X:\\\.\.\.\)/)
     assert.equal(executor.resolve({ command: 'pwd', remoteWorkdir: '   ' }).workdir, '', 'blank is absent, not a cd')
   })
 
@@ -3642,6 +3645,9 @@ console.log('\n[A] unit: the ssh_shell remote script builder (POSIX, base64 payl
     // Posix passthrough is byte-identical to buildScript; cmd replaces cd with /d.
     const built = buildScript({ startupCommand: 'echo A', workdir: '/srv/app', command: 'echo C' })
     assert.equal(buildPassthroughCommand({ family: 'posix', startupCommand: 'echo A', workdir: '/srv/app', command: 'echo C', built }), built.script)
+    // A POSIX host is not refused locally for a Windows path; its shell reports the error.
+    const winBuilt = buildScript({ workdir: 'C:\\Users\\me', command: 'pwd' })
+    assert.match(buildPassthroughCommand({ family: 'posix', workdir: 'C:\\Users\\me', command: 'pwd', built: winBuilt }), /cd -- 'C:\\Users\\me'/)
     assert.match(buildCmdPassthrough({ startupCommand: '', workdir: 'C:\\x', command: 'dir' }), /cd \/d "C:\\x" && dir$/)
   })
 
@@ -4129,6 +4135,26 @@ console.log('\n[A] unit: the ssh_shell exec channel (exit, isolation, timeout) (
         assert.equal(fixture.commands[1], 'echo hi\n', 'the script text is the channel command')
         await (await executor.execute({ command: 'echo hi', timeoutMs: 5000 })).result()
         assert.deepEqual(fixture.commands, ['echo __DSH_SHELL__%COMSPEC%__', 'echo hi\n', 'echo hi\n'], 'the probe is cached per connection')
+      } finally { pool.dispose(); await fixture.close() }
+    })
+    await testAsync('a cmd login shell accepts a Windows workdir and emits cd /d', async () => {
+      const fixture = await startServer((stream, info) => {
+        if (info.command.includes('__DSH_SHELL__')) {
+          stream.write('__DSH_SHELL__C:\\Windows\\system32\\cmd.exe\n')
+          stream.exit(0)
+          stream.end()
+          return
+        }
+        stream.write('ok\n')
+        stream.exit(0)
+        stream.end()
+      })
+      const { executor, pool } = await executorFor(fixture, { host: { shellTemplate: undefined } })
+      try {
+        const spec = executor.resolve({ command: 'echo hi', remoteWorkdir: 'C:\\Users\\me', timeoutMs: 5000 })
+        await (await executor.execute(spec)).result()
+        assert.equal(fixture.commands[0], 'echo __DSH_SHELL__%COMSPEC%__')
+        assert.equal(fixture.commands[1], 'chcp 65001>nul && cd /d "C:\\Users\\me" && echo hi')
       } finally { pool.dispose(); await fixture.close() }
     })
     await testAsync('the result carries the sandbox remote fact through the real handle', async () => {
@@ -10036,7 +10062,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.match(zh['hosts.field.startupCommand.hint'], /原样保留/)
     assert.match(en['hosts.field.shellTemplate.hint'], /directly in the login shell/)
     assert.match(en['hosts.field.shellTemplate.hint'], /base64/)
-    assert.match(en['hosts.field.shellTemplate.hint'], /cmd uses && and cd \/d/)
+    assert.match(en['hosts.field.shellTemplate.hint'], /cmd: &&, cd \/d/)
   })
   test('the ssh page puts the host table first, then the remote-only sandbox knob', () => {
     const row = ROWS.find((entry) => entry.rowId === 'win-mb-tool-ssh')
