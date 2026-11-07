@@ -278,7 +278,10 @@ timeoutMs?). Foreground only: transfers are not registered as jobs.
   allowed and the result says so. A refused path uses the plugin's standard
   sandbox sentence.
 - Remote path: absolute POSIX path. SFTP on Windows OpenSSH expects the /C:/...
-  drive form; the tool description states this.
+  drive form; the tool description states this. **Later change (2026-11-07):**
+  the accepted forms are POSIX `/...`, a Windows drive path (`C:\...` or
+  `C:/...`, normalized to `/C:/...`) or UNC `\\server\share`; a relative path
+  is still refused.
 - Upload creates remote parent directories; download creates local parent
   directories. recursive walks directories.
 - Default timeout 5 min per operation; the timeout aborts the SFTP stream and
@@ -398,7 +401,7 @@ Unit tests (no network):
 Integration tests (deterministic, in-process): an ssh2.Server fixture with a
 generated host key serves exec and SFTP; the pool connects to it, so channel,
 job, timeout and scp paths run without a real network. A live-host smoke test
-(me) stays manual.
+(prod) stays manual.
 
 Audit updates: field tables (client vs host config), patch rows, exports, tool
 names, terminal enum, and the generated client registry all change and must be

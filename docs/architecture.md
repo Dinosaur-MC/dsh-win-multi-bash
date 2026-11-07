@@ -68,7 +68,7 @@ The four executors own their argv:
 - result rendering: exit/signal markers, sandbox markers, spill previews, promoted reads, the `(no output)` body;
 - the fallback description when the core row is absent (the shared guidance moves into each tool description).
 
-A dialect may also contribute **extra tools** from its one executor (`extraTools`): the ssh row registers `ssh_scp` this way, so the transfer shares the row's Config, host registry and connection pool instead of building a second engine.
+A dialect may also contribute **extra tools** from its one executor (`extraTools`): the ssh row registers `ssh_scp` and `ssh_hosts` this way, so the transfer and the read-only inventory share the row's Config, host registry and connection pool instead of building a second engine.
 
 ## The prompt section
 
@@ -126,7 +126,7 @@ The SSH dialect keeps the family's tool contract but replaces the local spawn wi
 
 ### Transfers (`ssh_scp`)
 
-The same row, executor, host registry, known_hosts check and connection pool serve a second tool, `ssh_scp` (`lib/ssh-shell/scp-tool.js` over `scp.js`). `defineShellTool` accepts an `extraTools` list for exactly this: a dialect registers additional tools against the ONE executor, so the transfer adds no row, no config partition and no second pool.
+The same row, executor, host registry, known_hosts check and connection pool serve two extra tools beyond `ssh_shell`: `ssh_scp` (`lib/ssh-shell/scp-tool.js` over `scp.js`) and `ssh_hosts` (`lib/ssh-shell/hosts-tool.js`) — a read-only inventory that opens no connection and is not gated by the host authorization. `defineShellTool` accepts an `extraTools` list for exactly this: a dialect registers additional tools against the ONE executor, so the transfer adds no row, no config partition and no second pool.
 
 - **One SFTP session per operation** on a leased pooled client. A successful or failed operation closes its session before it returns, and a cancellation tears the live streams down, ends a session that exists, hands the lease back and retires exactly that client — including a session that arrives after the caller already got its answer. The one path that cannot run the operation's `finally` is a subsystem or OPEN request the server never answers: the client is closed with its last lease, which rejects the parked request, and a late session is closed when it finally arrives.
 - **Foreground only.** No `run_in_background`, no promotion, no job: its own deadline (default 300 s) races the **whole** operation — the pool dial, the SFTP subsystem request and the transfer — because each of those awaits can park forever on a server that never answers.
@@ -139,7 +139,7 @@ The same row, executor, host registry, known_hosts check and connection pool ser
 
 Git Bash rewrites leading-slash POSIX paths into Windows paths whenever a native Windows program is called. That is MSYS behavior, not a plugin defect: `wsl.exe -e ls /root` inside `git_bash` becomes `...\Git\root`. Prefix the call with `MSYS_NO_PATHCONV=1` (or `MSYS2_ARG_CONV_EXCL="*"`) to pass arguments verbatim; for WSL work, prefer `wsl_bash`, which ships the command as a base64 payload.
 
-`workdir` accepts native, MSYS (`/c/...`) and WSL automount (`/mnt/c/...`) forms. The resolver translates a single-letter drive form and the automount form to native before `spawn`; MSYS POSIX roots (`/etc`, `/usr`, `/tmp`) and distro-side paths such as `/mnt/data` are left alone, and a relative `workdir` resolves against the session workspace. None of this applies to `ssh_shell`: its `workdir` is an absolute POSIX path on the remote host, taken verbatim (never resolved against the local session) and refused by name when it is a Windows or relative path. The conversation card's prompt cwd applies the same resolution plus `.`/`..` normalization, so a `workdir: "lib/.."` displays the actual directory, not `..`.
+`workdir` accepts native, MSYS (`/c/...`) and WSL automount (`/mnt/c/...`) forms. The resolver translates a single-letter drive form and the automount form to native before `spawn`; MSYS POSIX roots (`/etc`, `/usr`, `/tmp`) and distro-side paths such as `/mnt/data` are left alone, and a relative `workdir` resolves against the session workspace. None of this applies to `ssh_shell`: its `workdir` is an absolute path on the remote host, taken verbatim (never resolved against the local session) — POSIX `/...` and Windows drive `X:\...` / `X:/...` both work; a relative path is refused locally, and a UNC `\\server\share...` is accepted for `ssh_scp`'s `remotePath` but refused as a `workdir` on a cmd host (cmd cannot `cd /d` into UNC; use `pushd` in the command). The conversation card's prompt cwd applies the same resolution plus `.`/`..` normalization, so a `workdir: "lib/.."` displays the actual directory, not `..`.
 
 ## Package layout
 
@@ -149,8 +149,8 @@ lib/
 ├── bash-wsl/       WslBashExecutor (WSL, base64 payloads)
 ├── bash-msys2/     Msys2BashExecutor (MSYS2 UCRT64)
 ├── ssh-shell/      SshShellExecutor (pooled ssh2 channels) + ssh_scp (SFTP),
-│                   hosts, known_hosts, script builder, connection pool,
-│                   local-path policy and transfer runner
+│                   ssh_hosts (read-only inventory), hosts, known_hosts, script
+│                   builder, connection pool, local-path policy and transfer runner
 ├── tool-bash/      factory + one instance per dialect; registry, shell-family,
 │                   render, terminal, backend ownership
 ├── terminal-session.js   PTY registry: bounded output, readiness, reclamation
