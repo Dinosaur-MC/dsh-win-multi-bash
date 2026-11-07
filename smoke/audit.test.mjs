@@ -2952,12 +2952,16 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
           assert.match(definition.description, /blackhole/, 'the alias hint comes from the row registry')
           const output = definition.output?.schema?.properties ?? {}
           assert.deepEqual(Object.keys(output).sort(), ['bytes', 'error', 'files', 'ok', 'outsideWorkspace', 'sandbox'])
-          // Assert by NAME, not by a parameter proxy: a third ssh_* tool that did not
-          // serve the registry's alias would otherwise be invisible here.
+          // Assert by NAME, not by a parameter proxy: every extra ssh_* tool this row
+          // serves must show up here, including the read-only inventory.
           const sshToolNames = ctx.tools.schemas().map((tool) => tool.name).filter((name) => /^ssh_/.test(name)).sort()
-          assert.deepEqual(sshToolNames, ['ssh_scp', 'ssh_shell'], 'the host-registry row mounts exactly its two ssh_* tools')
-          // The row still serves exactly the shell tool and this one.
+          assert.deepEqual(sshToolNames, ['ssh_hosts', 'ssh_scp', 'ssh_shell'], 'the host-registry row mounts its shell, transfer and inventory tools')
+          // The row still serves the shell tool and the transfer; ssh_hosts reads the
+          // same registry and must not be approval-gated (no connection is opened).
           assert.ok(ctx.tools.get('ssh_shell') !== undefined)
+          const hostsDefinition = ctx.tools.get('ssh_hosts')
+          assert.deepEqual(Object.keys(hostsDefinition.parameters?.properties ?? {}).sort(), ['approval', 'defaultOnly', 'query'])
+          assert.equal(hostsDefinition.parameters.properties.approval.enum.includes('trusted'), true)
         }],
         ['ssh_scp answers every expected refusal as a STRUCTURED result (no raw throw)', async () => {
           // 1. Unknown alias: the §8.1 rule, reported as a config-phase result.
@@ -3092,6 +3096,50 @@ console.log('\n[A] unit: the ssh_shell host registry (validation, aliases, defau
     assert.equal(DEFAULT_SHELL_TEMPLATE, undefined)
   })
 
+  test('ssh_hosts inventories the registry read-only, filters in order and never exposes credentials', async () => {
+    const { inventoryHosts, createHostsTool } = await import(libUrl('ssh-shell', 'hosts-tool.js'))
+    const base = { approval: 'session', default: false, port: 22 }
+    const hosts = [
+      { ...base, alias: 'alpha', host: 'alpha.example', user: 'alice', keyPath: 'C:/keys/a', passphraseEnv: 'A_PASS', startupCommand: 'export A=1', shellTemplate: 'bash -c x', description: 'build box' },
+      { ...base, alias: 'beta', host: '10.0.0.2', user: 'bob', keyPath: 'C:/keys/b' },
+      { ...base, alias: 'gamma', host: 'gamma.example', user: 'carol', keyPath: 'C:/keys/c', approval: 'trusted', default: true },
+    ]
+    const all = inventoryHosts(hosts)
+    assert.deepEqual(all.hosts.map((host) => host.alias), ['alpha', 'beta', 'gamma'], 'configured order is preserved')
+    assert.equal(all.total, 3)
+    assert.equal(all.matched, 3)
+    assert.deepEqual(Object.keys(all.hosts[0]).sort(), ['alias', 'approval', 'default', 'description', 'hasShellTemplate', 'hasStartupCommand', 'host', 'port', 'user'])
+    assert.equal(all.hosts[0].hasStartupCommand, true)
+    assert.equal(all.hosts[0].hasShellTemplate, true)
+    assert.equal(all.hosts[1].hasStartupCommand, false)
+    assert.equal(all.hosts[1].hasShellTemplate, false)
+    for (const field of ['alpha', 'ALICE', 'build box', '10.0.0.2'])
+      assert.equal(inventoryHosts(hosts, { query: field }).matched, 1, 'query matches alias/user/description/host: ' + field)
+    assert.equal(inventoryHosts(hosts, { approval: 'trusted' }).hosts[0].alias, 'gamma')
+    assert.equal(inventoryHosts(hosts, { defaultOnly: true }).hosts[0].alias, 'gamma')
+    assert.equal(inventoryHosts(hosts, { query: 'no-such-host' }).matched, 0)
+    assert.throws(() => inventoryHosts(hosts, { approval: 'always' }), /approval must be/)
+    // The registered schema and the returned keys are the same set.
+    let registered
+    const ctx = { tools: { register: (definition) => { registered = definition } } }
+    await createHostsTool().register(ctx, { executor: { hosts } })
+    const value = await registered.execute({})
+    assert.deepEqual(Object.keys(value.hosts[0]).sort(), Object.keys(registered.output.schema.properties.hosts.items.properties).sort())
+    assert.deepEqual(Object.keys(value).sort(), Object.keys(registered.output.schema.properties).sort())
+    const json = JSON.stringify(value)
+    const text = registered.output.render({}, value).map((block) => block.text).join('\n')
+    for (const secret of ['keyPath', 'passphraseEnv', 'C:/keys', 'A_PASS']) {
+      assert.equal(json.includes(secret), false, 'JSON must not carry ' + secret)
+      assert.equal(text.includes(secret), false, 'text must not carry ' + secret)
+    }
+    const emptyInfo = { executor: { hosts: [] } }
+    let emptyTool
+    await createHostsTool().register({ tools: { register: (definition) => { emptyTool = definition } } }, emptyInfo)
+    const empty = await emptyTool.execute({})
+    assert.deepEqual(empty, { hosts: [], total: 0, matched: 0 })
+    const emptyText = emptyTool.output.render({}, empty)[0].text
+    assert.match(emptyText, /Add one on the SSH Configure page/)
+  })
   test('a declared host keeps its own values, and optional fields normalize away', () => {
     const one = validateHosts([{
       alias: 'win-box_1', host: 'example.lan', port: 2222, user: 'root', keyPath: 'C:/keys/id_ed25519',

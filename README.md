@@ -24,6 +24,7 @@ Every dialect owns its own executor, and **no tool registers as `ctx.shell`** �
 | `msys2_bash` | MSYS2 UCRT64 | **Opt-in**; owns a `Msys2BashExecutor`; MSYS2's own `$MSYSTEM` and `pacman` |
 | `ssh_shell` | Remote (SSH) | **Opt-in**; owns a `SshShellExecutor`; one pooled connection per host, one channel per call |
 | `ssh_scp` | Remote (SSH) | **Opt-in with `ssh_shell`**; SFTP file/tree transfer on the same executor and pooled connection; foreground only |
+| `ssh_hosts` | Remote (SSH) | **Opt-in with `ssh_shell`**; read-only inventory of the configured hosts with query/approval/default filters; no connection, no approval, never returns credentials |
 | `terminal` | any of the above | Persistent PTY sessions: `open` / `send` / `read` / `signal` / `close` / `list` |
 | `pwsh` | dsh's own | Untouched; served by the base bundle's `pwsh-sandbox` row |
 
@@ -55,6 +56,7 @@ Requires `pnpm`. The bundle layer is assembled at boot, so **restart `dsh web`**
 - **`wsl_bash` / `msys2_bash`**: enable `win-mb-tool-wsl` / `win-mb-tool-msys2` on the Plugins page. Pin `wslBash.wslDistro` or `msys2Bash.bashPath` only when discovery is not enough.
 - **`ssh_shell`**: enable `win-mb-tool-ssh` and add hosts under `sshShell.hosts` (`alias`, `host`, `user`, `keyPath`; `port` / `startupCommand` / `default` as needed). A call names an alias (or omits it when one host is `default`); no hosts refuses every call. Key-only auth, strict host keys — see the [migration notes](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/configuration.md). Hosts default to `approval: session`: one prompt per session through a dedicated card; `trusted` never asks. Hosts are edited in the row's **host table** on the Configure page — one card per host, at most one default. Each row tests unsaved values with **Test connection**.
 - **`ssh_scp`**: the same row does transfers — `action: "upload" | "download"`, `localPath` (inside the workspace unless `danger-full-access`; checked lexically, symlinks are not resolved), `remotePath` (absolute POSIX; `/C:/...` on Windows OpenSSH), `recursive` for trees, `timeoutMs` (default 5 min). Foreground only; the result is `{ ok, bytes, files?, error? }` plus `sandbox` facts (and `outsideWorkspace` when an outside path was allowed), and failures are values naming the phase and the alias.
+- **`ssh_hosts`**: read-only inventory on the same row — `query` (case-insensitive alias/host/user/description), `approval` (`session` | `trusted`), `defaultOnly`. Returns sanitized host facts with `hasStartupCommand` / `hasShellTemplate` booleans; never a key path or passphrase variable. No connection or approval; an empty registry is a successful empty list.
 - **`terminal`**: `open` a session, `send` commands with `submit: true`, `read` the reply, then `close`. The working directory, exported variables and aliases survive between calls. Sessions are process-local, capped, idle-reclaimed and **not** jobs; the Session header lists and stops them.
 - Every row has a **Configure** page; changes are live unless a knob shapes the tool schema.
 
