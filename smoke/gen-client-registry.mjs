@@ -103,10 +103,23 @@ export function spliceClientRegistry(source) {
     const endMarker = source.indexOf(GENERATED_END, begin === -1 ? 0 : begin);
     if (begin === -1) throw new Error(`gen-client-registry: ${GENERATED_BEGIN.trim()} not found in lib/client.js`);
     if (endMarker === -1) throw new Error(`gen-client-registry: ${GENERATED_END.trim()} not found after the region start`);
+    // A region that was appended twice would leave two copies of the generated
+    // `const` declarations in one factory scope: the browser then throws
+    // `Identifier ... has already been declared`. Refuse the source instead of
+    // silently replacing only the first copy.
+    if (source.indexOf(GENERATED_BEGIN, begin + 1) !== -1)
+        throw new Error('gen-client-registry: more than one generated region in lib/client.js; restore the file from git before writing');
     const bodyStart = source.indexOf('\n', begin) + 1;
     const head = source.slice(0, bodyStart);
     const tail = source.slice(endMarker);
-    return `${head}${renderClientRegistry()}${tail}`;
+    const next = `${head}${renderClientRegistry()}${tail}`;
+    // One top-level declaration per generated name, in the whole factory. This
+    // catches a hand-edit or a partial splice that still parses individually.
+    for (const name of ['ROWS', 'SHELL_TOOL_NAMES', 'TERMINAL_ROW_ID', 'TERMINAL_TOOL_NAME', 'TERMINAL_CONFIG_KEY', 'APPROVAL_GATED_TOOL_NAMES']) {
+        const count = next.split(`const ${name} =`).length - 1;
+        if (count !== 1) throw new Error(`gen-client-registry: lib/client.js declares ${name} ${count} times; expected exactly once`);
+    }
+    return next;
 }
 
 /** The region's current text in a client source, or `undefined` when unmarked. */

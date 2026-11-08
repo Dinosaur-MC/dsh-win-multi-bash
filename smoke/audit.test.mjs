@@ -1928,7 +1928,7 @@ console.log('\n[A] unit: the dialect registry is the single source (S1)')
     DIALECT_FACTS, SHELL_DIALECTS, SHELL_FAMILY_TOOL_NAMES, CLIENT_ROWS, LEAF_RULES,
     PATCH_ROWS, EXPORT_SUBPATHS, TOOL_INSTANCES, PACKAGE_NAME, REGISTRY_ERROR_PREFIX, validateShellDialects,
   } = registry
-  const { currentClientRegistry, renderClientRegistry } = await import(new URL('./gen-client-registry.mjs', import.meta.url).href)
+  const { currentClientRegistry, renderClientRegistry, spliceClientRegistry } = await import(new URL('./gen-client-registry.mjs', import.meta.url).href)
   const broken = (over) => SHELL_DIALECTS.map((dialect, index) => (index === 0 ? { ...dialect, ...over } : dialect))
   /** Every rejection must carry the registry prefix — that is what makes it readable at boot. */
   const rejects = (dialects, pattern) => {
@@ -2048,6 +2048,14 @@ console.log('\n[A] unit: the dialect registry is the single source (S1)')
     // guard that makes "forgot to regenerate" loud.
     assert.equal(currentClientRegistry(source), renderClientRegistry(),
       'lib/client.js is stale — run: node smoke/gen-client-registry.mjs --write')
+    // The generated region must stay SINGULAR: a second copy would repeat its
+    // const declarations in the same factory scope and the browser half would die
+    // with "Identifier ... has already been declared".
+    const regenerated = spliceClientRegistry(source)
+    assert.equal(regenerated.split('//#region registry-derived (generated)').length - 1, 1)
+    for (const name of ['ROWS', 'SHELL_TOOL_NAMES', 'TERMINAL_ROW_ID', 'TERMINAL_TOOL_NAME', 'TERMINAL_CONFIG_KEY', 'APPROVAL_GATED_TOOL_NAMES'])
+      assert.equal(regenerated.split(`const ${name} =`).length - 1, 1, name + ' must be declared exactly once')
+    assert.throws(() => spliceClientRegistry(source + '\n' + source), /more than one generated region/)
     for (const dialect of SHELL_DIALECTS) assert.ok(source.includes(`rowId: "${dialect.rowId}"`))
   })
 
@@ -8605,9 +8613,9 @@ console.log('\n[A] unit: the terminal session route (HTTP fence, method, body, d
     assert.deepEqual(result, { writes: 0, ended: true }, 'the catch only ends an already-started response')
   })
 }
-console.log('\n[A] unit: the terminal session route\'s hosts.test endpoint and the host probe')
+console.log('\n[A] unit: the ssh row\'s hosts.test endpoint and the host probe')
 {
-  const { createSessionDispatch, createSessionRouteHandler } = await import(libUrl('tool-bash', 'types', 'terminal.js'))
+  const { createHostsDispatch, createHostsRouteHandler } = await import(libUrl('ssh-shell', 'hosts-route.js'))
   const { probeHost } = await import(libUrl('ssh-shell', 'probe.js'))
   const path = await import('node:path')
   const { mkdirSync, writeFileSync } = await import('node:fs')
@@ -8621,7 +8629,7 @@ console.log('\n[A] unit: the terminal session route\'s hosts.test endpoint and t
 
   await testAsync('hosts.test dispatches the injectable probe and maps every failure phase', async () => {
     const calls = []
-    const dispatch = createSessionDispatch(fakeSessions, {
+    const dispatch = createHostsDispatch({
       probeHost: async (host) => {
         calls.push(host)
         if (host.force === 'bad') return { ok: false, phase: 'host-key', message: 'ssh-shell: host key verification failed for "prod (u@h.example:22)": changed' }
@@ -8643,7 +8651,7 @@ console.log('\n[A] unit: the terminal session route\'s hosts.test endpoint and t
     const primitive = await dispatch('hosts.test', { host: 'prod' })
     assert.equal(primitive.error.phase, 'config')
     // A probe that THROWS is still a failed test, never the unknown-endpoint error.
-    const throwing = createSessionDispatch(fakeSessions, { probeHost: async () => { throw new Error('probe exploded') } })
+    const throwing = createHostsDispatch({ probeHost: async () => { throw new Error('probe exploded') } })
     const thrown = await throwing('hosts.test', { host: { alias: 'prod', host: 'h.example', user: 'u', keyPath: 'k' } })
     assert.equal(thrown.ok, false)
     assert.equal(thrown.error.code, 'hosts/test-failed')
@@ -8651,7 +8659,7 @@ console.log('\n[A] unit: the terminal session route\'s hosts.test endpoint and t
     assert.match(thrown.error.message, /probe exploded/)
     // The same envelope over the real HTTP handler.
     const hostCtx = { connection: { requestRejection: () => undefined } }
-    const route = createSessionRouteHandler({ hostCtx, dispatch })
+    const route = createHostsRouteHandler({ hostCtx, dispatch })
     const written = { status: undefined, body: undefined, headersSent: false }
     const fakeRes = {
       get headersSent() { return written.headersSent },
@@ -8660,7 +8668,7 @@ console.log('\n[A] unit: the terminal session route\'s hosts.test endpoint and t
     }
     const req = {
       method: 'POST',
-      url: '/win-mb/hosts.test',
+      url: '/win-mb-ssh/hosts.test',
       headers: { 'content-type': 'application/json' },
       async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ host: { alias: 'prod', host: 'h.example', user: 'u', keyPath: 'k' } })) },
     }
@@ -8672,7 +8680,7 @@ console.log('\n[A] unit: the terminal session route\'s hosts.test endpoint and t
   await testAsync('hosts.approvalScope validates and marks the scope through the injected marker', async () => {
     const marked = []
     const cleared = []
-    const dispatch = createSessionDispatch(fakeSessions, { markApprovalScope: (callId, scope) => { marked.push([callId, scope]); return true }, clearApprovalScope: (callId) => { cleared.push(callId); return true } })
+    const dispatch = createHostsDispatch({ markApprovalScope: (callId, scope) => { marked.push([callId, scope]); return true }, clearApprovalScope: (callId) => { cleared.push(callId); return true } })
     assert.deepEqual(await dispatch('hosts.approvalScope', { callId: 'call-1', scope: 'once' }), { ok: true })
     assert.deepEqual(await dispatch('hosts.approvalScope', { callId: 'call-2', scope: 'session' }), { ok: true })
     assert.deepEqual(marked, [['call-1', 'once'], ['call-2', 'session']])
@@ -8685,20 +8693,20 @@ console.log('\n[A] unit: the terminal session route\'s hosts.test endpoint and t
     }
     assert.equal(marked.length, 2, 'an invalid payload never marks')
     assert.equal(cleared.length, 1, 'an invalid payload never clears')
-    const refused = createSessionDispatch(fakeSessions, { markApprovalScope: () => false })
+    const refused = createHostsDispatch({ markApprovalScope: () => false })
     const rejected = await refused('hosts.approvalScope', { callId: 'call-3', scope: 'once' })
     assert.equal(rejected.ok, false)
     assert.equal(rejected.error.code, 'hosts/bad-request')
     // The same endpoint over the real HTTP handler keeps the route rules.
     const hostCtx = { connection: { requestRejection: () => undefined } }
-    const route = createSessionRouteHandler({ hostCtx, dispatch })
+    const route = createHostsRouteHandler({ hostCtx, dispatch })
     const written = { status: undefined, body: undefined, headersSent: false }
     const res = {
       get headersSent() { return written.headersSent },
       writeHead(status) { written.status = status; written.headersSent = true },
       end(body) { if (body !== undefined) written.body = String(body) },
     }
-    const req = { method: 'POST', url: '/win-mb/hosts.approvalScope', headers: { 'content-type': 'application/json' }, async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ callId: 'call-4', scope: 'once' })) } }
+    const req = { method: 'POST', url: '/win-mb-ssh/hosts.approvalScope', headers: { 'content-type': 'application/json' }, async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ callId: 'call-4', scope: 'once' })) } }
     await route(req, res)
     assert.equal(written.status, 200)
     assert.deepEqual(JSON.parse(written.body), { ok: true })
@@ -8924,6 +8932,96 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
     } finally { await ctx.fiber.dispose() }
   })
 
+  await testAsync('the row entries load without ssh2; terminal has no hosts endpoints and the ssh route names the missing transport', async () => {
+    const dir = mkdtempSync(join(process.cwd(), '.temp', 'no-ssh2-'))
+    const loaderPath = join(dir, 'loader.mjs')
+    writeFileSync(loaderPath, [
+      'export async function resolve(specifier, context, nextResolve) {',
+      "  if (specifier === 'ssh2' || specifier.startsWith('ssh2/')) {",
+      "    const error = new Error(\"Cannot find package 'ssh2' imported from \" + context.parentURL)",
+      "    error.code = 'ERR_MODULE_NOT_FOUND'",
+      '    throw error',
+      '  }',
+      '  return nextResolve(specifier, context)',
+      '}',
+      '',
+    ].join('\n'))
+    const entries = ['lib/index.js', 'lib/tool-bash/types/git-bash.js', 'lib/tool-bash/types/wsl-bash.js', 'lib/tool-bash/types/msys2-bash.js', 'lib/tool-bash/types/terminal.js', 'lib/tool-bash/types/ssh-shell.js'].map((path) => pathToFileURL(join(lib, '..', path)).href)
+    const hostsRouteUrl = pathToFileURL(join(lib, 'ssh-shell', 'hosts-route.js')).href
+    const childPath = join(dir, 'child.mjs')
+    writeFileSync(childPath, [
+      "import Module from 'node:module'",
+      'const originalLoad = Module._load',
+      'Module._load = function (request) {',
+      "  if (request === 'ssh2') {",
+      "    const error = new Error(\"Cannot find package 'ssh2' imported from a dependency\")",
+      "    error.code = 'ERR_MODULE_NOT_FOUND'",
+      '    throw error',
+      '  }',
+      '  return originalLoad.apply(this, arguments)',
+      '}',
+      `const entries = ${JSON.stringify(entries)}`,
+      `const hostsRouteUrl = ${JSON.stringify(hostsRouteUrl)}`,
+      'for (const entry of entries) await import(entry)',
+      "const { createSessionDispatch } = await import(entries[4])",
+      "const sessions = { listAll: () => [], list: () => [], tail: () => '', clearFinished: () => 0, stop: async () => false }",
+      "const host = { alias: 'prod', user: 'me', host: 'host.example.com', port: 22, keyPath: 'C:/Users/me/id_ed25519' }",
+      "const terminalHost = await createSessionDispatch(sessions)('hosts.test', { host })",
+      "const terminalScope = await createSessionDispatch(sessions)('hosts.approvalScope', { callId: 'c1', scope: 'once' })",
+      "const hostsRoute = await import(hostsRouteUrl)",
+      "const hostsResult = await hostsRoute.createHostsDispatch()('hosts.test', { host })",
+      "console.log(JSON.stringify({ loaded: entries.length, terminalHost, terminalScope, hostsResult }))",
+    ].join('\n'))
+    const run = spawnSync(process.execPath, ['--experimental-loader', pathToFileURL(loaderPath).href, childPath], { cwd: process.cwd(), encoding: 'utf8', timeout: 30000 })
+    assert.equal(run.status, 0, run.stderr + '\\n' + run.stdout)
+    const out = JSON.parse(run.stdout.trim().split('\\n').at(-1))
+    assert.equal(out.loaded, 6, 'every row entry imports without ssh2')
+    assert.equal(out.terminalHost.ok, false, 'the terminal dispatcher has no hosts.test endpoint')
+    assert.equal(out.terminalHost.error.code, 'terminal/unknown-endpoint')
+    assert.equal(out.terminalScope.ok, false, 'the terminal dispatcher has no hosts.approvalScope endpoint')
+    assert.equal(out.terminalScope.error.code, 'terminal/unknown-endpoint')
+    assert.equal(out.hostsResult.ok, false, 'the ssh route still loads and names the missing transport')
+    assert.equal(out.hostsResult.error.phase, 'config')
+    assert.match(out.hostsResult.error.message, /ssh2 is not installed for this deployment/)
+  })
+  test('the terminal module graph never reaches ssh-shell or ssh2', () => {
+    const seen = new Set()
+    const stack = [join(lib, 'tool-bash', 'types', 'terminal.js')]
+    const pattern = /^\s*(?:import|export)\s+(?:[^'\"]*?\s+from\s+)?['\"]([^'\"]+)['\"]/gm
+    while (stack.length > 0) {
+      const file = stack.pop()
+      if (seen.has(file)) continue
+      seen.add(file)
+      const source = readFileSync(file, 'utf8')
+      for (const match of source.matchAll(pattern)) {
+        const specifier = match[1]
+        assert.notEqual(specifier, 'ssh2', file + ' must not import ssh2')
+        assert.equal(specifier.startsWith('ssh2/'), false, file + ' must not import an ssh2 subpath')
+        if (!specifier.startsWith('.')) continue
+        const resolved = join(dirname(file), specifier)
+        assert.equal(resolved.includes(join(lib, 'ssh-shell')), false, file + ' must not reach ' + specifier)
+        if (existsSync(resolved)) stack.push(resolved)
+        else assert.fail(file + ' imports a missing module ' + specifier)
+      }
+    }
+    assert.ok(seen.size > 3, 'the walk must actually follow the terminal row graph')
+  })
+
+  test('the terminal route keeps /win-mb and the ssh route owns /win-mb-ssh', async () => {
+    const { registerHostsRoute, HOSTS_ROUTE_PATH } = await import(libUrl('ssh-shell', 'hosts-route.js'))
+    const { registerSessionRoute } = await import(libUrl('tool-bash', 'types', 'terminal.js'))
+    assert.equal(HOSTS_ROUTE_PATH, '/win-mb-ssh')
+    const hosts = []
+    const terminal = []
+    const disposeHosts = registerHostsRoute({ register: (spec) => { hosts.push(spec); return () => {} } }, () => {}, () => {})
+    const disposeTerminal = registerSessionRoute({ register: (spec) => { terminal.push(spec); return () => {} } }, () => {}, () => {})
+    assert.equal(hosts.length, 1)
+    assert.equal(hosts[0].kind, 'prefix')
+    assert.equal(hosts[0].path, '/win-mb-ssh')
+    assert.equal(terminal.length, 1)
+    assert.equal(terminal[0].path, '/win-mb')
+    disposeHosts(); disposeTerminal()
+  })
   if (GIT_BASH === '') {
     skip('  … skipping the terminal round trip: no Git Bash was found to pin')
   } else {
@@ -10238,7 +10336,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     }
     const success = await testHostConnection(row, fakeFetch({ ok: true, value: { fingerprint: 'SHA256:abc', warning: 'host key was learned, not matched' } }))
     assert.deepEqual(success, { ok: true, fingerprint: 'SHA256:abc', warning: 'host key was learned, not matched' })
-    assert.equal(requests[0].url, '/win-mb/hosts.test')
+    assert.equal(requests[0].url, '/win-mb-ssh/hosts.test')
     assert.equal(requests[0].options.method, 'POST')
     assert.deepEqual(JSON.parse(requests[0].options.body), { host: hostObjectFromRow(row) }, 'the staged host object is the payload')
     assert.equal(Object.hasOwn(JSON.parse(requests[0].options.body).host, '__rowId'), false, 'the editor id never leaves the page')
@@ -10252,9 +10350,10 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     const opaque = await testHostConnection(row, fakeFetch({}, 500, false))
     assert.deepEqual(opaque, { ok: false, message: 'HTTP 500' }, 'a non-JSON refusal still names its status')
     const missingRoute = await testHostConnection(row, fakeFetch({}, 404, false))
-    assert.match(missingRoute.message, /not registered on this host/, 'a 404 names the missing route (the terminal row is disabled)')
+    assert.match(missingRoute.message, /is the ssh row enabled/, 'a 404 names the ssh row, not the terminal row')
+    assert.doesNotMatch(missingRoute.message, /terminal row disabled/)
     const spaFallback = await testHostConnection(row, async () => ({ status: 200, ok: true, json: async () => { throw new SyntaxError('<!doctype html>') } }))
-    assert.match(spaFallback.message, /not registered on this host/, 'a 200 SPA fallback gets the same missing-route message')
+    assert.match(spaFallback.message, /is the ssh row enabled/, 'a 200 SPA fallback gets the same missing-route message')
   })
   test('required warnings and row labels use the same placeholder the helper fills', () => {
     const rows = [blankHostRow()]
@@ -10771,7 +10870,7 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
       posts.push([url, JSON.parse(init.body)])
       return { ok: true, status: 200, json: async () => ({ ok: true }) }
     })
-    assert.deepEqual(posts, [['/win-mb/hosts.approvalScope', { callId: 'call-ok', scope: 'clear' }]])
+    assert.deepEqual(posts, [['/win-mb-ssh/hosts.approvalScope', { callId: 'call-ok', scope: 'clear' }]])
     // A 200 SPA fallback (HTML, not the route's JSON envelope) must not count as cleared.
     await assert.rejects(
       () => clearHostApprovalScope('call-spa', async () => ({ ok: true, status: 200, json: async () => { throw new SyntaxError('Unexpected token <') } })),
