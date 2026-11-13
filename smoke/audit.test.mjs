@@ -1727,13 +1727,36 @@ const ALPHA2_SERVICE_ROWS = (() => {
   }
 })()
 
+// dsh 0.2.2-rc.1 separated tool execution from tool registration ("refactor(tools):
+// separate scoped executors from tool registration", commit 455686626d): from that
+// release `ctx.tools.execute` dispatches through an executor contributed by a provider
+// row, and the base bundle loads `tool-executor-native` for it. A standalone fixture
+// that calls `ctx.tools.execute` must mirror that row when the runtime ships the
+// package; 0.2.1 and earlier execute directly and need no row (hence the resolve guard,
+// which also keeps this fixture valid on the whole engines.dsh range).
+const EXECUTOR_API = (() => {
+  try {
+    import.meta.resolve('@deepseek-ai/dsh-tool-executor-native')
+    return true
+  } catch {
+    return false
+  }
+})()
+
+const EXECUTOR_ROW = EXECUTOR_API
+  ? `- id: tool-executor
+  name: '@deepseek-ai/dsh-tool-executor-native'
+
+`
+  : ''
+
 const BASE_ROWS = `${ALPHA2_SERVICE_ROWS}- id: system-prompt
   name: '@deepseek-ai/dsh-system-prompt'
 
 - id: tools
   name: '@deepseek-ai/dsh-tools'
 
-- id: subprocess
+${EXECUTOR_ROW}- id: subprocess
   name: '@deepseek-ai/dsh-subprocess-local'
 
 - id: sandbox
@@ -1858,6 +1881,25 @@ async function assembledPrompt(ctx) {
   return { assembly, prompt: renderPrompt(assembly) }
 }
 
+/**
+ * Invoke one tool through `ctx.tools`, adapting to the runtime's execute shape:
+ * dsh 0.2.2-rc.1+ takes a batch of ToolCallBlocks and returns one result per call,
+ * earlier releases take a single call and execute it directly. Both settle to a
+ * ToolExecutionResult, so every assertion below stays shape-agnostic.
+ */
+async function callTool(ctx, name, args, options = {}) {
+  const callId = options.callId ?? ToolCallId(`audit-${name}-${Math.random().toString(36).slice(2)}`)
+  const signal = options.signal ?? new AbortController().signal
+  if (!EXECUTOR_API) return ctx.tools.execute({ signal, callId, name, arguments: args })
+  const batch = await ctx.tools.execute({
+    signal,
+    calls: [{ type: 'tool-call', id: callId, name, arguments: JSON.stringify(args) }],
+  })
+  const settled = batch.results.find((r) => r.callId === callId)
+  if (settled === undefined) throw new Error(`audit: no settled result for ${name}`)
+  return settled.result
+}
+
 /** Execute a tool and return the joined text of its rendered content. */
 async function execTool(ctx, name, args) {
   return execToolResult(ctx, name, args).then((r) => r.text)
@@ -1865,12 +1907,7 @@ async function execTool(ctx, name, args) {
 
 /** Execute a tool and return { text, isError, error } for error-path assertions. */
 async function execToolResult(ctx, name, args) {
-  const result = await timed('call', () => ctx.tools.execute({
-    signal: new AbortController().signal,
-    callId: ToolCallId(`audit-${name}-${Math.random().toString(36).slice(2)}`),
-    name,
-    arguments: { description: `audit ${name}`, ...args },
-  }))
+  const result = await timed('call', () => callTool(ctx, name, { description: `audit ${name}`, ...args }))
   const text = (result.content ?? [])
     .filter((b) => b.type === 'text')
     .map((b) => b.text)
@@ -2892,19 +2929,9 @@ console.log('\n[A] unit + [B] boot: the SSH dialect (remote effects, no local sa
           approval: 'trusted'
           default: true
 `
-    const sshCall = (ctx, args) => ctx.tools.execute({
-      signal: new AbortController().signal,
-      callId: ToolCallId('audit-ssh-' + Math.random().toString(36).slice(2)),
-      name: 'ssh_shell',
-      arguments: { description: 'audit ssh', ...args },
-    })
+    const sshCall = (ctx, args) => callTool(ctx, 'ssh_shell', { description: 'audit ssh', ...args })
     /** The row's SECOND tool: same boot, same executor, same host registry. */
-    const scpCall = (ctx, args, signal = new AbortController().signal) => ctx.tools.execute({
-      signal,
-      callId: ToolCallId('audit-scp-' + Math.random().toString(36).slice(2)),
-      name: 'ssh_scp',
-      arguments: args,
-    })
+    const scpCall = (ctx, args, signal = new AbortController().signal) => callTool(ctx, 'ssh_scp', args, { signal })
     let ctx
     try {
       ctx = await bootFixture(BLACKHOLE_ROWS(), 'ssh-blackhole.yml')
@@ -8892,12 +8919,7 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
     return !process.getActiveResourcesInfo().includes('MessagePort')
   }
   const runTerminal = async (ctx, args) => {
-    const result = await ctx.tools.execute({
-      signal: new AbortController().signal,
-      callId: ToolCallId('audit-terminal-' + Math.random().toString(36).slice(2)),
-      name: 'terminal',
-      arguments: args,
-    })
+    const result = await callTool(ctx, 'terminal', args)
     const text = (result.content ?? []).filter((entry) => entry.type === 'text').map((entry) => entry.text).join('')
     return { text, value: result.value, isError: result.isError }
   }
@@ -11938,11 +11960,8 @@ console.log('\n[B] boot integration: promote-on-timeout (shipped default, SERIAL
           // killable while the call still waits, and the model is told the kill
           // was not its command failing. dsh has the same end-to-end test
           // (tool-bash/tests/background.spec.ts:260-269).
-          const pending = ctx.tools.execute({
-            signal: new AbortController().signal,
-            callId: ToolCallId(`audit-stopped-${Math.random().toString(36).slice(2)}`),
-            name: 'git_bash',
-            arguments: { description: 'audit stopped marker', command: 'echo started; sleep 5', timeoutMs: 30000 },
+          const pending = callTool(ctx, 'git_bash', {
+            description: 'audit stopped marker', command: 'echo started; sleep 5', timeoutMs: 30000,
           })
           let jobId
           for (let attempt = 0; attempt < 100 && jobId === undefined; attempt += 1) {
@@ -12032,12 +12051,7 @@ console.log('\n[B] boot integration: an auto-degraded sandbox reports `unconfine
     return probe.status === 0
   })()
 
-  const rawCall = (ctx, args) => ctx.tools.execute({
-    signal: new AbortController().signal,
-    callId: ToolCallId(`unconfined-${Math.random().toString(36).slice(2)}`),
-    name: 'wsl_bash',
-    arguments: { description: 'unconfined probe', ...args },
-  })
+  const rawCall = (ctx, args) => callTool(ctx, 'wsl_bash', { description: 'unconfined probe', ...args })
   const rawText = (result) => (result.content ?? [])
     .filter((block) => block.type === 'text').map((block) => block.text).join('').replace(/\r\n/g, '\n')
 
@@ -12132,12 +12146,7 @@ console.log('\n[B] boot integration: an auto-degraded BACKGROUND job says so in 
     return seen
   }
   // `execToolResult` drops the structured value; the fact lives on it.
-  const valueOf = async (ctx, args) => (await ctx.tools.execute({
-    signal: new AbortController().signal,
-    callId: ToolCallId(`audit-bg-fact-${Math.random().toString(36).slice(2)}`),
-    name: 'wsl_bash',
-    arguments: { description: 'audit background fact', ...args },
-  })).value
+  const valueOf = async (ctx, args) => (await callTool(ctx, 'wsl_bash', { description: 'audit background fact', ...args })).value
 
   if (!HAS_WSL_DISTRO) {
     skip('  … skipping background-unconfined fixture: no usable WSL distribution on this host')
@@ -12361,12 +12370,7 @@ console.log('\n[B] boot integration: a background job records the tool call that
   if (!HAS_GIT_BASH) {
     skip('  … skipping M1 fixture: no Git Bash probed on this host')
   } else {
-    const callOf = (ctx, name, args, callId) => ctx.tools.execute({
-      signal: new AbortController().signal,
-      callId: callId ?? ToolCallId(`m1-${Math.random().toString(36).slice(2)}`),
-      name,
-      arguments: { description: `m1 ${name}`, ...args },
-    })
+    const callOf = (ctx, name, args, callId) => callTool(ctx, name, { description: `m1 ${name}`, ...args }, { callId })
     const textOf = (result) => (result.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('').replace(/\r\n/g, '\n')
 
     let ctx
