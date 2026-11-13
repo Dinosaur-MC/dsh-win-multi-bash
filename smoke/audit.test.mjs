@@ -11222,6 +11222,41 @@ console.log('\n[A] unit: web client half (the Plugins page row form)')
     assert.equal(preparingRow.props.running, true)
   })
 
+  test('a background shell card carries the job it started, and says where the output lives', () => {
+    // A background card carries no output and no verdict, so the starter's ack line is
+    // the only thing that can point the row at the work: without it the row is a command
+    // with nothing behind it, and its expanded body would draw an empty terminal.
+    const bgArgs = JSON.stringify({ command: 'npm run build', run_in_background: true })
+    const result = (text) => ({ kind: 'result', call: { argsRaw: bgArgs }, content: [{ type: 'text', text }], isError: false })
+    const ack = (id, tail = '') => result(`started background job ${id}\n${tail}`)
+    const t = (key) => en[key] ?? key
+    const rowOf = (block) => ToolCard({ toolName: 'git_bash', callId: 'bg1', phase: 'result', cwd: 'C:/ws', t, block }).children.find((child) => child && child.type === 'DisclosureRow')
+    const row = rowOf(ack('git_bash-0123456789ab', 'The command keeps running in the background.'))
+    const chip = row.props.collapsedContent[2]
+    assert.equal(chip.props.className, 'dshwmb-tool-job', 'the job handle rides the collapsed row')
+    assert.equal(chip.props.title, en['row.backgroundHint'], 'the chip explains where the output went')
+    assert.equal(chip.children[0], 'git_bash-0123456789ab')
+    // The ack is the platform's exact line; a CRLF result still names the same job, and a
+    // settled result without one keeps the old row (no chip, no invented id).
+    assert.equal(rowOf(result('started background job git_bash-crlf\r\nThe command keeps running.')).props.collapsedContent[2].children[0], 'git_bash-crlf')
+    assert.equal(rowOf(result('started, see the job list')).props.collapsedContent[2], null, 'a result that names no job gains no chip')
+    // The expanded body names the job instead of drawing the empty terminal that a card
+    // with `output: undefined` would draw.
+    const expanded = (block) => ToolCard({ toolName: 'git_bash', callId: 'bg1', phase: 'result', cwd: 'C:/ws', t, block, useDisclosure: () => ({ expanded: true, setExpanded: () => {}, toggle: () => {} }) }).children.find((child) => child && child.type === 'DisclosureRow')
+    const body = expanded(ack('git_bash-0123456789ab')).props.children.children[0]
+    assert.equal(body.props.className, 'dshwmb-tool-bg')
+    assert.deepEqual(body.children.map((child) => child.props.className), ['dshwmb-tool-bg-hint', 'dshwmb-tool-bg-id'])
+    assert.equal(body.children[0].children[0], en['row.backgroundHint'])
+    assert.equal(body.children[1].children[0].children[0], en['row.backgroundJob'])
+    assert.equal(body.children[1].children[1].props.className, 'dshwmb-tool-bg-code')
+    assert.equal(body.children[1].children[1].children[0], 'git_bash-0123456789ab', 'the code carries the bare id')
+    const bare = expanded(result('out')).props.children.children[0]
+    assert.deepEqual(bare.children.map((child) => child.props.className), ['dshwmb-tool-bg-hint'], 'no job named, only the hint')
+    // The same two facts in Chinese; the dictionaries stay key-for-key (asserted elsewhere).
+    assert.equal(zh['row.backgroundJob'], '后台任务')
+    assert.match(zh['row.backgroundHint'], /任务列表/)
+  })
+
   test('each card primitive on its own is load-bearing: omit one and no row is registered', () => {
     // The README says "a deployment missing any of them registers no row at all", so the
     // gate is pinned per member, not once with all four absent: a check weakened to one
