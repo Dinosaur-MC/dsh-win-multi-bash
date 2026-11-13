@@ -42,6 +42,8 @@ Only `git_bash` and `terminal` are enabled by default; three dialects ship switc
 
 `sshShell.hosts` is the row's whole host inventory: an array of objects, one per host, and the alias a call passes is the only way to choose one. It replaces the previous single-target pins — the tool no longer drives an `ssh.exe` process, so its Configure page carries no client path, host, user or port.
 
+Both `ssh_shell` and `ssh_scp` need the `ssh2` transport, which this package declares as an **optional peer dependency**: installing the plugin neither installs nor builds it, and every row still loads without it. Install it into the same profile before enabling the row — `dsh plugin --profile <profile> add ssh2`, or `pnpm add ssh2` inside `$DSH_HOME/profiles/<profile>`. If pnpm stops with `ERR_PNPM_IGNORED_BUILDS`, approve the pending `ssh2` / `cpu-features` entries on the Plugins page and retry; the blocked script only builds the optional native accelerator, so the transport is usable either way. Without the package every call fails closed with `ssh2 is not installed for this deployment; install the package dependency`.
+
 | Field | Required | Meaning |
 | --- | --- | --- |
 | `alias` | yes | The name a call passes. Unique within the array, `/^[A-Za-z0-9][A-Za-z0-9._-]*$/`. |

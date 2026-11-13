@@ -35,7 +35,7 @@ Only `git_bash` and `terminal` ship on; the rest are opt-in. `git_bash` often ru
 - dsh `0.1.7-rc.2` through `0.2.x` (the `engines.dsh` window).
 - Windows, and a dsh deployment that provides the published `@deepseek-ai` base packages.
 - Git Bash and/or WSL and/or MSYS2 only for the backends you enable; a missing backend never affects pwsh.
-- For `ssh_shell` / `ssh_scp`: key-only access under `sshShell.hosts`, host keys in `known_hosts`.
+- For `ssh_shell` / `ssh_scp`: the `ssh2` package in the profile (an optional peer — see [The SSH transport](#the-ssh-transport-ssh2)), key-only access under `sshShell.hosts`, host keys in `known_hosts`.
 - Node `^22.19.0 || >=24.0.0` (the range this package declares), and `pnpm` for installation.
 
 ## Install
@@ -49,6 +49,20 @@ dsh plugin --profile web remove dsh-win-multi-bash                 # remove
 ```
 
 Requires `pnpm`. The bundle layer is assembled at boot, so **restart `dsh web`** for a change to take effect. Do not also hand-write the same rows into the profile's `cordis.patch.yml`: the loader rejects duplicate entry ids.
+
+### The SSH transport (`ssh2`)
+
+`ssh2` is an **optional peer dependency**, not a dependency: `dsh plugin --profile web add dsh-win-multi-bash` installs this package alone, and every row still loads — the transport is resolved on first use (`lib/ssh-shell/ssh2.js`) and a missing one becomes the named failure `ssh2 is not installed for this deployment; install the package dependency`. That keeps the install free of native build scripts: a hard dependency on `ssh2` makes pnpm refuse the whole command with `ERR_PNPM_IGNORED_BUILDS` naming `ssh2` and `cpu-features`, because ssh2 ships an `install` script that pnpm 10+ will not run unattended.
+
+To use `ssh_shell` / `ssh_scp`, add the transport to the same profile:
+
+```powershell
+dsh plugin --profile web add ssh2      # the same CLI that installed this plugin
+```
+
+`dsh plugin add` accepts a package that is not itself a plugin and reports `ssh2 declares no dsh.bundle — installed as a plain dependency, not a profile layer` — which is exactly what this is. Running `pnpm add ssh2` inside `$DSH_HOME\profiles\web` is the equivalent.
+
+If pnpm stops with `ERR_PNPM_IGNORED_BUILDS`, dsh has already recorded the pending entries under `allowBuilds` in that profile's `pnpm-workspace.yaml` (`ssh2: set this to true or false`); approve them on the Plugins page, or set both to `true`, then re-run. The transport works either way: `ssh2` is pure JavaScript and the blocked script only builds the optional `cpu-features` accelerator. A profile that never enables the SSH row needs none of this.
 
 ## Quick start
 
