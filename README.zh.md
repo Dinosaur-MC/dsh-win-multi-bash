@@ -35,7 +35,7 @@ DeepSeek Harness 的 Windows 多 bash 插件。**`git_bash`**（Git for Windows 
 - dsh `0.1.7-rc.2` 到 `0.2.x`（`engines.dsh` 窗口）。
 - Windows，以及一个提供已发布 `@deepseek-ai` 基础包的 dsh 部署。
 - Git Bash / WSL / MSYS2 只在启用对应后端时需要；缺后端不会影响 pwsh。
-- `ssh_shell` / `ssh_scp` 需要 `sshShell.hosts` 下主机的仅密钥访问，且主机密钥已在 `known_hosts` 中。
+- `ssh_shell` / `ssh_scp` 需要 `ssh2` 传输层（可选 peer，见下文「SSH 传输层」）与 `sshShell.hosts` 下主机的仅密钥访问，主机密钥须在 `known_hosts` 中。
 - Node `^22.19.0 || >=24.0.0`（本包声明范围），安装需要 `pnpm`。
 
 ## 安装
@@ -49,6 +49,16 @@ dsh plugin --profile web remove dsh-win-multi-bash                 # 卸载
 ```
 
 需要 `pnpm`。bundle 层在启动时组装，改动后请**重启 `dsh web`**。不要把手写的相同行再写进 profile 的 `cordis.patch.yml`：loader 会拒绝重复的 entry id。
+
+### SSH 传输层（`ssh2`）
+
+`ssh2` 是**可选 peer 依赖**：安装本插件既不安装也不构建它，所有行照常加载；传输层在首次使用时解析，缺失时 SSH 调用以 `ssh2 is not installed for this deployment` 失败关闭。需要时把它加进同一 profile：
+
+```powershell
+dsh plugin --profile web add ssh2
+```
+
+改成硬依赖会让 pnpm 以 `ERR_PNPM_IGNORED_BUILDS`（点名 `ssh2` 与 `cpu-features`）拒绝整次安装；pnpm 询问时批准待处理的 `allowBuilds` 条目即可——被拦的脚本只构建可选加速器。详见[配置](https://github.com/Dinosaur-MC/dsh-win-multi-bash/blob/main/docs/configuration.md)。
 
 ## 快速开始
 
