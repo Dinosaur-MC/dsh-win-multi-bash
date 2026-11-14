@@ -1,3 +1,24 @@
+# dsh-win-multi-bash v0.8.1
+
+## New
+
+- **A profile without the SSH transport is a supported shape.** `ssh2` is an optional peer now: a profile that only runs `git_bash`, `wsl_bash`, `msys2_bash` or `terminal` installs and boots without it, and an `ssh_shell` / `ssh_scp` call names the command that adds the transport.
+
+## Improvements
+
+- **`dsh plugin --profile <name> add dsh-win-multi-bash` no longer fails on pnpm 11.** Installing the plugin pulls no `ssh2` and no `cpu-features` build, so the `ERR_PNPM_IGNORED_BUILDS` error that exited non-zero before `dsh.profile.bundles` was written cannot fire; the transport is a separate, optional install.
+- **The install path is documented as two steps.** `README.md`, `docs/configuration.md` and `docs/troubleshooting.md` name the ignored-build error, its cause, and the follow-up command that adds `ssh2`.
+
+## Bug fixes
+
+- **A missing `ssh2` names the command that installs it.** The call fails with `ssh2 is not installed for this deployment; add it with dsh plugin --profile <name> add ssh2 (or pnpm add ssh2 inside the profile directory) and restart dsh web`; the row still loads and every other tool on it keeps working.
+- **A background shell card names the job it started.** The starter's ack is the only place the row learns the handle, so the expanded card now shows `Background job` with the job id and where its output lives, instead of a command that keeps running with nothing pointing at the work. Every shell row that accepts `run_in_background` gets this.
+
+## Compatibility
+
+- No change to tools, rows, config keys or tool results; a profile that already has `ssh2` installed keeps working without reinstalling it.
+- The audit suite drives tools through the 0.2.2 executor API, so it runs on 0.2.2-rc.2 and later: 690 passed, 0 failed, 2 skipped on a host whose WSL has no distribution.
+
 # dsh-win-multi-bash v0.8.0
 
 ## New
