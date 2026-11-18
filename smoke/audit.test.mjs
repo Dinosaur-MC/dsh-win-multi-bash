@@ -7778,6 +7778,7 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
     // 0 is the documented way to turn idle reclamation off, so the schema must accept it.
     assert.equal(terminalTool.Config({ terminal: { idleMs: 0 } }).terminal.idleMs.get(), 0, 'a stored 0 survives the schema')
     assert.equal(schema.terminal.allowUnconfined.get(), true)
+    assert.equal(schema.terminal.notices.get(), false, 'automatic notices stay off until the row turns them on')
     for (const backend of TERMINAL_BACKENDS)
       assert.ok(schema[backend.configKey] !== undefined, backend.configKey + ' must have a pin partition')
   })
@@ -8164,6 +8165,53 @@ console.log('\n[A] unit: the interactive terminal row (registry-derived backends
     fake.handles[0].exit({ exitCode: 0 })
     await settle(250)
     assert.ok(notices.some((notice) => notice.cause === 'exited'), 'the ending still reports')
+    await sessions.dispose()
+  })
+
+  await testAsync('the notices switch silences crossings and endings alike, live', async () => {
+    const fake = fakePty()
+    const notices = []
+    let enabled = true
+    const sessions = createTerminalSessions({ subprocess: fake.service }, { notify: (event) => notices.push(event), noticesEnabled: () => enabled, transitionTickMs: 10 })
+    await sessions.open(sessionRequest('a', { startupWaitMs: 0, quietNoticeMs: 120, maxSessions: 1 }))
+    fake.handles[0].output.write('first\n')
+    await settle(400)
+    assert.deepEqual(notices.map((notice) => notice.cause), ['quiet'], 'with the switch on, a crossing is reported')
+    enabled = false
+    fake.handles[0].output.write('while off\n')
+    await settle(400)
+    assert.equal(notices.length, 1, 'the switch reaches a session that is already open')
+    fake.handles[0].exit({ exitCode: 0 })
+    await settle(250)
+    assert.deepEqual(notices.map((notice) => notice.cause), ['quiet'], 'and the ending is silent too, which quietNoticeMs 0 cannot do')
+    await sessions.dispose()
+  })
+
+  await testAsync('notify on open answers the switch per session, in either direction', async () => {
+    const fake = fakePty()
+    const notices = []
+    let enabled = true
+    const sessions = createTerminalSessions({ subprocess: fake.service }, { notify: (event) => notices.push(event), noticesEnabled: () => enabled, transitionTickMs: 10 })
+    const muted = await sessions.open(sessionRequest('a', { startupWaitMs: 0, quietNoticeMs: 120, maxSessions: 2, notify: false }))
+    const loud = await sessions.open(sessionRequest('a', { startupWaitMs: 0, quietNoticeMs: 120, maxSessions: 2, notify: true }))
+    assert.equal(muted.session.notices, false, 'the session remembers what it answered')
+    assert.equal(loud.session.notices, true)
+    fake.handles[0].output.write('muted\n')
+    fake.handles[1].output.write('loud\n')
+    await settle(400)
+    enabled = false
+    fake.handles[0].output.write('muted again\n')
+    fake.handles[1].output.write('loud again\n')
+    await settle(400)
+    fake.handles[0].exit({ exitCode: 0 })
+    fake.handles[1].exit({ exitCode: 0 })
+    await settle(300)
+    assert.deepEqual([...new Set(notices.map((notice) => notice.session.id))], [loud.session.id],
+      'an explicit false stays silent while the switch is on, and an explicit true keeps reporting while it is off')
+    const causes = notices.map((notice) => notice.cause)
+    assert.equal(causes[0], 'quiet', 'the opted-in session reports while the row switch is still on')
+    assert.ok(causes.includes('burst'), 'and after the switch goes off it still reports its next crossing')
+    assert.ok(causes.includes('exited'), 'and its ending')
     await sessions.dispose()
   })
 
@@ -8935,6 +8983,7 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
       const definition = ctx.tools.get('terminal')
       assert.ok(definition !== undefined, 'the terminal row must register')
       const shells = definition.parameters.properties.shell.enum
+      assert.equal(definition.parameters.properties.notify.type, 'boolean', 'open advertises the per-session answer')
       assert.deepEqual(shells, ['git_bash', 'wsl_bash', 'msys2_bash'], 'only the THREE local shells are session backends')
       assert.ok(!shells.includes('ssh_shell'), 'a persistent remote PTY would bypass the host-authorization gate')
       for (const backend of LOCAL_BACKENDS) {
@@ -8945,6 +8994,7 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
       const openSchema = definition.output.schema.oneOf.find((branch) => branch.properties?.kind?.const === 'open')
       assert.ok(openSchema !== undefined, 'the open value shape must exist')
       assert.ok(!('remote' in openSchema.properties), 'no session result may carry a remote fact any more')
+      assert.ok(openSchema.required.includes('notices'), 'the open value reports the resolved answer')
       const rendered = definition.output.render({ action: 'open' }, {
         kind: 'open', sessionId: 's1', shell: 'git_bash', pid: 7, cwd: 'C:/ws',
         sandboxMode: 'none', unconfined: true, output: 'ready', truncated: false, lossy: false, nextOffset: 5,
@@ -9171,6 +9221,11 @@ console.log('\n[B] boot integration: the terminal row over a REAL PTY (state mus
         const refused = await runTerminal(strict, { action: 'open' })
         assert.equal(refused.isError, true, refused.text)
         assert.match(refused.text, /allowUnconfined/)
+      })
+      await testAsync('notify is open-only, and is refused by name anywhere else', async () => {
+        const refused = await runTerminal(strict, { action: 'read', sessionId: 'no-such-session', notify: false })
+        assert.equal(refused.isError, true, refused.text)
+        assert.match(refused.text, /only meaningful for action "open"/)
       })
     } finally {
       if (strict) await strict.fiber.dispose()
